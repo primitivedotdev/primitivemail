@@ -1,0 +1,31 @@
+// Grafana Alloy config - scrapes postfix-exporter and milter, pushes to Prometheus-compatible endpoint
+
+// Scrape postfix-exporter metrics
+prometheus.scrape "postfix" {
+  targets = [{
+    __address__ = "postfix-exporter:9154",
+  }]
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "15s"
+}
+
+// Scrape milter Prometheus metrics
+prometheus.scrape "milter" {
+  targets = [{
+    __address__ = "primitivemail:9901",
+  }]
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "15s"
+}
+
+// Push to remote Prometheus endpoint
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = env("PROMETHEUS_URL")
+
+    basic_auth {
+      username = env("PROMETHEUS_USER")
+      password = env("PROMETHEUS_KEY")
+    }
+  }
+}

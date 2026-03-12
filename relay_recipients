@@ -1,0 +1,2 @@
+# Accept mail for ANY recipient at ANY domain
+/.+@.+/  OK

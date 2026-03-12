@@ -1,0 +1,83 @@
+version: "3.9"
+
+services:
+  primitivemail:
+    build: .
+    container_name: primitivemail
+    restart: unless-stopped
+    environment:
+      MYHOSTNAME: "${MYHOSTNAME:-mx.example.com}"
+      MYDOMAIN: "${MYDOMAIN:-example.com}"
+      ENABLE_IP_LITERAL: "${ENABLE_IP_LITERAL:-false}" # Accept mail to user@[IP] without DNS
+      IP_LITERAL: "${IP_LITERAL:-}"                  # The IP address to accept mail for
+      WEBHOOK_URL: "${WEBHOOK_URL:-}"              # Webhook endpoint (optional - standalone mode if unset)
+      WEBHOOK_SECRET: "${WEBHOOK_SECRET:-}"         # Auth token for webhook
+      STORAGE_URL: "${STORAGE_URL:-}"               # S3-compatible upload URL for large emails (optional)
+      STORAGE_KEY: "${STORAGE_KEY:-}"               # Auth key for storage uploads
+      STORAGE_AUTH_STYLE: "${STORAGE_AUTH_STYLE:-s3}" # "s3" or "supabase"
+      MAIL_DIR: "${MAIL_DIR:-/mail/incoming}"       # Where standalone mode saves emails
+      ALLOWED_SENDER_DOMAINS: "${ALLOWED_SENDER_DOMAINS:-}" # Comma-separated allowed sender domains
+      ALLOWED_SENDERS: "${ALLOWED_SENDERS:-}"       # Comma-separated allowed sender addresses
+      ALLOW_BOUNCES: "${ALLOW_BOUNCES:-true}"       # Accept bounce messages (empty MAIL FROM)
+      ALLOWED_RECIPIENTS: "${ALLOWED_RECIPIENTS:-}" # Comma-separated allowed recipient addresses
+      SPOOF_PROTECTION: "${SPOOF_PROTECTION:-off}"  # off|monitor|standard|strict
+      TLS_CERT: "${TLS_CERT:-}"                     # Custom TLS cert path (auto-generated if empty)
+      TLS_KEY: "${TLS_KEY:-}"                       # Custom TLS key path
+      LOKI_URL: "${LOKI_URL:-}"                     # Loki push endpoint (optional)
+      LOKI_USER: "${LOKI_USER:-}"                   # Loki auth user (optional)
+      LOKI_KEY: "${LOKI_KEY:-}"                     # Loki auth key (optional)
+    ports:
+      - "25:25"     # SMTP (public)
+    volumes:
+      - ./maildata:/mail/incoming
+      - postfix-logs:/var/log              # Shared with postfix-exporter
+
+  watcher:
+    build:
+      context: .
+      dockerfile: watcher/Dockerfile
+    container_name: primitivemail-watcher
+    restart: unless-stopped
+    # TODO: run as non-root once milter creates dirs with shared group
+    volumes:
+      - ./maildata:/mail/incoming
+    depends_on:
+      - primitivemail
+
+  postfix-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile.postfix-exporter
+    container_name: postfix-exporter
+    restart: unless-stopped
+    user: "65534:65534"                    # Run as nobody (non-root)
+    read_only: true                         # Read-only filesystem
+    command:
+      - --postfix.logfile_path=/var/log/postfix.log
+      - --postfix.showq_path=/nonexistent  # Disable socket (log-only mode)
+    volumes:
+      - postfix-logs:/var/log:ro
+    ports:
+      - "127.0.0.1:9154:9154"              # Localhost only
+
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy
+    restart: unless-stopped
+    user: "65534:65534"                    # Run as nobody
+    read_only: true
+    command:
+      - run
+      - --storage.path=/tmp/alloy
+      - /etc/alloy/config.alloy
+    environment:
+      PROMETHEUS_URL: "${PROMETHEUS_URL:-}"
+      PROMETHEUS_USER: "${PROMETHEUS_USER:-}"
+      PROMETHEUS_KEY: "${PROMETHEUS_KEY:-}"
+    volumes:
+      - ./alloy-config.alloy:/etc/alloy/config.alloy:ro
+    tmpfs:
+      - /tmp/alloy                         # Writable temp for WAL
+
+volumes:
+  postfix-logs:                            # Shared volume for logs

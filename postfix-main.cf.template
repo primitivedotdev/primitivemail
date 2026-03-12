@@ -1,0 +1,54 @@
+myhostname = ${MYHOSTNAME}
+mydomain = ${MYDOMAIN}
+
+inet_interfaces = all
+inet_protocols = ipv4
+
+# Don't relay for others (just localhost)
+mynetworks = 127.0.0.0/8
+
+# Accept mail for ANY domain via relay, then discard (milter handles everything)
+mydestination =
+relay_domains = regexp:/etc/postfix/relay_domains
+relay_recipient_maps = regexp:/etc/postfix/relay_recipients
+relay_transport = discard
+
+# Use luser_relay for catch-all delivery
+local_recipient_maps =
+luser_relay = catchall
+
+smtpd_banner = ${MYHOSTNAME} ESMTP
+biff = no
+append_dot_mydomain = no
+readme_directory = no
+compatibility_level = 2
+
+# Timeout for pipe/spawn commands (webhook SLA)
+command_time_limit = 30s
+
+# Log to file for postfix-exporter (Postfix 3.4+ built-in logging)
+# This enables dual logging: stdout (docker logs) AND file (for metrics)
+maillog_file = /var/log/postfix.log
+
+# Rate limiting - prevent abuse/DoS
+smtpd_client_connection_rate_limit = 10
+smtpd_client_message_rate_limit = 50
+smtpd_client_recipient_rate_limit = 100
+anvil_rate_time_unit = 60s
+
+# Message size limit - 25MB (standard SMTP limit)
+message_size_limit = 26214400
+
+# TLS - enable STARTTLS for incoming connections
+# Self-signed cert auto-generated at startup if not provided
+smtpd_tls_cert_file = /etc/postfix/tls/server.pem
+smtpd_tls_key_file = /etc/postfix/tls/server.key
+smtpd_tls_security_level = may
+smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtpd_tls_loglevel = 1
+
+# Milter configuration - intercepts emails BEFORE 250 OK
+# This ensures emails are stored in DB before we acknowledge receipt
+smtpd_milters = inet:127.0.0.1:9900
+milter_default_action = tempfail
+milter_protocol = 6

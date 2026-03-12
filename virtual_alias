@@ -1,0 +1,2 @@
+# Catch all email addresses for our domain
+/@.*/ INBOX

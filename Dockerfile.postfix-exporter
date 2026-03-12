@@ -1,0 +1,32 @@
+# Build Postfix Exporter from official kumina source
+# Source: https://github.com/kumina/postfix_exporter
+
+FROM golang:1.21-alpine AS builder
+
+# Install git and build tools
+RUN apk add --no-cache git make
+
+# Clone official repo
+WORKDIR /build
+RUN git clone https://github.com/kumina/postfix_exporter.git .
+
+# Build the binary without systemd support (we only need log file reading)
+RUN CGO_ENABLED=0 go build -tags nosystemd -o postfix_exporter .
+
+# Runtime stage - minimal image
+FROM alpine:latest
+
+# Install ca-certificates for HTTPS (if needed for metrics push)
+RUN apk add --no-cache ca-certificates
+
+# Copy binary from builder
+COPY --from=builder /build/postfix_exporter /usr/local/bin/postfix_exporter
+
+# Run as non-root user
+RUN addgroup -S exporter && adduser -S exporter -G exporter
+USER exporter
+
+EXPOSE 9154
+
+ENTRYPOINT ["/usr/local/bin/postfix_exporter"]
+CMD ["--postfix.logfile_path=/var/log/postfix.log"]

@@ -1,0 +1,10 @@
+watcher/node_modules
+watcher/dist
+maildata
+__pycache__
+*.pyc
+.git
+.pytest_cache
+docs
+CLAUDE.local.md
+.DS_Store

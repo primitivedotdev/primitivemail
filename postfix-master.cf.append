@@ -1,0 +1,3 @@
+# Custom pipe transport for storing mail (Python version - debug wrapper)
+mxpipe   unix  -       n       n       -       1       pipe
+ flags=R user=root argv=/opt/mx-box/store-mail-wrapper-debug.sh ${recipient}

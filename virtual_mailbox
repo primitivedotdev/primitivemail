@@ -1,0 +1,2 @@
+# Route all emails to catchall user
+/^(.+)@(.+)$/  catchall

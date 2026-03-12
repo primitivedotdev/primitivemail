@@ -1,0 +1,2 @@
+# Route ALL email to our mxpipe transport
+/.+@.+/  mxpipe:

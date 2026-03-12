@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""PrimitiveMail CLI - manage your self-hosted inbox."""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+
+def get_maildata_path(args):
+    """Resolve maildata path from --path flag, env var, or default."""
+    if args.path:
+        return Path(args.path)
+    if os.environ.get("PRIMITIVEMAIL_MAILDATA"):
+        return Path(os.environ["PRIMITIVEMAIL_MAILDATA"])
+    # Default: ~/primitivemail/maildata
+    return Path.home() / "primitivemail" / "maildata"
+
+
+def parse_filename_timestamp(filename):
+    """Parse timestamp from filename like 20260311T225855Z-089ecb30.eml"""
+    try:
+        ts_str = filename.split("-")[0]  # 20260311T225855Z
+        return datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, IndexError):
+        return None
+
+
+def cmd_version(args):
+    print(f"primitive {VERSION}")
+
+
+def cmd_emails_status(args):
+    maildata = get_maildata_path(args)
+
+    if not maildata.exists():
+        print(f"No maildata directory found at {maildata}")
+        sys.exit(1)
+
+    # Find all .eml files across all domain dirs
+    eml_files = sorted(maildata.glob("*/*.eml"))
+    total = len(eml_files)
+
+    if total == 0:
+        print("No emails received yet.")
+        return
+
+    # Most recent email (filenames sort chronologically)
+    latest_eml = eml_files[-1]
+    latest_meta = latest_eml.with_suffix(".meta.json")
+
+    # Parse timestamp from filename
+    received_at = parse_filename_timestamp(latest_eml.name)
+    received_str = received_at.strftime("%Y-%m-%d %H:%M:%S UTC") if received_at else "unknown"
+
+    # Read sender from .meta.json
+    sender = "unknown"
+    if latest_meta.exists():
+        try:
+            meta = json.loads(latest_meta.read_text())
+            sender = meta.get("smtp", {}).get("mail_from", "unknown")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    print(f"Total emails:  {total}")
+    print(f"Last received: {received_str}")
+    print(f"Last from:     {sender}")
+
+
+def get_install_path():
+    """Resolve the primitivemail install directory."""
+    if os.environ.get("PRIMITIVEMAIL_DIR"):
+        return Path(os.environ["PRIMITIVEMAIL_DIR"])
+    return Path.home() / "primitivemail"
+
+
+def cmd_restart(args):
+    install_dir = get_install_path()
+    compose_file = install_dir / "docker-compose.yml"
+
+    if not compose_file.exists():
+        print(f"No docker-compose.yml found at {install_dir}")
+        sys.exit(1)
+
+    print("Reloading PrimitiveMail (only changed containers restart)...")
+    result = subprocess.run(
+        ["docker", "compose", "up", "-d"],
+        cwd=install_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"Failed: {result.stderr.strip()}")
+        sys.exit(1)
+    print("Done.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="primitive",
+        description="Primitive CLI - manage your self-hosted inbox",
+    )
+    parser.add_argument("--path", help="Path to maildata directory")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("version", help="Show version")
+    sub.add_parser("emails-status", help="Show email inbox status")
+    sub.add_parser("restart", help="Reload config and restart changed containers")
+
+    args = parser.parse_args()
+
+    if args.command == "version":
+        cmd_version(args)
+    elif args.command == "emails-status":
+        cmd_emails_status(args)
+    elif args.command == "restart":
+        cmd_restart(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

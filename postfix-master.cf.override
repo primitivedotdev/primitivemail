@@ -1,0 +1,3 @@
+# Override smtp service to disable chroot
+# This allows smtpd to read /etc/postfix/virtual_* files
+smtp      inet  n       -       n       -       -       smtpd

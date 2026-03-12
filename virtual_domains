@@ -1,0 +1,2 @@
+# Accept mail for any domain (catch-all)
+/^.+$/  OK

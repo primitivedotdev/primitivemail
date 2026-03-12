@@ -1,0 +1,9 @@
+.env
+maildata/
+*.pyc
+__pycache__/
+.DS_Store
+CLAUDE.local.md
+.internal/
+watcher/node_modules/
+watcher/dist/
