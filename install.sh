@@ -635,6 +635,24 @@ start_server() {
         echo "  Check logs: docker logs primitivemail"
         exit 1
     fi
+
+    # Check if port 25 is reachable from the outside (detects security group blocks)
+    if [[ -n "$PM_IP_LITERAL" ]]; then
+        local check_ip="$PM_IP_LITERAL"
+        info "Checking port 25 reachability on $check_ip..."
+        if timeout 5 bash -c "echo QUIT | nc -w 3 $check_ip 25" &>/dev/null; then
+            success "Port 25 is reachable from this host"
+        elif timeout 5 bash -c "cat < /dev/tcp/$check_ip/25" &>/dev/null; then
+            success "Port 25 is reachable from this host"
+        else
+            echo ""
+            warn "Port 25 does not appear reachable on $check_ip"
+            echo -e "  PrimitiveMail is running, but external mail may not be able to reach it."
+            echo -e "  If you're on a cloud provider, check that your security group / firewall"
+            echo -e "  allows inbound TCP on port 25."
+            echo ""
+        fi
+    fi
 }
 
 # --- CLI -----------------------------------------------------------------
