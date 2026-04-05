@@ -650,7 +650,7 @@ start_server() {
         $compose_cmd up -d --build --quiet-pull 2>&1 | tail -5
     fi
 
-    # Wait for container to be healthy
+    # Wait for container to start
     local attempts=0
     while [[ $attempts -lt 15 ]]; do
         if docker ps --format '{{.Names}}' | grep -q primitivemail; then
@@ -660,10 +660,27 @@ start_server() {
         attempts=$((attempts + 1))
     done
 
-    if docker ps --format '{{.Names}}' | grep -q primitivemail; then
+    if ! docker ps --format '{{.Names}}' | grep -q primitivemail; then
+        error "Container failed to start"
+        echo ""
+        echo "  Check logs: docker logs primitivemail"
+        exit 1
+    fi
+
+    # Wait for Postfix to bind to port 25 inside the container
+    attempts=0
+    while [[ $attempts -lt 20 ]]; do
+        if docker exec primitivemail sh -c "ss -tln | grep -q ':25 '" &>/dev/null; then
+            break
+        fi
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+
+    if [[ $attempts -lt 20 ]]; then
         success "PrimitiveMail is running on port 25"
     else
-        error "Container failed to start"
+        error "PrimitiveMail started but SMTP did not become ready"
         echo ""
         echo "  Check logs: docker logs primitivemail"
         exit 1
