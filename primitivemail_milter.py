@@ -1057,9 +1057,18 @@ class PrimitiveMailMilter(Milter.Base):
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
             error_body = e.read().decode('utf-8') if e.fp else ''
-            self.log_error(f"Webhook HTTP error {e.code}: {error_body[:200]} (latency: {latency_ms:.0f}ms)")
 
             result = _interpret_webhook_response(e.code, error_body)
+
+            # Log based on the interpreted result, not the HTTP status
+            if result.get('success'):
+                self.log(
+                    f"Webhook responded: {result.get('status', 'N/A')} "
+                    f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
+                )
+            else:
+                self.log_error(f"Webhook HTTP {e.code}: {error_body[:200]} (latency: {latency_ms:.0f}ms)")
+
             metrics_status = 'success' if result.get('success') else 'error'
             record_metrics(lambda: (
                 WEBHOOK_DURATION.labels(status=metrics_status, path=webhook_path).observe(latency_ms / 1000),

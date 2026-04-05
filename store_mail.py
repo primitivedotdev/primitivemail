@@ -246,19 +246,36 @@ class EmailProcessor:
             http_status = e.code
             error_body = e.read().decode('utf-8') if e.fp else ''
 
-            logger.error(
-                "Webhook HTTP error",
-                extra={
-                    "event": "webhook_failed",
-                    "domain": domain,
-                    "recipient": recipient,
-                    "http_status": http_status,
-                    "latency_ms": round(latency_ms, 2),
-                    "error": error_body[:200],
-                }
-            )
+            result = _interpret_webhook_response(http_status, error_body)
 
-            return _interpret_webhook_response(http_status, error_body)
+            # Log based on the interpreted result, not the HTTP status
+            if result.get('success'):
+                logger.info(
+                    f"Webhook responded: {result.get('status', 'N/A')}",
+                    extra={
+                        "event": "webhook_response",
+                        "domain": domain,
+                        "recipient": recipient,
+                        "http_status": http_status,
+                        "ingestion_status": result.get('status'),
+                        "reason": result.get('reason', ''),
+                        "latency_ms": round(latency_ms, 2),
+                    }
+                )
+            else:
+                logger.error(
+                    "Webhook HTTP error",
+                    extra={
+                        "event": "webhook_failed",
+                        "domain": domain,
+                        "recipient": recipient,
+                        "http_status": http_status,
+                        "latency_ms": round(latency_ms, 2),
+                        "error": error_body[:200],
+                    }
+                )
+
+            return result
 
         except urllib.error.URLError as e:
             latency_ms = (time.time() - start_time) * 1000
