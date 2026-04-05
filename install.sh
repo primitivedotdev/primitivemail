@@ -636,21 +636,58 @@ start_server() {
         exit 1
     fi
 
-    # Check if port 25 is reachable from the outside (detects security group blocks)
+    # Check if port 25 is reachable from the outside (detects security group blocks).
+    # This only works when the public IP is NAT'd (not on a local interface), because
+    # the connection hairpins through the cloud gateway and hits firewall rules. If the
+    # IP is bound locally, the kernel routes it without leaving the machine, so the
+    # test would give a false positive — skip it in that case.
     if [[ -n "$PM_IP_LITERAL" ]]; then
         local check_ip="$PM_IP_LITERAL"
-        info "Checking port 25 reachability on $check_ip..."
-        if timeout 5 bash -c 'echo QUIT | nc -w 3 "$1" 25' _ "$check_ip" &>/dev/null; then
-            success "Port 25 is reachable from this host"
-        elif timeout 5 bash -c 'cat < /dev/tcp/"$1"/25' _ "$check_ip" &>/dev/null; then
-            success "Port 25 is reachable from this host"
+        if ip addr show 2>/dev/null | grep -q "$check_ip"; then
+            info "Public IP is on a local interface — skipping port 25 reachability check"
         else
-            echo ""
-            warn "Port 25 does not appear reachable on $check_ip"
-            echo -e "  PrimitiveMail is running, but external mail may not be able to reach it."
-            echo -e "  If you're on a cloud provider, check that your security group / firewall"
-            echo -e "  allows inbound TCP on port 25."
-            echo ""
+            info "Checking port 25 reachability on $check_ip..."
+            if timeout 5 bash -c 'echo QUIT | nc -w 3 "$1" 25' _ "$check_ip" &>/dev/null; then
+                success "Port 25 is reachable from this host"
+            elif timeout 5 bash -c 'cat < /dev/tcp/"$1"/25' _ "$check_ip" &>/dev/null; then
+                success "Port 25 is reachable from this host"
+            else
+                echo ""
+                warn "Port 25 does not appear reachable on $check_ip"
+                echo -e "  PrimitiveMail is running, but external mail won't reach it until you"
+                echo -e "  allow inbound TCP on port 25 in your firewall settings."
+                echo ""
+                local cloud=""
+                if curl -s -m 1 http://169.254.169.254/latest/meta-data/ &>/dev/null; then
+                    cloud="aws"
+                elif curl -s -m 1 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/ &>/dev/null; then
+                    cloud="gcp"
+                elif curl -s -m 1 -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" &>/dev/null; then
+                    cloud="azure"
+                fi
+                case "$cloud" in
+                    aws)
+                        echo -e "  It looks like you're on ${BOLD}AWS${NC}. To fix this:"
+                        echo -e "  EC2 > Security Groups > Edit inbound rules > Add rule:"
+                        echo -e "  Type: Custom TCP | Port: 25 | Source: 0.0.0.0/0"
+                        ;;
+                    gcp)
+                        echo -e "  It looks like you're on ${BOLD}Google Cloud${NC}. To fix this:"
+                        echo -e "  VPC Network > Firewall > Create rule:"
+                        echo -e "  Direction: Ingress | Protocol: TCP | Port: 25 | Source: 0.0.0.0/0"
+                        ;;
+                    azure)
+                        echo -e "  It looks like you're on ${BOLD}Azure${NC}. To fix this:"
+                        echo -e "  Network Security Group > Inbound security rules > Add:"
+                        echo -e "  Protocol: TCP | Destination port: 25 | Source: Any"
+                        ;;
+                    *)
+                        echo -e "  Check your cloud provider's security group / firewall settings"
+                        echo -e "  and ensure inbound TCP on port 25 is allowed from 0.0.0.0/0."
+                        ;;
+                esac
+                echo ""
+            fi
         fi
     fi
 }
