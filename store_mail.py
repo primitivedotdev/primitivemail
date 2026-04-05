@@ -249,8 +249,9 @@ class EmailProcessor:
             result = _interpret_webhook_response(http_status, error_body)
 
             # Log based on the interpreted result, not the HTTP status
+            log_fn = logger.info if result.get('status') == 'accepted' else logger.warning
             if result.get('success'):
-                logger.info(
+                log_fn(
                     f"Webhook responded: {result.get('status', 'N/A')}",
                     extra={
                         "event": "webhook_response",

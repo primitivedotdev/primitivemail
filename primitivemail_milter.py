@@ -1061,9 +1061,14 @@ class PrimitiveMailMilter(Milter.Base):
             result = _interpret_webhook_response(e.code, error_body)
 
             # Log based on the interpreted result, not the HTTP status
-            if result.get('success'):
+            if result.get('success') and result.get('status') == 'accepted':
                 self.log(
-                    f"Webhook responded: {result.get('status', 'N/A')} "
+                    f"Webhook responded: accepted "
+                    f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
+                )
+            elif result.get('success'):
+                logger.warning(
+                    f"[{self.id}] Webhook responded: {result.get('status')} "
                     f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
                 )
             else:
