@@ -481,6 +481,113 @@ class TestEdgeCases:
 
 
 # ===========================================================================
+# Webhook HTTP status code fallback
+# ===========================================================================
+
+class TestWebhookHTTPStatusFallback:
+    """
+    Test that HTTP status codes are used as fallback when the response body
+    does not contain a JSON 'status' field. JSON 'status' is authoritative
+    when present and overrides the HTTP status code.
+    """
+
+    def test_http_200_empty_body_accepted(self, milter):
+        """HTTP 200 with empty body → accepted via HTTP status fallback"""
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        with patch('urllib.request.urlopen', return_value=MockResponse(200, '')):
+            result = milter.eom()
+
+        assert result == mock_milter.ACCEPT
+
+    def test_http_200_non_json_accepted(self, milter):
+        """HTTP 200 with non-JSON body → accepted via HTTP status fallback"""
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        with patch('urllib.request.urlopen', return_value=MockResponse(200, 'OK')):
+            result = milter.eom()
+
+        assert result == mock_milter.ACCEPT
+
+    def test_http_4xx_no_json_tempfails(self, milter):
+        """HTTP 4xx without JSON status → tempfail (safe default, sender retries)"""
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        mock_error = HTTPError(
+            url="https://test.example.com/webhook",
+            code=422,
+            msg="Unprocessable",
+            hdrs={},
+            fp=BytesIO(b'')
+        )
+
+        with patch('urllib.request.urlopen', side_effect=mock_error):
+            result = milter.eom()
+
+        assert result == mock_milter.TEMPFAIL
+
+    def test_http_5xx_no_json_tempfails(self, milter):
+        """HTTP 5xx without JSON status → tempfail"""
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        mock_error = HTTPError(
+            url="https://test.example.com/webhook",
+            code=500,
+            msg="Server Error",
+            hdrs={},
+            fp=BytesIO(b'')
+        )
+
+        with patch('urllib.request.urlopen', side_effect=mock_error):
+            result = milter.eom()
+
+        assert result == mock_milter.TEMPFAIL
+
+    def test_http_4xx_with_json_status_uses_json(self, milter):
+        """HTTP 422 with JSON {"status": "accepted"} → JSON wins → ACCEPT"""
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        mock_error = HTTPError(
+            url="https://test.example.com/webhook",
+            code=422,
+            msg="Unprocessable",
+            hdrs={},
+            fp=BytesIO(json.dumps({"status": "accepted"}).encode())
+        )
+
+        with patch('urllib.request.urlopen', side_effect=mock_error):
+            result = milter.eom()
+
+        assert result == mock_milter.ACCEPT
+
+    def test_http_200_with_reject_json_uses_json(self, milter):
+        """HTTP 200 with {"status": "reject_permanent"} → JSON wins → REJECT"""
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        response = MockResponse(200, json.dumps({
+            "status": "reject_permanent",
+            "reason": "domain_not_found"
+        }))
+
+        with patch('urllib.request.urlopen', return_value=response):
+            result = milter.eom()
+
+        assert result == mock_milter.REJECT
+
+
+# ===========================================================================
 # Standalone mode
 # ===========================================================================
 

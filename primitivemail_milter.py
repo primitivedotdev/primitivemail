@@ -253,6 +253,36 @@ if SPOOF_PROTECTION != 'off':
 validator = EmailValidator()
 
 
+def _interpret_webhook_response(http_status: int, body: str) -> Dict[str, Any]:
+    """Interpret a webhook response. JSON 'status' field is authoritative when
+    present; otherwise fall back to HTTP status code mapping.
+
+    Returns a dict compatible with the existing webhook result contract:
+      {'success': True, 'status': ..., 'reason': ..., 'detail': ...}  or
+      {'success': False, 'error': ...}
+    """
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict) and 'status' in data:
+            return {
+                'success': True,
+                'status': data['status'],
+                'reason': data.get('reason', ''),
+                'detail': data.get('detail', ''),
+            }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Fall back to HTTP status code
+    if 200 <= http_status < 300:
+        return {'success': True, 'status': 'accepted', 'reason': '', 'detail': ''}
+    else:
+        # 4xx/5xx without explicit JSON status = something went wrong on the
+        # webhook side (auth failure, server error, bug). Tempfail so the
+        # sender retries and no mail is lost.
+        return {'success': False, 'error': f'HTTP {http_status}'}
+
+
 class PrimitiveMailMilter(Milter.Base):
     """
     Milter that intercepts emails during SMTP.
@@ -1012,42 +1042,32 @@ class PrimitiveMailMilter(Milter.Base):
                 response_body = response.read().decode('utf-8')
                 webhook_path = 'storage_first' if storage_result else 'inline'
 
-                try:
-                    response_data = json.loads(response_body)
-                    self.log(
-                        f"Webhook responded: {response_data.get('status')} "
-                        f"(latency: {latency_ms:.0f}ms)"
-                    )
-                    record_metrics(lambda: (
-                        WEBHOOK_DURATION.labels(status='success', path=webhook_path).observe(latency_ms / 1000),
-                        WEBHOOK_CALLS_TOTAL.labels(status='success', path=webhook_path).inc(),
-                    ))
-                    return {
-                        'success': True,
-                        'status': response_data.get('status'),
-                        'reason': response_data.get('reason', ''),
-                        'detail': response_data.get('detail', ''),
-                    }
-                except json.JSONDecodeError:
-                    self.log_error("Invalid JSON response from webhook")
-                    record_metrics(lambda: (
-                        WEBHOOK_DURATION.labels(status='error', path=webhook_path).observe(latency_ms / 1000),
-                        WEBHOOK_CALLS_TOTAL.labels(status='error', path=webhook_path).inc(),
-                        ERRORS_TOTAL.labels(stage='webhook').inc(),
-                    ))
-                    return {'success': False, 'error': 'Invalid JSON response'}
+                result = _interpret_webhook_response(response.status, response_body)
+                self.log(
+                    f"Webhook responded: {result.get('status', 'N/A')} "
+                    f"(latency: {latency_ms:.0f}ms)"
+                )
+                record_metrics(lambda: (
+                    WEBHOOK_DURATION.labels(status='success', path=webhook_path).observe(latency_ms / 1000),
+                    WEBHOOK_CALLS_TOTAL.labels(status='success', path=webhook_path).inc(),
+                ))
+                return result
 
         except urllib.error.HTTPError as e:
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
             error_body = e.read().decode('utf-8') if e.fp else ''
             self.log_error(f"Webhook HTTP error {e.code}: {error_body[:200]} (latency: {latency_ms:.0f}ms)")
+
+            result = _interpret_webhook_response(e.code, error_body)
+            metrics_status = 'success' if result.get('success') else 'error'
             record_metrics(lambda: (
-                WEBHOOK_DURATION.labels(status='error', path=webhook_path).observe(latency_ms / 1000),
-                WEBHOOK_CALLS_TOTAL.labels(status='error', path=webhook_path).inc(),
-                ERRORS_TOTAL.labels(stage='webhook').inc(),
+                WEBHOOK_DURATION.labels(status=metrics_status, path=webhook_path).observe(latency_ms / 1000),
+                WEBHOOK_CALLS_TOTAL.labels(status=metrics_status, path=webhook_path).inc(),
             ))
-            return {'success': False, 'error': f'HTTP {e.code}'}
+            if not result.get('success'):
+                record_metrics(lambda: ERRORS_TOTAL.labels(stage='webhook').inc())
+            return result
 
         except urllib.error.URLError as e:
             latency_ms = (time.time() - start_time) * 1000

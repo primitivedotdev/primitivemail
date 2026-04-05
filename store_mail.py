@@ -62,6 +62,36 @@ except Exception as e:
 MESSAGE_ID_DOMAIN = os.environ.get('MYDOMAIN', 'primitivemail')
 
 
+def _interpret_webhook_response(http_status: int, body: str) -> dict:
+    """Interpret a webhook response. JSON 'status' field is authoritative when
+    present; otherwise fall back to HTTP status code mapping.
+
+    Returns a dict compatible with the existing webhook result contract:
+      {'success': True, 'status': ..., 'reason': ..., 'detail': ...}  or
+      {'success': False, 'error': ...}
+    """
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict) and 'status' in data:
+            return {
+                'success': True,
+                'status': data['status'],
+                'reason': data.get('reason', ''),
+                'detail': data.get('detail', ''),
+            }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+
+    # Fall back to HTTP status code
+    if 200 <= http_status < 300:
+        return {'success': True, 'status': 'accepted', 'reason': '', 'detail': ''}
+    else:
+        # 4xx/5xx without explicit JSON status = something went wrong on the
+        # webhook side (auth failure, server error, bug). Tempfail so the
+        # sender retries and no mail is lost.
+        return {'success': False, 'error': f'HTTP {http_status}'}
+
+
 class EmailProcessor:
     def __init__(self, webhook_url: Optional[str] = None, webhook_secret: Optional[str] = None):
         self.webhook_url = webhook_url
@@ -194,37 +224,22 @@ class EmailProcessor:
                 http_status = response.status
                 response_body = response.read().decode('utf-8')
 
-                # Parse JSON response to check status
-                try:
-                    response_data = json.loads(response_body)
-                    status = response_data.get('status')
-                    reason = response_data.get('reason', '')
+                result = _interpret_webhook_response(http_status, response_body)
 
-                    logger.info(
-                        f"Webhook responded: {status}",
-                        extra={
-                            "event": "webhook_response",
-                            "domain": domain,
-                            "recipient": recipient,
-                            "http_status": http_status,
-                            "ingestion_status": status,
-                            "reason": reason,
-                            "latency_ms": round(latency_ms, 2),
-                        }
-                    )
+                logger.info(
+                    f"Webhook responded: {result.get('status', 'N/A')}",
+                    extra={
+                        "event": "webhook_response",
+                        "domain": domain,
+                        "recipient": recipient,
+                        "http_status": http_status,
+                        "ingestion_status": result.get('status'),
+                        "reason": result.get('reason', ''),
+                        "latency_ms": round(latency_ms, 2),
+                    }
+                )
 
-                    # Return status for caller to map to SMTP code
-                    return {
-                        'success': True,
-                        'status': status,
-                        'reason': reason,
-                    }
-                except json.JSONDecodeError:
-                    logger.error("Invalid JSON response from webhook")
-                    return {
-                        'success': False,
-                        'error': 'Invalid JSON response'
-                    }
+                return result
 
         except urllib.error.HTTPError as e:
             latency_ms = (time.time() - start_time) * 1000
@@ -242,10 +257,8 @@ class EmailProcessor:
                     "error": error_body[:200],
                 }
             )
-            return {
-                'success': False,
-                'error': f'HTTP {http_status}: {error_body[:200]}'
-            }
+
+            return _interpret_webhook_response(http_status, error_body)
 
         except urllib.error.URLError as e:
             latency_ms = (time.time() - start_time) * 1000
