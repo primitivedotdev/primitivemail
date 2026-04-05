@@ -640,9 +640,9 @@ start_server() {
     if [[ -n "$PM_IP_LITERAL" ]]; then
         local check_ip="$PM_IP_LITERAL"
         info "Checking port 25 reachability on $check_ip..."
-        if timeout 5 bash -c "echo QUIT | nc -w 3 $check_ip 25" &>/dev/null; then
+        if timeout 5 bash -c 'echo QUIT | nc -w 3 "$1" 25' _ "$check_ip" &>/dev/null; then
             success "Port 25 is reachable from this host"
-        elif timeout 5 bash -c "cat < /dev/tcp/$check_ip/25" &>/dev/null; then
+        elif timeout 5 bash -c 'cat < /dev/tcp/"$1"/25' _ "$check_ip" &>/dev/null; then
             success "Port 25 is reachable from this host"
         else
             echo ""
