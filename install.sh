@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # PrimitiveMail Installer
-# Usage: curl -fsSL https://primitive.dev/install.sh | bash
+# Usage: curl -fsSL https://get.primitive.dev | bash
 #   or:  ./install.sh --hostname mx.example.com --domain example.com
 
 BOLD='\033[1m'
