@@ -681,7 +681,7 @@ start_server() {
         local port_status=""
         if [[ -n "$check_result" ]]; then
             # Parse status from JSON response (avoid jq dependency)
-            port_status=$(echo "$check_result" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+            port_status=$(echo "$check_result" | grep -o '"status" *: *"[^"]*"' | cut -d'"' -f4)
         fi
 
         case "$port_status" in
