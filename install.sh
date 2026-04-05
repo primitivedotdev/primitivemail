@@ -582,6 +582,39 @@ configure() {
 
 # --- Start ---------------------------------------------------------------
 
+print_firewall_help() {
+    local cloud=""
+    if curl -s -m 1 http://169.254.169.254/latest/meta-data/ &>/dev/null; then
+        cloud="aws"
+    elif curl -s -m 1 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/ &>/dev/null; then
+        cloud="gcp"
+    elif curl -s -m 1 -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" &>/dev/null; then
+        cloud="azure"
+    fi
+    case "$cloud" in
+        aws)
+            echo -e "  It looks like you're on ${BOLD}AWS${NC}. To fix this:"
+            echo -e "  EC2 > Security Groups > Edit inbound rules > Add rule:"
+            echo -e "  Type: Custom TCP | Port: 25 | Source: 0.0.0.0/0"
+            ;;
+        gcp)
+            echo -e "  It looks like you're on ${BOLD}Google Cloud${NC}. To fix this:"
+            echo -e "  VPC Network > Firewall > Create rule:"
+            echo -e "  Direction: Ingress | Protocol: TCP | Port: 25 | Source: 0.0.0.0/0"
+            ;;
+        azure)
+            echo -e "  It looks like you're on ${BOLD}Azure${NC}. To fix this:"
+            echo -e "  Network Security Group > Inbound security rules > Add:"
+            echo -e "  Protocol: TCP | Destination port: 25 | Source: Any"
+            ;;
+        *)
+            echo -e "  Check your cloud provider's security group / firewall settings"
+            echo -e "  and ensure inbound TCP on port 25 is allowed from 0.0.0.0/0."
+            ;;
+    esac
+    echo ""
+}
+
 start_server() {
     if [[ $NO_START -eq 1 ]]; then
         info "Skipping start (--no-start)"
@@ -636,59 +669,69 @@ start_server() {
         exit 1
     fi
 
-    # Check if port 25 is reachable from the outside (detects security group blocks).
-    # This only works when the public IP is NAT'd (not on a local interface), because
-    # the connection hairpins through the cloud gateway and hits firewall rules. If the
-    # IP is bound locally, the kernel routes it without leaving the machine, so the
-    # test would give a false positive — skip it in that case.
+    # Check if port 25 is reachable from the outside via external probe service.
+    # Falls back to a local hairpin check if the API is unreachable (only works
+    # when the public IP is NAT'd — see comment below).
     local check_ip="${PM_IP_LITERAL:-$(detect_public_ip)}"
     if [[ -n "$check_ip" ]]; then
-        if ip addr show 2>/dev/null | grep -qF " $check_ip/"; then
-            info "Public IP is on a local interface — skipping port 25 reachability check"
-        else
-            info "Checking port 25 reachability on $check_ip..."
-            if timeout 5 bash -c 'echo QUIT | nc -w 3 "$1" 25' _ "$check_ip" &>/dev/null; then
-                success "Port 25 is reachable from this host"
-            elif timeout 5 bash -c 'cat < /dev/tcp/"$1"/25' _ "$check_ip" &>/dev/null; then
-                success "Port 25 is reachable from this host"
-            else
+        info "Checking port 25 reachability on $check_ip..."
+        local check_result=""
+        check_result=$(curl -fsSL --max-time 10 "https://mx-tools.primitive.dev/check?ip=$check_ip" 2>/dev/null) || true
+
+        local port_status=""
+        if [[ -n "$check_result" ]]; then
+            # Parse status from JSON response (avoid jq dependency)
+            port_status=$(echo "$check_result" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+        fi
+
+        case "$port_status" in
+            open)
+                success "Port 25 is reachable from the outside"
+                ;;
+            closed)
                 echo ""
-                warn "Port 25 does not appear reachable on $check_ip"
+                warn "Port 25 is not accepting connections on $check_ip"
+                echo -e "  The host is reachable but nothing is listening on port 25."
+                echo -e "  Check that the PrimitiveMail container is running:"
+                echo -e "    docker ps | grep primitivemail"
+                echo -e "    docker logs primitivemail"
+                echo ""
+                ;;
+            blocked)
+                echo ""
+                warn "Port 25 appears blocked by a firewall on $check_ip"
                 echo -e "  PrimitiveMail is running, but external mail won't reach it until you"
                 echo -e "  allow inbound TCP on port 25 in your firewall settings."
                 echo ""
-                local cloud=""
-                if curl -s -m 1 http://169.254.169.254/latest/meta-data/ &>/dev/null; then
-                    cloud="aws"
-                elif curl -s -m 1 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/ &>/dev/null; then
-                    cloud="gcp"
-                elif curl -s -m 1 -H "Metadata: true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" &>/dev/null; then
-                    cloud="azure"
-                fi
-                case "$cloud" in
-                    aws)
-                        echo -e "  It looks like you're on ${BOLD}AWS${NC}. To fix this:"
-                        echo -e "  EC2 > Security Groups > Edit inbound rules > Add rule:"
-                        echo -e "  Type: Custom TCP | Port: 25 | Source: 0.0.0.0/0"
-                        ;;
-                    gcp)
-                        echo -e "  It looks like you're on ${BOLD}Google Cloud${NC}. To fix this:"
-                        echo -e "  VPC Network > Firewall > Create rule:"
-                        echo -e "  Direction: Ingress | Protocol: TCP | Port: 25 | Source: 0.0.0.0/0"
-                        ;;
-                    azure)
-                        echo -e "  It looks like you're on ${BOLD}Azure${NC}. To fix this:"
-                        echo -e "  Network Security Group > Inbound security rules > Add:"
-                        echo -e "  Protocol: TCP | Destination port: 25 | Source: Any"
-                        ;;
-                    *)
-                        echo -e "  Check your cloud provider's security group / firewall settings"
-                        echo -e "  and ensure inbound TCP on port 25 is allowed from 0.0.0.0/0."
-                        ;;
-                esac
+                print_firewall_help
+                ;;
+            error)
                 echo ""
-            fi
-        fi
+                warn "Port 25 check failed — host unreachable at $check_ip"
+                echo -e "  Verify that this is the correct public IP for your server."
+                echo -e "  You can check manually at: ${BOLD}https://mx-tools.primitive.dev${NC}"
+                echo ""
+                ;;
+            *)
+                # API unreachable or returned unexpected status — fall back to local
+                # hairpin check (only reliable when the IP is NAT'd, not local)
+                warn "Could not reach port check service — falling back to local check"
+                if ip addr show 2>/dev/null | grep -qF " $check_ip/"; then
+                    info "Public IP is on a local interface — cannot verify port 25 from here"
+                    echo -e "  Check manually at: ${BOLD}https://mx-tools.primitive.dev${NC}"
+                elif timeout 5 bash -c 'echo QUIT | nc -w 3 "$1" 25' _ "$check_ip" &>/dev/null; then
+                    success "Port 25 is reachable from this host"
+                elif timeout 5 bash -c 'cat < /dev/tcp/"$1"/25' _ "$check_ip" &>/dev/null; then
+                    success "Port 25 is reachable from this host"
+                else
+                    echo ""
+                    warn "Port 25 does not appear reachable on $check_ip"
+                    echo -e "  PrimitiveMail is running, but external mail may not be able to reach it."
+                    echo -e "  You can verify manually at: ${BOLD}https://mx-tools.primitive.dev${NC}"
+                    echo ""
+                fi
+                ;;
+        esac
     fi
 }
 
