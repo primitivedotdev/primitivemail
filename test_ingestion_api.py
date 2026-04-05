@@ -106,29 +106,28 @@ Test email body.
         assert exit_code == 67, f"Permanent rejection ({reason}) must return exit 67 (550)"
 
     # ========================================================================
-    # TEST 3: HTTP ERRORS (401, 500, 503, etc.)
+    # TEST 3: HTTP errors without JSON status → tempfail (exit 75)
     # ========================================================================
-    @pytest.mark.parametrize("http_status", [401, 403, 500, 502, 503])
-    def test_http_errors_return_exit_75(self, processor, http_status):
+    @pytest.mark.parametrize("http_status", [400, 401, 403, 404, 422, 500, 502, 503])
+    def test_http_errors_without_json_status_return_exit_75(self, processor, http_status):
         """
-        CRITICAL: HTTP errors → script must exit 75 → Postfix sends 451 (tempfail)
-        Sender will retry later when API is back up
+        HTTP 4xx/5xx without a JSON 'status' field → tempfail → exit 75 (451)
+        Safe default: sender retries, no mail lost from webhook misconfiguration.
         """
         email = self.make_email()
 
-        # Mock HTTPError
         mock_error = HTTPError(
             url="https://test.example.com/api/inbound",
             code=http_status,
             msg="Error",
             hdrs={},
-            fp=BytesIO(b'{"error": "Internal server error"}')
+            fp=BytesIO(b'{"error": "Something went wrong"}')
         )
 
         with patch('urllib.request.urlopen', side_effect=mock_error):
             exit_code = processor.process_email(email)
 
-        assert exit_code == 75, f"HTTP {http_status} must return exit 75 (451 tempfail)"
+        assert exit_code == 75, f"HTTP {http_status} without JSON status must return exit 75 (451 tempfail)"
 
     # ========================================================================
     # TEST 4: NETWORK ERRORS (Timeout, connection refused, DNS failure)
@@ -153,21 +152,21 @@ Test email body.
         assert exit_code == 75, f"Network error ({error_reason}) must return exit 75 (451)"
 
     # ========================================================================
-    # TEST 5: INVALID JSON RESPONSE
+    # TEST 5: HTTP 200 with non-JSON body → accepted (fallback to HTTP status)
     # ========================================================================
-    def test_invalid_json_returns_exit_75(self, processor):
+    def test_http_200_non_json_returns_exit_0(self, processor):
         """
-        CRITICAL: If API returns invalid JSON → exit 75 → 451 tempfail
+        HTTP 200 with non-JSON body → falls back to HTTP status → accepted → exit 0
+        Simplest possible webhook: just return 200.
         """
         email = self.make_email()
 
-        # Mock response with invalid JSON
         mock_response = MockResponse(200, "NOT JSON")
 
         with patch('urllib.request.urlopen', return_value=mock_response):
             exit_code = processor.process_email(email)
 
-        assert exit_code == 75, "Invalid JSON must return exit 75 (451 tempfail)"
+        assert exit_code == 0, "HTTP 200 without JSON must return exit 0 (accepted via HTTP status fallback)"
 
     # ========================================================================
     # TEST 6: UNKNOWN STATUS IN RESPONSE
@@ -188,11 +187,11 @@ Test email body.
         assert exit_code == 75, "Unknown status must return exit 75 (451 tempfail)"
 
     # ========================================================================
-    # TEST 7: MISSING STATUS FIELD
+    # TEST 7: HTTP 200 with JSON missing 'status' → accepted (fallback)
     # ========================================================================
-    def test_missing_status_field_returns_exit_75(self, processor):
+    def test_http_200_missing_status_field_returns_exit_0(self, processor):
         """
-        CRITICAL: Response missing 'status' field → exit 75 → 451
+        HTTP 200 with JSON that has no 'status' field → falls back to HTTP status → accepted
         """
         email = self.make_email()
 
@@ -203,7 +202,7 @@ Test email body.
         with patch('urllib.request.urlopen', return_value=mock_response):
             exit_code = processor.process_email(email)
 
-        assert exit_code == 75, "Missing status field must return exit 75 (451)"
+        assert exit_code == 0, "HTTP 200 without status field must return exit 0 (accepted via HTTP status fallback)"
 
     # ========================================================================
     # TEST 8: MISSING WEBHOOK CONFIG
@@ -322,6 +321,77 @@ Test email body.
         decoded = base64.b64decode(captured_payload['eml_base64']).decode('utf-8')
         assert decoded == email, "Email should be correctly base64-encoded and decodable"
 
+    # ========================================================================
+    # TEST 13: HTTP 200 empty body → accepted (HTTP status fallback)
+    # ========================================================================
+    def test_http_200_empty_body_returns_exit_0(self, processor):
+        """HTTP 200 with empty body → accepted via HTTP status fallback"""
+        email = self.make_email()
+
+        mock_response = MockResponse(200, "")
+
+        with patch('urllib.request.urlopen', return_value=mock_response):
+            exit_code = processor.process_email(email)
+
+        assert exit_code == 0, "HTTP 200 with empty body must return exit 0 (accepted)"
+
+    # ========================================================================
+    # TEST 14: HTTP 4xx with JSON status overrides HTTP status
+    # ========================================================================
+    def test_http_4xx_with_json_accepted_returns_exit_0(self, processor):
+        """HTTP 422 with JSON {"status": "accepted"} → JSON wins → exit 0"""
+        email = self.make_email()
+
+        mock_error = HTTPError(
+            url="https://test.example.com/api/inbound",
+            code=422,
+            msg="Unprocessable",
+            hdrs={},
+            fp=BytesIO(json.dumps({"status": "accepted"}).encode())
+        )
+
+        with patch('urllib.request.urlopen', side_effect=mock_error):
+            exit_code = processor.process_email(email)
+
+        assert exit_code == 0, "HTTP 4xx with JSON status=accepted must return exit 0 (JSON overrides HTTP)"
+
+    # ========================================================================
+    # TEST 15: HTTP 5xx with JSON status overrides HTTP status
+    # ========================================================================
+    def test_http_5xx_with_json_accepted_returns_exit_0(self, processor):
+        """HTTP 500 with JSON {"status": "accepted"} → JSON wins → exit 0"""
+        email = self.make_email()
+
+        mock_error = HTTPError(
+            url="https://test.example.com/api/inbound",
+            code=500,
+            msg="Server Error",
+            hdrs={},
+            fp=BytesIO(json.dumps({"status": "accepted"}).encode())
+        )
+
+        with patch('urllib.request.urlopen', side_effect=mock_error):
+            exit_code = processor.process_email(email)
+
+        assert exit_code == 0, "HTTP 5xx with JSON status=accepted must return exit 0 (JSON overrides HTTP)"
+
+    # ========================================================================
+    # TEST 16: HTTP 200 with reject JSON → JSON overrides HTTP status
+    # ========================================================================
+    def test_http_200_with_reject_json_returns_exit_67(self, processor):
+        """HTTP 200 with JSON {"status": "reject_permanent"} → JSON wins → exit 67"""
+        email = self.make_email()
+
+        mock_response = MockResponse(200, json.dumps({
+            "status": "reject_permanent",
+            "reason": "sender_blocked"
+        }))
+
+        with patch('urllib.request.urlopen', return_value=mock_response):
+            exit_code = processor.process_email(email)
+
+        assert exit_code == 67, "HTTP 200 with JSON status=reject_permanent must return exit 67 (JSON overrides HTTP)"
+
 
 class TestEmailProcessorExitCodeContract:
     """
@@ -391,28 +461,26 @@ class TestEmailProcessorExitCodeContract:
 
     def test_never_exit_0_on_errors(self, processor):
         """
-        CRITICAL SAFETY: NEVER exit 0 (250 OK) unless API explicitly says 'accepted'
-        This prevents silent data loss
+        CRITICAL SAFETY: NEVER exit 0 (250 OK) on server errors or network failures.
+
+        Note: HTTP 200 with no JSON status is now intentionally accepted (exit 0)
+        via HTTP status code fallback — that is not an error scenario.
         """
         email = "From: test@test.com\nTo: test@test.com\nX-Original-To: test@test.com\n\nBody"
 
         error_scenarios = [
-            # HTTP errors
+            # HTTP 5xx errors (no JSON status → tempfail)
             HTTPError("url", 500, "Error", {}, BytesIO(b'{"error": "server error"}')),
+
+            # HTTP 4xx errors (no JSON status → reject, not exit 0)
             HTTPError("url", 401, "Unauth", {}, BytesIO(b'{"error": "unauthorized"}')),
 
             # Network errors
             URLError("Connection refused"),
             URLError("timed out"),
 
-            # Invalid JSON
-            MockResponse(200, "NOT JSON"),
-
-            # Unknown status
+            # Unknown status (JSON with status field → status authoritative → tempfail)
             MockResponse(200, json.dumps({"status": "unknown"})),
-
-            # Missing status
-            MockResponse(200, json.dumps({"some_field": "value"})),
         ]
 
         for error in error_scenarios:
