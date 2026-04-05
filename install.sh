@@ -641,8 +641,8 @@ start_server() {
     # the connection hairpins through the cloud gateway and hits firewall rules. If the
     # IP is bound locally, the kernel routes it without leaving the machine, so the
     # test would give a false positive — skip it in that case.
-    if [[ -n "$PM_IP_LITERAL" ]]; then
-        local check_ip="$PM_IP_LITERAL"
+    local check_ip="${PM_IP_LITERAL:-$(detect_public_ip)}"
+    if [[ -n "$check_ip" ]]; then
         if ip addr show 2>/dev/null | grep -qF " $check_ip/"; then
             info "Public IP is on a local interface — skipping port 25 reachability check"
         else
