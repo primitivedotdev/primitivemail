@@ -69,6 +69,22 @@ find /tmp -name 'pipe-debug-*.log' -mtime +1 -delete 2>/dev/null || true
 # Start rsyslog (optional, for logs)
 service rsyslog start || true
 
+# Optionally tail Postfix log to stdout for container log collectors (Datadog, CloudWatch, etc.)
+# Postfix still writes to /var/log/postfix.log regardless — this just mirrors it to stdout.
+if [ "${POSTFIX_LOG_STDOUT:-false}" = "true" ]; then
+    touch /var/log/postfix.log
+    tail -F /var/log/postfix.log &
+    echo "Postfix log tailing to stdout enabled"
+fi
+
+# Ensure Postfix queue directories exist and are readable
+# (host mounts may start empty; permissions needed for monitoring tools)
+for dir in incoming active deferred hold maildrop corrupt bounce defer flush saved trace; do
+    mkdir -p "/var/spool/postfix/$dir"
+done
+chmod 755 /var/spool/postfix/incoming /var/spool/postfix/active /var/spool/postfix/deferred /var/spool/postfix/hold
+chown -R postfix:postfix /var/spool/postfix
+
 # Datadog APM tracing (optional — set DATADOG_TRACING_ENABLED=true to enable)
 if [ "${DATADOG_TRACING_ENABLED:-false}" = "true" ]; then
     export DD_SERVICE="${DD_SERVICE:-milter}"
