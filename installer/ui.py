@@ -40,12 +40,10 @@ def _get_tty_input(prompt_text: str) -> str:
     """Read a line from /dev/tty (works under curl|bash where stdin is the pipe).
     Falls back to sys.stdin if /dev/tty is unavailable."""
     try:
-        tty = open("/dev/tty", "r")
-        sys.stderr.write(prompt_text)
-        sys.stderr.flush()
-        line = tty.readline().rstrip("\n")
-        tty.close()
-        return line
+        with open("/dev/tty", "r") as tty:
+            sys.stderr.write(prompt_text)
+            sys.stderr.flush()
+            return tty.readline().rstrip("\n")
     except OSError:
         return input(prompt_text)
 
@@ -79,10 +77,10 @@ def prompt_choice(prompt_text: str, max_val: int, default: int, no_prompt: bool)
     return default
 
 
-def run_with_progress(cmd: list, label: str, verbose: bool = False) -> None:
+def run_with_progress(cmd: list, label: str, verbose: bool = False, cwd: str = None) -> None:
     """Run a command with a braille spinner. On failure, print last 20 lines and exit."""
     if verbose:
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, cwd=cwd)
         if result.returncode != 0:
             error(f"{label} failed")
             sys.exit(1)
@@ -90,7 +88,7 @@ def run_with_progress(cmd: list, label: str, verbose: bool = False) -> None:
         return
 
     spin_chars = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd)
 
     stop = threading.Event()
     elapsed = [0]

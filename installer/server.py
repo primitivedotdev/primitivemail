@@ -47,6 +47,7 @@ def build_and_start(
             compose_cmd + ["build", "--quiet"],
             "Building",
             verbose=verbose,
+            cwd=install_dir,
         )
         print()
         ui.step("Starting PrimitiveMail")
@@ -113,10 +114,10 @@ def check_port_25_local_fallback(ip: str) -> Optional[bool]:
     if result.returncode == 0 and f" {ip}/" in result.stdout:
         return None  # Can't self-check a local IP
 
-    # Try nc
+    # Try nc (pass ip as positional arg to avoid shell injection)
     try:
         result = subprocess.run(
-            ["timeout", "5", "bash", "-c", f'echo QUIT | nc -w 3 "{ip}" 25'],
+            ["timeout", "5", "bash", "-c", 'echo QUIT | nc -w 3 "$1" 25', "_", ip],
             capture_output=True, timeout=10,
         )
         if result.returncode == 0:
@@ -271,7 +272,7 @@ def _ensure_local_bin_on_path() -> None:
     bashrc = os.path.expanduser("~/.bashrc")
     if os.path.isfile(bashrc):
         contents = open(bashrc).read()
-        if ".local/bin" not in contents:
+        if path_line not in contents:
             with open(bashrc, "w") as f:
                 f.write(f"{path_line}\n{contents}")
 
@@ -283,7 +284,7 @@ def _ensure_local_bin_on_path() -> None:
         if not os.path.isfile(rc):
             continue
         contents = open(rc).read()
-        if ".local/bin" not in contents:
+        if path_line not in contents:
             with open(rc, "a") as f:
                 f.write(f"\n{path_line}\n")
 

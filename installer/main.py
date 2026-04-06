@@ -236,14 +236,13 @@ def print_config_summary(cfg: dict) -> None:
 
 
 def print_dns_instructions(cfg: dict) -> None:
-    if not cfg["has_domain"]:
-        return
-    lines = config.build_dns_instructions(cfg["hostname"], cfg["domain"])
-    print()
-    ui.step("DNS setup required")
-    print()
-    for line in lines:
-        print(f"  {line}")
+    if cfg["has_domain"]:
+        lines = config.build_dns_instructions(cfg["hostname"], cfg["domain"])
+        print()
+        ui.step("DNS setup required")
+        print()
+        for line in lines:
+            print(f"  {line}")
 
     if cfg["spoof_protection"] != "off":
         print()
