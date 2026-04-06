@@ -262,6 +262,77 @@ def print_dns_instructions(cfg: dict) -> None:
         ui.info("Ensure outbound DNS (port 53) is not blocked by your firewall.")
 
 
+def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
+    """Attempt to claim a free subdomain on primitive.email.
+    Must be called after the server is running (port 25 must be open).
+    Returns updated cfg if successful, original cfg if not."""
+    print()
+
+    # Check if this IP already has a claim (idempotent — no side effects)
+    ui.info("Checking for existing subdomain...")
+    result = config.claim_subdomain()
+
+    if result and result.get("existing"):
+        domain = result["domain"]
+        ui.success(f"This server already has a domain: {domain}")
+        print()
+        print(f"  {ui.BOLD}Send email to:{ui.NC}")
+        print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
+        print()
+
+        cfg = {
+            **cfg,
+            "hostname": domain,
+            "domain": domain,
+            "ip_literal": "",
+            "has_domain": True,
+        }
+        write_env(install_dir, cfg)
+        ui.info("Restarting with existing domain...")
+        server.restart(install_dir)
+        return cfg
+
+    # No existing claim — ask if they want one
+    if not no_prompt:
+        if not ui.prompt_yn(
+            "Would you like a free email domain? (e.g. cool-fox.primitive.email)",
+            "y",
+            no_prompt=False,
+        ):
+            return cfg
+
+    if not result:
+        # First check returned None (API error / port 25 not reachable)
+        ui.info("Claiming a free subdomain...")
+        result = config.claim_subdomain()
+
+    if not result:
+        ui.warn("Could not claim a subdomain. You can try again later or add your own domain.")
+        ui.info("Continuing with IP literal mode.")
+        return cfg
+
+    domain = result["domain"]
+    ui.success(f"Claimed: {domain}")
+    print()
+    print(f"  {ui.BOLD}Send email to:{ui.NC}")
+    print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
+    print()
+
+    cfg = {
+        **cfg,
+        "hostname": domain,
+        "domain": domain,
+        "ip_literal": "",
+        "has_domain": True,
+    }
+
+    write_env(install_dir, cfg)
+    ui.info("Restarting with new domain...")
+    server.restart(install_dir)
+
+    return cfg
+
+
 def print_next_steps(cfg: dict, install_dir: str) -> None:
     lines = config.build_next_steps(
         ip_literal=cfg["ip_literal"],
@@ -291,6 +362,12 @@ def main() -> None:
         verbose=args.verbose,
         ip_literal=cfg["ip_literal"],
     )
+
+    # After server is running (port 25 open), claim a free subdomain
+    # if the user doesn't have their own domain
+    if not cfg["has_domain"] and not args.no_start:
+        cfg = try_claim_subdomain(install_dir, cfg, args.no_prompt)
+
     server.install_cli(install_dir)
     print_next_steps(cfg, install_dir)
 
