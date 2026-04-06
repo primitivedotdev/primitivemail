@@ -69,6 +69,15 @@ find /tmp -name 'pipe-debug-*.log' -mtime +1 -delete 2>/dev/null || true
 # Start rsyslog (optional, for logs)
 service rsyslog start || true
 
+# Datadog APM tracing (optional — set DATADOG_TRACING_ENABLED=true to enable)
+if [ "${DATADOG_TRACING_ENABLED:-false}" = "true" ]; then
+    export DD_SERVICE="${DD_SERVICE:-milter}"
+    export DD_ENV="${DD_ENV:-unknown}"
+    export DD_TRACE_AGENT_URL="${DD_TRACE_AGENT_URL:-http://localhost:8126}"
+    export DD_TRACE_PROPAGATION_STYLE="${DD_TRACE_PROPAGATION_STYLE:-datadog,tracecontext}"
+    echo "Datadog tracing enabled (service=${DD_SERVICE}, env=${DD_ENV})"
+fi
+
 # Start the milter in background (MUST be running before Postfix starts)
 echo "Starting milter..."
 /opt/mx-box/primitivemail_milter.py &

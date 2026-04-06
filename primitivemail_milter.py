@@ -125,6 +125,21 @@ def record_metrics(fn):
         except Exception:
             pass
 
+# Datadog APM tracing (optional — install ddtrace and set DATADOG_TRACING_ENABLED=true)
+TRACING_ENABLED = False
+tracer = None
+HTTPPropagator = None
+try:
+    if os.environ.get('DATADOG_TRACING_ENABLED', '').lower() == 'true':
+        from ddtrace import tracer as _tracer
+        from ddtrace.propagation.http import HTTPPropagator as _HTTPPropagator
+        tracer = _tracer
+        HTTPPropagator = _HTTPPropagator
+        TRACING_ENABLED = True
+except ImportError:
+    pass
+_TRACING_WANTED = os.environ.get('DATADOG_TRACING_ENABLED', '').lower() == 'true'
+
 # Configure logging
 handlers = [logging.StreamHandler(sys.stderr)]
 
@@ -143,6 +158,12 @@ logging.basicConfig(
     handlers=handlers
 )
 logger = logging.getLogger(__name__)
+
+# Deferred tracing log (after basicConfig so the message is visible)
+if TRACING_ENABLED:
+    logger.info("Datadog APM tracing enabled")
+elif _TRACING_WANTED:
+    logger.warning("DATADOG_TRACING_ENABLED=true but ddtrace not installed — tracing disabled")
 
 # Add Loki handler if configured (optional - works with any Loki-compatible endpoint)
 try:
@@ -164,6 +185,22 @@ except Exception as e:
 # Configuration from environment
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET')
+
+# Extra headers to include on webhook calls (JSON object, optional).
+# Useful for deployment protection bypass, API gateway auth, etc.
+# Example: WEBHOOK_EXTRA_HEADERS='{"x-vercel-protection-bypass": "secret123"}'
+WEBHOOK_EXTRA_HEADERS = {}
+try:
+    raw = os.environ.get('WEBHOOK_EXTRA_HEADERS', '')
+    if raw:
+        WEBHOOK_EXTRA_HEADERS = json.loads(raw)
+        if not isinstance(WEBHOOK_EXTRA_HEADERS, dict):
+            logger.error("WEBHOOK_EXTRA_HEADERS must be a JSON object, ignoring")
+            WEBHOOK_EXTRA_HEADERS = {}
+        else:
+            logger.info(f"Webhook extra headers configured: {list(WEBHOOK_EXTRA_HEADERS.keys())}")
+except (json.JSONDecodeError, ValueError) as e:
+    logger.error(f"Invalid WEBHOOK_EXTRA_HEADERS JSON: {e}")
 
 # Storage configuration for large email uploads
 # Supports S3-compatible storage (AWS S3, R2, MinIO, Supabase Storage, etc.)
@@ -318,6 +355,7 @@ class PrimitiveMailMilter(Milter.Base):
         self.spf_result = 'none'
         self._result_label = 'unknown'
         self._path_label = 'inline'
+        self._trace_span = None
 
     def log(self, msg: str, **extra):
         """Log with connection ID for correlation"""
@@ -326,6 +364,17 @@ class PrimitiveMailMilter(Milter.Base):
     def log_error(self, msg: str, **extra):
         """Log error with connection ID"""
         logger.error(f"[{self.id}] {msg}", extra=extra)
+
+    def _finish_trace(self, result: str, error: str = None):
+        """Finish the APM trace span for this email (no-op if tracing disabled)"""
+        span = getattr(self, '_trace_span', None)
+        if span:
+            span.set_tag("email.result", result)
+            if error:
+                span.set_tag("error", True)
+                span.set_tag("error.message", error)
+            span.finish()
+            self._trace_span = None
 
     @Milter.noreply
     def connect(self, hostname, family, hostaddr):
@@ -739,6 +788,22 @@ class PrimitiveMailMilter(Milter.Base):
         self.log(f"  Subject: {self.subject}")
         self.log(f"  Size: {size} bytes")
 
+        # Start APM trace span (no-op if tracing disabled)
+        self._trace_span = None
+        if TRACING_ENABLED:
+            domain = valid_recipients[0].split('@')[1].lower() if valid_recipients else 'unknown'
+            self._trace_span = tracer.trace(
+                "milter.process_email",
+                service="milter",
+                resource=f"email:{domain}",
+            )
+            self._trace_span.set_tag("email.sender", self.sender or "")
+            self._trace_span.set_tag("email.recipients", ", ".join(valid_recipients))
+            self._trace_span.set_tag("email.recipient_count", len(valid_recipients))
+            self._trace_span.set_tag("email.size_bytes", size)
+            self._trace_span.set_tag("email.subject", self.subject or "")
+            self._trace_span.set_tag("email.message_id", self.message_id or "")
+
         # --- DKIM + DMARC checks (need full message) ---
         if SPOOF_PROTECTION != 'off':
             dkim_result, dkim_domains = self._check_dkim(raw_email_bytes)
@@ -770,6 +835,7 @@ class PrimitiveMailMilter(Milter.Base):
                 if dmarc_result['policy'] == 'reject' and not dmarc_result['pass']:
                     self.setreply("550", "5.7.1", f"Failed DMARC policy for {from_domain}")
                     self._result_label = 'reject_permanent'
+                    self._finish_trace("reject_permanent", f"dmarc_reject:{from_domain}")
                     self.log(f"Returning REJECT (550) - DMARC reject policy for {from_domain}")
                     self.log("=" * 50)
                     return Milter.REJECT
@@ -782,12 +848,14 @@ class PrimitiveMailMilter(Milter.Base):
                 if dkim_result == 'fail':
                     self.setreply("550", "5.7.20", "DKIM validation failed")
                     self._result_label = 'reject_permanent'
+                    self._finish_trace("reject_permanent", "dkim_failed")
                     self.log("Returning REJECT (550) - DKIM validation failed")
                     self.log("=" * 50)
                     return Milter.REJECT
                 if not dmarc_result['pass']:
                     self.setreply("550", "5.7.1", "DMARC validation failed")
                     self._result_label = 'reject_permanent'
+                    self._finish_trace("reject_permanent", "dmarc_failed")
                     self.log("Returning REJECT (550) - DMARC validation failed")
                     self.log("=" * 50)
                     return Milter.REJECT
@@ -806,6 +874,7 @@ class PrimitiveMailMilter(Milter.Base):
                     }
                 self._save_to_disk(raw_email_bytes, valid_recipients, **save_kwargs)
                 self._result_label = 'accept'
+                self._finish_trace("accepted")
                 self.log("Standalone mode - email saved to disk")
                 self.log("Returning ACCEPT (250)")
                 self.log("=" * 50)
@@ -813,6 +882,7 @@ class PrimitiveMailMilter(Milter.Base):
             except Exception as e:
                 self.log_error(f"Failed to save email to disk: {e}")
                 self._result_label = 'tempfail'
+                self._finish_trace("tempfail", f"disk write failed: {e}")
                 self.setreply("451", "4.7.1", "Temporary failure saving email, please retry")
                 self.log("Returning TEMPFAIL (451) - disk write failed")
                 self.log("=" * 50)
@@ -824,6 +894,7 @@ class PrimitiveMailMilter(Milter.Base):
             storage_result = self.upload_to_storage(raw_email_bytes)
             if not storage_result['success']:
                 self.log_error(f"Storage upload failed: {storage_result.get('error', 'unknown')}")
+                self._finish_trace("tempfail", f"storage upload failed: {storage_result.get('error')}")
                 self.setreply("451", "4.7.1", "Temporary failure, please retry")
                 return Milter.TEMPFAIL
             self.log(f"Uploaded to storage: {storage_result['storage_key']} ({size} bytes)")
@@ -880,6 +951,7 @@ class PrimitiveMailMilter(Milter.Base):
             # whole message so the sender retries. Already-accepted recipients
             # will be de-duplicated by the webhook receiver on (message_id, recipient).
             self._result_label = 'tempfail'
+            self._finish_trace("tempfail", "webhook transient failure")
             self.setreply("451", "4.7.1", "Temporary failure, please retry")
             self.log("Returning TEMPFAIL (451) - transient failure for at least one recipient")
             self.log("=" * 50)
@@ -889,6 +961,7 @@ class PrimitiveMailMilter(Milter.Base):
             # some were permanently rejected (can't REJECT or sender thinks
             # nobody got it).
             self._result_label = 'accept'
+            self._finish_trace("accepted")
             self.log("Returning ACCEPT (250)")
             self.log("=" * 50)
             return Milter.ACCEPT
@@ -897,6 +970,7 @@ class PrimitiveMailMilter(Milter.Base):
             # when there's only one recipient (most common case) for better
             # diagnostics. For multi-recipient, use generic.
             self._result_label = 'reject_permanent'
+            self._finish_trace("reject_permanent", last_hard_reject_result.get('reason', '') if last_hard_reject_result else 'all_rejected')
             if len(valid_recipients) == 1 and last_hard_reject_result:
                 reason = last_hard_reject_result.get('reason', '')
                 detail = last_hard_reject_result.get('detail', '')
@@ -928,6 +1002,7 @@ class PrimitiveMailMilter(Milter.Base):
         else:
             # All soft rejects or mix -- accept (silent drop, logged by webhook)
             self._result_label = 'accept'
+            self._finish_trace("accepted")
             self.log("Returning ACCEPT (250) - all recipients soft-rejected (logged)")
             self.log("=" * 50)
             return Milter.ACCEPT
@@ -954,6 +1029,17 @@ class PrimitiveMailMilter(Milter.Base):
         else:
             headers['Authorization'] = f'Bearer {STORAGE_KEY}'
 
+        storage_span = None
+        if TRACING_ENABLED:
+            storage_span = tracer.trace(
+                "milter.storage_upload",
+                service="milter",
+                resource="storage",
+            )
+            storage_span.set_tag("storage.upload_id", upload_id)
+            storage_span.set_tag("storage.size_bytes", len(raw_bytes))
+            storage_span.set_tag("storage.sha256", sha256)
+
         start = time.time()
         try:
             req = urllib.request.Request(
@@ -970,6 +1056,8 @@ class PrimitiveMailMilter(Milter.Base):
                         STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
                         STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
                     ))
+                    if storage_span:
+                        storage_span.set_tag('storage.status', 'success')
                     return {
                         'success': True,
                         'upload_id': upload_id,
@@ -982,6 +1070,9 @@ class PrimitiveMailMilter(Milter.Base):
                         STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
                         ERRORS_TOTAL.labels(stage='storage_upload').inc(),
                     ))
+                    if storage_span:
+                        storage_span.set_tag('error', True)
+                        storage_span.set_tag('http.status_code', response.status)
                     return {'success': False, 'error': f'HTTP {response.status}'}
 
         except Exception as e:
@@ -991,13 +1082,31 @@ class PrimitiveMailMilter(Milter.Base):
                 STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
                 ERRORS_TOTAL.labels(stage='storage_upload').inc(),
             ))
+            if storage_span:
+                storage_span.set_tag('error', True)
+                storage_span.set_tag('error.message', str(e))
             return {'success': False, 'error': str(e)}
+
+        finally:
+            if storage_span:
+                storage_span.finish()
 
     def _call_webhook_for_recipient(self, recipient: str, domain: str,
                                      raw_bytes: Optional[bytes], size: int,
                                      storage_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Call the ingestion webhook for a single recipient"""
         self.log(f"Posting to webhook: {WEBHOOK_URL}")
+
+        # Child trace span for webhook call
+        webhook_span = None
+        if TRACING_ENABLED:
+            webhook_span = tracer.trace(
+                "milter.webhook_call",
+                service="milter",
+                resource=WEBHOOK_URL,
+            )
+            webhook_span.set_tag("email.recipient", recipient)
+            webhook_span.set_tag("email.domain", domain)
 
         payload = {
             'recipient': recipient,
@@ -1027,13 +1136,18 @@ class PrimitiveMailMilter(Milter.Base):
         start_time = time.time()
 
         try:
+            webhook_headers = {
+                'Authorization': f'Bearer {WEBHOOK_SECRET}',
+                'Content-Type': 'application/json',
+                **WEBHOOK_EXTRA_HEADERS,
+            }
+            if TRACING_ENABLED and webhook_span and HTTPPropagator:
+                HTTPPropagator.inject(webhook_span.context, webhook_headers)
+
             req = urllib.request.Request(
                 WEBHOOK_URL,
                 data=json.dumps(payload).encode('utf-8'),
-                headers={
-                    'Authorization': f'Bearer {WEBHOOK_SECRET}',
-                    'Content-Type': 'application/json'
-                },
+                headers=webhook_headers,
                 method='POST'
             )
 
@@ -1092,6 +1206,8 @@ class PrimitiveMailMilter(Milter.Base):
                 WEBHOOK_CALLS_TOTAL.labels(status='error', path=webhook_path).inc(),
                 ERRORS_TOTAL.labels(stage='webhook').inc(),
             ))
+            if webhook_span:
+                webhook_span.set_tag('error', True)
             return {'success': False, 'error': str(e.reason)}
 
         except Exception as e:
@@ -1103,7 +1219,13 @@ class PrimitiveMailMilter(Milter.Base):
                 WEBHOOK_CALLS_TOTAL.labels(status='error', path=webhook_path).inc(),
                 ERRORS_TOTAL.labels(stage='webhook').inc(),
             ))
+            if webhook_span:
+                webhook_span.set_tag('error', True)
             return {'success': False, 'error': str(e)}
+
+        finally:
+            if webhook_span:
+                webhook_span.finish()
 
     def close(self):
         """Connection closed"""
