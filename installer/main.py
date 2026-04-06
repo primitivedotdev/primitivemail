@@ -93,25 +93,15 @@ def configure(args: argparse.Namespace) -> dict:
             has_domain = True
         else:
             print()
-            ui.warn("No domain means this server can ONLY receive email via IP literal addresses.")
-            print()
-            ui.info(f"Instead of:  {ui.BOLD}user@example.com{ui.NC}")
-            ui.info(f"You'll use:  {ui.BOLD}user@[1.2.3.4]{ui.NC}  (with the brackets)")
-            print()
-            ui.info("Gmail, Outlook, and most providers support this, but some may not.")
-            ui.info("You can always add a domain later by editing .env and restarting.")
+            print(f"  {ui.GREEN}+{ui.NC} {ui.BOLD}We'll give you a free domain once your server is running.{ui.NC}")
+            print(f"    {ui.MUTED}Something like:{ui.NC} {ui.GREEN}anything@cool-fox.primitive.email{ui.NC}")
             print()
             ui.info("Detecting your public IP...")
             ip_literal = config.detect_public_ip() or ""
             if ip_literal:
                 ui.success(f"Detected public IP: {ip_literal}")
-                print()
-                print(f"  {ui.BOLD}To send email to this server, use:{ui.NC}")
-                print(f"  {ui.GREEN}anything@[{ip_literal}]{ui.NC}")
-                print()
-                ui.success("IP literal support will be enabled automatically")
             else:
-                ui.warn("Could not detect public IP. Set ENABLE_IP_LITERAL=true and IP_LITERAL=<your-ip> in .env")
+                ui.warn("Could not detect public IP.")
             hostname = "localhost"
             domain = "localhost"
             has_domain = False
@@ -158,10 +148,12 @@ def configure(args: argparse.Namespace) -> dict:
 
         # --- Recipient filtering ---
         print()
-        print(f"  {ui.MUTED}Allowed recipient addresses (comma-separated, optional){ui.NC}")
-        print(f"  {ui.MUTED}If set, only these addresses can receive mail.{ui.NC}")
-        print(f"  {ui.MUTED}Leave blank to accept mail for any address at your domain.{ui.NC}")
-        allowed_recipients = ui.prompt_value("Recipients", "", no_prompt=False)
+        ui.step("Recipient Filtering")
+        print()
+        print(f"  {ui.MUTED}Which addresses on YOUR server can receive mail?{ui.NC}")
+        print(f"  {ui.MUTED}Comma-separated list, or leave blank to accept mail for any address.{ui.NC}")
+        print(f"  {ui.MUTED}Example: inbox@yourdomain.com,alerts@yourdomain.com{ui.NC}")
+        allowed_recipients = ui.prompt_value("Allowed recipients", "", no_prompt=False)
 
         # --- Spoof protection ---
         print()
@@ -263,36 +255,12 @@ def print_dns_instructions(cfg: dict) -> None:
 
 
 def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
-    """Attempt to claim a free subdomain on primitive.email.
+    """Claim a new free subdomain on primitive.email.
     Must be called after the server is running (port 25 must be open).
+    Existing claims are handled earlier in configure().
     Returns updated cfg if successful, original cfg if not."""
     print()
 
-    # Check if this IP already has a claim (idempotent — no side effects)
-    ui.info("Checking for existing subdomain...")
-    result = config.claim_subdomain()
-
-    if result and result.get("existing"):
-        domain = result["domain"]
-        ui.success(f"This server already has a domain: {domain}")
-        print()
-        print(f"  {ui.BOLD}Send email to:{ui.NC}")
-        print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
-        print()
-
-        cfg = {
-            **cfg,
-            "hostname": domain,
-            "domain": domain,
-            "ip_literal": "",
-            "has_domain": True,
-        }
-        write_env(install_dir, cfg)
-        ui.info("Restarting with existing domain...")
-        server.restart(install_dir)
-        return cfg
-
-    # No existing claim — ask if they want one
     if not no_prompt:
         if not ui.prompt_yn(
             "Would you like a free email domain? (e.g. cool-fox.primitive.email)",
@@ -301,10 +269,8 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
         ):
             return cfg
 
-    if not result:
-        # First check returned None (API error / port 25 not reachable)
-        ui.info("Claiming a free subdomain...")
-        result = config.claim_subdomain()
+    ui.info("Claiming a free subdomain...")
+    result = config.claim_subdomain()
 
     if not result:
         ui.warn("Could not claim a subdomain. You can try again later or add your own domain.")
