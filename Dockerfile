@@ -19,6 +19,12 @@ RUN apt-get update && \
     pip3 install --no-cache-dir python-logging-loki pymilter prometheus_client 'pyspf>=2.0,<3' 'dnspython>=2.7,<3' 'dkimpy>=1.1,<2' 'tldextract>=5.0,<6' && \
     rm -rf /var/lib/apt/lists/*
 
+# Optional: Datadog APM tracing (enabled via DATADOG_TRACING_ENABLED=true at runtime)
+ARG INSTALL_DDTRACE=false
+RUN if [ "$INSTALL_DDTRACE" = "true" ]; then \
+      pip3 install --no-cache-dir ddtrace; \
+    fi
+
 # Work dir for our scripts/config
 RUN mkdir -p /opt/mx-box /mail/incoming && \
     chmod 750 /mail/incoming
