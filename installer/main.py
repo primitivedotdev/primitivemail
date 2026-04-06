@@ -268,6 +268,31 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
     Returns updated cfg if successful, original cfg if not."""
     print()
 
+    # Check if this IP already has a claim (idempotent — no side effects)
+    ui.info("Checking for existing subdomain...")
+    result = config.claim_subdomain()
+
+    if result and result.get("existing"):
+        domain = result["domain"]
+        ui.success(f"This server already has a domain: {domain}")
+        print()
+        print(f"  {ui.BOLD}Send email to:{ui.NC}")
+        print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
+        print()
+
+        cfg = {
+            **cfg,
+            "hostname": domain,
+            "domain": domain,
+            "ip_literal": "",
+            "has_domain": True,
+        }
+        write_env(install_dir, cfg)
+        ui.info("Restarting with existing domain...")
+        server.restart(install_dir)
+        return cfg
+
+    # No existing claim — ask if they want one
     if not no_prompt:
         if not ui.prompt_yn(
             "Would you like a free email domain? (e.g. cool-fox.primitive.email)",
@@ -276,29 +301,23 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
         ):
             return cfg
 
-    ui.info("Claiming a free subdomain...")
-    result = config.claim_subdomain()
+    if not result:
+        # First check returned None (API error / port 25 not reachable)
+        ui.info("Claiming a free subdomain...")
+        result = config.claim_subdomain()
 
     if not result:
         ui.warn("Could not claim a subdomain. You can try again later or add your own domain.")
         ui.info("Continuing with IP literal mode.")
         return cfg
 
-    subdomain = result["subdomain"]
     domain = result["domain"]
-    ip = result.get("ip", cfg["ip_literal"])
-
-    if result.get("existing"):
-        ui.success(f"You already have: {domain}")
-    else:
-        ui.success(f"Claimed: {domain}")
-
+    ui.success(f"Claimed: {domain}")
     print()
     print(f"  {ui.BOLD}Send email to:{ui.NC}")
     print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
     print()
 
-    # Update config with the real domain
     cfg = {
         **cfg,
         "hostname": domain,
@@ -307,7 +326,6 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
         "has_domain": True,
     }
 
-    # Rewrite .env and restart to pick up the new domain
     write_env(install_dir, cfg)
     ui.info("Restarting with new domain...")
     server.restart(install_dir)
