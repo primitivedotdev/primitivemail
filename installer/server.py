@@ -307,6 +307,25 @@ def _ensure_local_bin_on_path() -> None:
                 f.write(f"\n{path_line}\n")
 
 
+def restart(install_dir: str) -> None:
+    """Restart containers to pick up .env changes. Uses down + up (not restart)."""
+    compose_cmd = get_compose_cmd()
+    subprocess.run(
+        compose_cmd + ["down"],
+        cwd=install_dir,
+        capture_output=True,
+    )
+    subprocess.run(
+        compose_cmd + ["up", "-d", "--quiet-pull"],
+        cwd=install_dir,
+        capture_output=True,
+    )
+    if wait_for_container() and wait_for_smtp():
+        ui.success("PrimitiveMail restarted with new domain")
+    else:
+        ui.warn("Restart may have failed. Check: docker logs primitivemail")
+
+
 def install_cli(install_dir: str) -> None:
     """Install the CLI to ~/.local/bin (no sudo), with /usr/local/bin as fallback."""
     ui.step("Installing CLI")

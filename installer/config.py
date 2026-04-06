@@ -1,10 +1,14 @@
-"""Pure configuration logic for PrimitiveMail installer. No prompts."""
+"""Configuration logic for PrimitiveMail installer. No prompts."""
 
 import ipaddress
+import json
 import secrets
+import subprocess
 import urllib.request
 import urllib.error
 from typing import Optional
+
+CLAIM_API_URL = "https://www.primitive.dev/api/v1/claim-subdomain"
 
 
 def detect_public_ip() -> Optional[str]:
@@ -168,6 +172,27 @@ def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> lis
     lines.append("The install script can only open the OS-level firewall, not cloud firewalls.")
 
     return lines
+
+
+def claim_subdomain() -> Optional[dict]:
+    """Claim a free subdomain on primitive.email.
+    Uses curl -4 to force IPv4 (mx-tools can only check IPv4 port 25).
+    Returns {"subdomain": "cool-fox", "domain": "cool-fox.primitive.email", "ip": "..."} or None."""
+    try:
+        result = subprocess.run(
+            ["curl", "-4", "-s", "-X", "POST", CLAIM_API_URL,
+             "-H", "Content-Type: application/json",
+             "--max-time", "30"],
+            capture_output=True, text=True, timeout=35,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout)
+        if data.get("ok"):
+            return data
+        return None
+    except Exception:
+        return None
 
 
 def resolve_non_interactive_defaults(
