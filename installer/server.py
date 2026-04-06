@@ -113,7 +113,8 @@ def check_port_25_reachable(ip: str) -> Optional[str]:
     """Check port 25 via external API. Returns 'open'|'closed'|'blocked'|'error'|None."""
     try:
         url = f"https://mx-tools.primitive.dev/check?ip={ip}"
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": "PrimitiveMail-Installer"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("status")
     except Exception:

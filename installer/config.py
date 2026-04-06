@@ -11,7 +11,8 @@ def detect_public_ip() -> Optional[str]:
     """Try multiple IP detection services, return IPv4 string or None."""
     for url in ("https://ifconfig.me", "https://api.ipify.org", "https://icanhazip.com"):
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
+            req = urllib.request.Request(url, headers={"User-Agent": "PrimitiveMail-Installer"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 text = resp.read().decode("utf-8").strip()
                 try:
                     ipaddress.IPv4Address(text)
