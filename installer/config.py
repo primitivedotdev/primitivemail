@@ -1,6 +1,6 @@
-"""Pure configuration logic for PrimitiveMail installer. No I/O, no prompts."""
+"""Pure configuration logic for PrimitiveMail installer. No prompts."""
 
-import re
+import ipaddress
 import secrets
 import urllib.request
 import urllib.error
@@ -13,8 +13,11 @@ def detect_public_ip() -> Optional[str]:
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 text = resp.read().decode("utf-8").strip()
-                if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", text):
+                try:
+                    ipaddress.IPv4Address(text)
                     return text
+                except ValueError:
+                    continue
         except Exception:
             continue
     return None

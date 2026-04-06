@@ -226,11 +226,11 @@ check_python() {
     warn "Python 3 is not installed — attempting to install..."
 
     if command -v apt-get &> /dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq python3 >/dev/null 2>&1
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3 >/dev/null 2>&1 || true
     elif command -v yum &> /dev/null; then
-        sudo yum install -y -q python3 >/dev/null 2>&1
+        sudo yum install -y -q python3 >/dev/null 2>&1 || true
     elif command -v dnf &> /dev/null; then
-        sudo dnf install -y -q python3 >/dev/null 2>&1
+        sudo dnf install -y -q python3 >/dev/null 2>&1 || true
     fi
 
     if ! command -v python3 &> /dev/null; then

@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -51,23 +52,38 @@ def build_and_start(
         )
         print()
         ui.step("Starting PrimitiveMail")
-        subprocess.run(
+        result = subprocess.run(
             compose_cmd + ["up", "-d", "--quiet-pull"],
             cwd=install_dir,
         )
+        if result.returncode != 0:
+            ui.error("docker compose up failed")
+            if hasattr(result, 'stderr') and result.stderr:
+                print(result.stderr.decode('utf-8', errors='replace'))
+            sys.exit(1)
     elif verbose:
         ui.step("Starting PrimitiveMail")
-        subprocess.run(
+        result = subprocess.run(
             compose_cmd + ["up", "-d", "--build"],
             cwd=install_dir,
         )
+        if result.returncode != 0:
+            ui.error("docker compose up failed")
+            if hasattr(result, 'stderr') and result.stderr:
+                print(result.stderr.decode('utf-8', errors='replace'))
+            sys.exit(1)
     else:
         ui.step("Starting PrimitiveMail")
-        subprocess.run(
+        result = subprocess.run(
             compose_cmd + ["up", "-d", "--build", "--quiet-pull"],
             cwd=install_dir,
             capture_output=True,
         )
+        if result.returncode != 0:
+            ui.error("docker compose up failed")
+            if hasattr(result, 'stderr') and result.stderr:
+                print(result.stderr.decode('utf-8', errors='replace'))
+            sys.exit(1)
 
 
 def wait_for_container(timeout: int = 15) -> bool:
@@ -271,7 +287,8 @@ def _ensure_local_bin_on_path() -> None:
 
     bashrc = os.path.expanduser("~/.bashrc")
     if os.path.isfile(bashrc):
-        contents = open(bashrc).read()
+        with open(bashrc) as f:
+            contents = f.read()
         if path_line not in contents:
             with open(bashrc, "w") as f:
                 f.write(f"{path_line}\n{contents}")
@@ -283,7 +300,8 @@ def _ensure_local_bin_on_path() -> None:
     ]:
         if not os.path.isfile(rc):
             continue
-        contents = open(rc).read()
+        with open(rc) as f:
+            contents = f.read()
         if path_line not in contents:
             with open(rc, "a") as f:
                 f.write(f"\n{path_line}\n")

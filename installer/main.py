@@ -62,6 +62,17 @@ def configure(args: argparse.Namespace) -> dict:
     allowed_recipients = args.allowed_recipients
     spoof_protection = args.spoof_protection
 
+    if not config.validate_spoof_protection(spoof_protection):
+        if args.no_prompt:
+            ui.error(f"Invalid spoof protection level: {spoof_protection}")
+            ui.info("Valid values: off, monitor, standard, strict")
+            sys.exit(1)
+        else:
+            ui.warn(f"Invalid spoof protection level: {spoof_protection}")
+            ui.info("Valid values: off, monitor, standard, strict")
+            ui.info("Defaulting to: off")
+            spoof_protection = "off"
+
     if args.no_prompt:
         hostname, domain, ip_literal, has_domain = config.resolve_non_interactive_defaults(
             hostname, domain, ip_literal,
@@ -213,6 +224,7 @@ def write_env(install_dir: str, cfg: dict) -> None:
     env_path = os.path.join(install_dir, ".env")
     with open(env_path, "w") as f:
         f.write(content)
+    os.chmod(env_path, 0o600)
     ui.success(f"Configuration saved to {env_path}")
 
 
