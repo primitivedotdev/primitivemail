@@ -182,6 +182,7 @@ def claim_subdomain() -> Optional[dict]:
         result = subprocess.run(
             ["curl", "-4", "-s", "-X", "POST", CLAIM_API_URL,
              "-H", "Content-Type: application/json",
+             "-d", "{}",
              "--max-time", "30"],
             capture_output=True, text=True, timeout=35,
         )
