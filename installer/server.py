@@ -55,9 +55,12 @@ def build_and_start(
         result = subprocess.run(
             compose_cmd + ["up", "-d", "--quiet-pull"],
             cwd=install_dir,
+            capture_output=True,
         )
         if result.returncode != 0:
             ui.error("docker compose up failed")
+            if result.stderr:
+                print(result.stderr.decode("utf-8", errors="replace"))
             sys.exit(1)
     elif verbose:
         ui.step("Starting PrimitiveMail")
