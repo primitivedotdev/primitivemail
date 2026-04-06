@@ -249,6 +249,8 @@ main() {
     open_firewall
     clone_repo
     check_python
+    INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
+    export PRIMITIVEMAIL_DIR="$INSTALL_DIR"
     cd "$INSTALL_DIR"
     exec python3 -m installer.main ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
 }
