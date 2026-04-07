@@ -50,6 +50,14 @@ def check_existing_install(install_dir: str, no_prompt: bool) -> None:
 
 def configure(args: argparse.Namespace) -> dict:
     """Run the configuration flow. Returns a config dict."""
+    if not args.no_prompt:
+        print()
+        print(f"  {ui.RED}{ui.BOLD}Before you start, make sure:{ui.NC}")
+        print(f"  {ui.RED}-{ui.NC} This server has a {ui.BOLD}static public IP{ui.NC} {ui.MUTED}(dynamic IPs will break mail delivery){ui.NC}")
+        print(f"  {ui.RED}-{ui.NC} {ui.BOLD}Port 25 (TCP){ui.NC} is open inbound {ui.MUTED}(check your cloud firewall / security group){ui.NC}")
+        print(f"  {ui.RED}-{ui.NC} You are {ui.BOLD}NOT behind CGNAT{ui.NC} {ui.MUTED}(most cloud providers are fine, some home ISPs are not){ui.NC}")
+        print()
+
     ui.step("Configuration")
 
     hostname = args.hostname
