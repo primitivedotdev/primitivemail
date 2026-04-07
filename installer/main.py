@@ -151,10 +151,12 @@ def configure(args: argparse.Namespace) -> dict:
         print()
         ui.step("Recipient Filtering")
         print()
-        print(f"  {ui.MUTED}Which addresses on YOUR server can receive mail?{ui.NC}")
-        print(f"  {ui.MUTED}Comma-separated list, or leave blank to accept mail for any address.{ui.NC}")
-        print(f"  {ui.MUTED}Example: inbox@yourdomain.com,alerts@yourdomain.com{ui.NC}")
-        allowed_recipients = ui.prompt_value("Allowed recipients", "", no_prompt=False)
+        if ui.prompt_yn("Do you want to restrict which addresses can receive mail?", "n", no_prompt=False):
+            print()
+            print(f"  {ui.MUTED}Which addresses on YOUR server can receive mail?{ui.NC}")
+            print(f"  {ui.MUTED}Comma-separated list.{ui.NC}")
+            print(f"  {ui.MUTED}Example: inbox@yourdomain.com,alerts@yourdomain.com{ui.NC}")
+            allowed_recipients = ui.prompt_value("Allowed recipients", "", no_prompt=False)
 
         # --- Spoof protection ---
         print()
