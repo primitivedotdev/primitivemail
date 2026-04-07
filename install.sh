@@ -55,7 +55,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --ip-literal IP          Enable IP literal mail for this IP"
             echo "  --spoof-protection LEVEL off|monitor|standard|strict (default: off)"
             echo "  --no-prompt, -y          Non-interactive mode"
-            echo "  --no-start               Configure only, don't start"
             echo "  --verbose                Show detailed output"
             echo "  --help, -h               Show this help"
             exit 0
