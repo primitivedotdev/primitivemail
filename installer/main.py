@@ -94,7 +94,8 @@ def configure(args: argparse.Namespace) -> dict:
         else:
             print()
             print(f"  {ui.GREEN}+{ui.NC} {ui.BOLD}We'll give you a free domain once your server is running.{ui.NC}")
-            print(f"    {ui.MUTED}Something like:{ui.NC} {ui.GREEN}anything@cool-fox.primitive.email{ui.NC}")
+            print(f"    {ui.MUTED}Something like:{ui.NC} anything@{ui.DIM}<your-name>{ui.NC}.primitive.email")
+            print(f"    {ui.YELLOW}(not active yet -- assigned after install completes){ui.NC}")
             print()
             ui.info("Detecting your public IP...")
             ip_literal = config.detect_public_ip() or ""
