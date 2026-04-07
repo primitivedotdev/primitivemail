@@ -124,6 +124,7 @@ echo "Milter started with PID $MILTER_PID"
 # Graceful shutdown handler — drain Postfix queue, then stop milter
 shutdown() {
     echo "Received shutdown signal, draining..."
+    /usr/sbin/postfix flush 2>/dev/null
     /usr/sbin/postfix stop 2>/dev/null
     kill "$MILTER_PID" 2>/dev/null
     # Wait for milter to exit (up to 10s)
