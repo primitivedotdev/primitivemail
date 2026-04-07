@@ -1,6 +1,6 @@
 services:
   primitivemail:
-    build: .
+    image: "${PRIMITIVEMAIL_IMAGE:-ghcr.io/primitivedotdev/primitivemail:edge}"
     container_name: primitivemail
     restart: unless-stopped
     environment:
@@ -31,9 +31,7 @@ services:
       - postfix-logs:/var/log              # Shared with postfix-exporter
 
   watcher:
-    build:
-      context: .
-      dockerfile: watcher/Dockerfile
+    image: "${PRIMITIVEMAIL_WATCHER_IMAGE:-ghcr.io/primitivedotdev/primitivemail-watcher:edge}"
     container_name: primitivemail-watcher
     restart: unless-stopped
     # TODO: run as non-root once milter creates dirs with shared group
