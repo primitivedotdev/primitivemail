@@ -47,6 +47,8 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
 
   milter:
+    # Scale this service horizontally, for example:
+    # docker compose up -d --scale milter=4
     build: .
     restart: unless-stopped
     environment: &milter-env
