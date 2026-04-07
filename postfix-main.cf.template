@@ -49,6 +49,6 @@ smtpd_tls_loglevel = 1
 
 # Milter configuration - intercepts emails BEFORE 250 OK
 # This ensures emails are stored in DB before we acknowledge receipt
-smtpd_milters = inet:127.0.0.1:9900
+smtpd_milters = inet:${MILTER_ENDPOINT}
 milter_default_action = tempfail
 milter_protocol = 6
