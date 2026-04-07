@@ -12,7 +12,7 @@ prometheus.scrape "postfix" {
 // Scrape milter Prometheus metrics
 prometheus.scrape "milter" {
   targets = [{
-    __address__ = "primitivemail:9901",
+    __address__ = "milter:9901",
   }]
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
   scrape_interval = "15s"
