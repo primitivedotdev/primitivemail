@@ -251,6 +251,13 @@ main() {
     INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
     export PRIMITIVEMAIL_DIR="$INSTALL_DIR"
     cd "$INSTALL_DIR"
+
+    if [[ ! -d "installer" ]]; then
+        error "Installer package not found. Your copy may be outdated."
+        echo "  Try: rm -rf $INSTALL_DIR && rerun the install script."
+        exit 1
+    fi
+
     exec python3 -m installer.main ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
 }
 
