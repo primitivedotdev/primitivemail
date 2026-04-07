@@ -697,6 +697,7 @@ class PrimitiveMailMilter(Milter.Base):
         self.log("End of message - processing")
 
         eom_start = time.time()
+        self._eom_start = eom_start
         if METRICS_ENABLED:
             IN_FLIGHT.inc()
 
@@ -926,7 +927,7 @@ class PrimitiveMailMilter(Milter.Base):
 
             if not result['success']:
                 any_tempfail = True
-                self.log(f"    Result: TEMPFAIL (error: {result.get('error', 'unknown')})")
+                self.log(f"    TEMPFAIL for {rcpt}: {result.get('error', 'unknown')}")
             elif result.get('status') == 'accepted':
                 any_accepted = True
                 self.log(f"    Result: accepted")
@@ -941,7 +942,10 @@ class PrimitiveMailMilter(Milter.Base):
                     soft_rejects += 1
             else:
                 any_tempfail = True  # unknown status = tempfail
-                self.log(f"    Result: unknown status '{result.get('status')}' - treating as TEMPFAIL")
+                self.log(
+                    f"    Result: unknown status '{result.get('status')}' - treating as TEMPFAIL "
+                    f"(full response: {json.dumps(result)[:300]})"
+                )
 
         # Decide SMTP response.
         # Milter can only return one verdict for the entire message.
@@ -953,7 +957,13 @@ class PrimitiveMailMilter(Milter.Base):
             self._result_label = 'tempfail'
             self._finish_trace("tempfail", "webhook transient failure")
             self.setreply("451", "4.7.1", "Temporary failure, please retry")
-            self.log("Returning TEMPFAIL (451) - transient failure for at least one recipient")
+            eom_elapsed = (time.time() - self._eom_start) * 1000 if hasattr(self, '_eom_start') else 0
+            self.log(
+                f"TEMPFAIL sender={self.sender} message_id={self.message_id} "
+                f"recipients={len(valid_recipients)} accepted={1 if any_accepted else 0} "
+                f"hard_rejects={hard_rejects} soft_rejects={soft_rejects} "
+                f"eom_ms={eom_elapsed:.0f}"
+            )
             self.log("=" * 50)
             return Milter.TEMPFAIL
         elif any_accepted:
@@ -1170,7 +1180,11 @@ class PrimitiveMailMilter(Milter.Base):
         except urllib.error.HTTPError as e:
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
-            error_body = e.read().decode('utf-8') if e.fp else ''
+            error_body = ''
+            try:
+                error_body = e.read().decode('utf-8') if e.fp else ''
+            except Exception:
+                error_body = '<unreadable>'
 
             result = _interpret_webhook_response(e.code, error_body)
 
@@ -1186,7 +1200,11 @@ class PrimitiveMailMilter(Milter.Base):
                     f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
                 )
             else:
-                self.log_error(f"Webhook HTTP {e.code}: {error_body[:200]} (latency: {latency_ms:.0f}ms)")
+                self.log_error(
+                    f"WEBHOOK_HTTP_ERROR recipient={recipient} "
+                    f"http_status={e.code} latency_ms={latency_ms:.0f} "
+                    f"body={error_body[:500]}"
+                )
 
             metrics_status = 'success' if result.get('success') else 'error'
             record_metrics(lambda: (
@@ -1200,7 +1218,21 @@ class PrimitiveMailMilter(Milter.Base):
         except urllib.error.URLError as e:
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
-            self.log_error(f"Webhook network error: {e.reason} (latency: {latency_ms:.0f}ms)")
+            reason = str(e.reason)
+            # Classify the network error for easier searching
+            if 'timed out' in reason.lower() or 'timeout' in reason.lower():
+                error_type = 'timeout'
+            elif 'refused' in reason.lower():
+                error_type = 'connection_refused'
+            elif 'reset' in reason.lower():
+                error_type = 'connection_reset'
+            else:
+                error_type = 'network_error'
+            self.log_error(
+                f"WEBHOOK_NETWORK_ERROR recipient={recipient} "
+                f"error_type={error_type} reason={reason} "
+                f"latency_ms={latency_ms:.0f} timeout_config={timeout}s"
+            )
             record_metrics(lambda: (
                 WEBHOOK_DURATION.labels(status='error', path=webhook_path).observe(latency_ms / 1000),
                 WEBHOOK_CALLS_TOTAL.labels(status='error', path=webhook_path).inc(),
@@ -1208,12 +1240,16 @@ class PrimitiveMailMilter(Milter.Base):
             ))
             if webhook_span:
                 webhook_span.set_tag('error', True)
-            return {'success': False, 'error': str(e.reason)}
+            return {'success': False, 'error': f'{error_type}: {reason}'}
 
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
-            self.log_error(f"Webhook unexpected error: {e} (latency: {latency_ms:.0f}ms)")
+            self.log_error(
+                f"WEBHOOK_UNEXPECTED_ERROR recipient={recipient} "
+                f"exception={type(e).__name__} message={e} "
+                f"latency_ms={latency_ms:.0f}"
+            )
             record_metrics(lambda: (
                 WEBHOOK_DURATION.labels(status='error', path=webhook_path).observe(latency_ms / 1000),
                 WEBHOOK_CALLS_TOTAL.labels(status='error', path=webhook_path).inc(),
@@ -1221,7 +1257,7 @@ class PrimitiveMailMilter(Milter.Base):
             ))
             if webhook_span:
                 webhook_span.set_tag('error', True)
-            return {'success': False, 'error': str(e)}
+            return {'success': False, 'error': f'{type(e).__name__}: {e}'}
 
         finally:
             if webhook_span:
