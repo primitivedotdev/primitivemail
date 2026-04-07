@@ -85,22 +85,22 @@ def build_and_start(
             sys.exit(1)
 
 
-def wait_for_container(timeout: int = 15) -> bool:
+def wait_for_container(compose_cmd: list, timeout: int = 15) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
+            compose_cmd + ["ps", "--status", "running", "--services", "postfix"],
             capture_output=True, text=True,
         )
-        if "primitivemail" in result.stdout:
+        if result.returncode == 0 and "postfix" in result.stdout.split():
             return True
         time.sleep(1)
     return False
 
 
-def wait_for_smtp(timeout: int = 20) -> bool:
+def wait_for_smtp(compose_cmd: list, timeout: int = 20) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            ["docker", "exec", "primitivemail", "sh", "-c", "ss -tln | grep -q ':25 '"],
+            compose_cmd + ["exec", "-T", "postfix", "sh", "-c", "ss -tln | grep -q ':25 '"],
             capture_output=True,
         )
         if result.returncode == 0:
@@ -205,16 +205,16 @@ def start_server(
 
     build_and_start(install_dir, verbose, first_build, compose_cmd)
 
-    if not wait_for_container():
+    if not wait_for_container(compose_cmd):
         ui.error("Container failed to start")
         print()
-        print("  Check logs: docker logs primitivemail")
+        print("  Check logs: docker compose logs postfix")
         raise SystemExit(1)
 
-    if not wait_for_smtp():
+    if not wait_for_smtp(compose_cmd):
         ui.error("PrimitiveMail started but SMTP did not become ready")
         print()
-        print("  Check logs: docker logs primitivemail")
+        print("  Check logs: docker compose logs postfix")
         raise SystemExit(1)
 
     ui.success("PrimitiveMail is running on port 25")
@@ -234,8 +234,8 @@ def start_server(
         ui.warn(f"Port 25 is not accepting connections on {check_ip}")
         print("  The host is reachable but nothing is listening on port 25.")
         print("  Check that the PrimitiveMail container is running:")
-        print("    docker ps | grep primitivemail")
-        print("    docker logs primitivemail")
+        print("    docker compose ps postfix")
+        print("    docker compose logs postfix")
         print()
     elif status == "blocked":
         print()
@@ -325,10 +325,10 @@ def restart(install_dir: str) -> None:
         if result.stderr:
             print(result.stderr.decode("utf-8", errors="replace"))
         return
-    if wait_for_container() and wait_for_smtp():
+    if wait_for_container(compose_cmd) and wait_for_smtp(compose_cmd):
         ui.success("PrimitiveMail restarted with new domain")
     else:
-        ui.warn("Restart may have failed. Check: docker logs primitivemail")
+        ui.warn("Restart may have failed. Check: docker compose logs postfix")
 
 
 def install_cli(install_dir: str) -> None:

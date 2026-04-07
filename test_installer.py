@@ -364,7 +364,7 @@ class TestBuildNextSteps:
         lines = build_next_steps(ip_literal="", has_domain=True, install_dir="/home/user/pm")
         text = "\n".join(lines)
         assert "primitive emails-status" in text
-        assert "docker logs" in text
+        assert "docker compose logs postfix" in text
         assert "primitive restart" in text
 
     def test_agent_integration_hint(self):
