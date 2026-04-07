@@ -25,15 +25,19 @@ compatibility_level = 2
 
 # Timeout for pipe/spawn commands (webhook SLA)
 command_time_limit = 30s
+in_flow_delay = 0s
+default_process_limit = 512
+smtpd_client_connection_count_limit = 0
 
 # Log to file for postfix-exporter (Postfix 3.4+ built-in logging)
 # This enables dual logging: stdout (docker logs) AND file (for metrics)
 maillog_file = /var/log/postfix.log
 
-# Rate limiting - prevent abuse/DoS
-smtpd_client_connection_rate_limit = 10
-smtpd_client_message_rate_limit = 50
-smtpd_client_recipient_rate_limit = 100
+# Rate limiting - disabled by default to avoid throttling the milter tier.
+# Operators can re-enable tighter limits if they need anti-abuse controls.
+smtpd_client_connection_rate_limit = 0
+smtpd_client_message_rate_limit = 0
+smtpd_client_recipient_rate_limit = 0
 anvil_rate_time_unit = 60s
 
 # Message size limit - 25MB (standard SMTP limit)

@@ -37,6 +37,7 @@ render_postfix() {
     fi
 
     cat /opt/mx-box/postfix-master.cf.append >> /etc/postfix/master.cf
+    postconf -P 'smtp/inet/chroot=n'
 
     cp /opt/mx-box/relay_domains /etc/postfix/relay_domains
     cp /opt/mx-box/relay_recipients /etc/postfix/relay_recipients
