@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       SERVICE_ROLE: postfix
-      MILTER_ENDPOINT: "${MILTER_ENDPOINT:-milter:9900}"
+      MILTER_ENDPOINT: "${MILTER_ENDPOINT:-milter-lb:9900}"
       MYHOSTNAME: "${MYHOSTNAME:-mx.example.com}"
       MYDOMAIN: "${MYDOMAIN:-example.com}"
       ENABLE_IP_LITERAL: "${ENABLE_IP_LITERAL:-false}" # Accept mail to user@[IP] without DNS
@@ -28,9 +28,23 @@ services:
       LOKI_KEY: "${LOKI_KEY:-}"                     # Loki auth key (optional)
     ports:
       - "25:25"     # SMTP (public)
+    depends_on:
+      - milter-lb
     volumes:
       - ./maildata:/mail/incoming
       - postfix-logs:/var/log              # Shared with postfix-exporter
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  milter-lb:
+    image: haproxy:2.9
+    restart: unless-stopped
+    depends_on:
+      - milter
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
 
   milter:
     build: .
@@ -59,6 +73,10 @@ services:
     volumes:
       - ./maildata:/mail/incoming
       - postfix-logs:/var/log
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
   watcher:
     build:
