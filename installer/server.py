@@ -25,64 +25,53 @@ def get_compose_cmd() -> list:
         return ["docker-compose"]
 
 
-def is_first_build() -> bool:
-    """True if no primitivemail docker image exists yet."""
-    result = subprocess.run(
-        ["docker", "images", "--format", "{{.Repository}}"],
-        capture_output=True, text=True,
-    )
-    return "primitivemail" not in result.stdout
-
-
-def build_and_start(
+def pull_and_start(
     install_dir: str,
     verbose: bool,
-    first_build: bool,
     compose_cmd: list,
 ) -> None:
-    if first_build:
-        ui.step("Building PrimitiveMail")
-        ui.info("First build -- this usually takes 1-2 minutes")
-        print()
-        ui.run_with_progress(
-            compose_cmd + ["build", "--quiet"],
-            "Building",
-            verbose=verbose,
-            cwd=install_dir,
-        )
-        print()
-        ui.step("Starting PrimitiveMail")
+    ui.step("Pulling PrimitiveMail images")
+    if verbose:
         result = subprocess.run(
-            compose_cmd + ["up", "-d", "--quiet-pull"],
+            compose_cmd + ["pull"],
             cwd=install_dir,
-            capture_output=True,
         )
         if result.returncode != 0:
-            ui.error("docker compose up failed")
-            if result.stderr:
-                print(result.stderr.decode("utf-8", errors="replace"))
+            ui.error("docker compose pull failed")
             sys.exit(1)
-    elif verbose:
+
         ui.step("Starting PrimitiveMail")
         result = subprocess.run(
-            compose_cmd + ["up", "-d", "--build"],
+            compose_cmd + ["up", "-d"],
             cwd=install_dir,
         )
         if result.returncode != 0:
             ui.error("docker compose up failed")
             sys.exit(1)
-    else:
-        ui.step("Starting PrimitiveMail")
-        result = subprocess.run(
-            compose_cmd + ["up", "-d", "--build", "--quiet-pull"],
-            cwd=install_dir,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            ui.error("docker compose up failed")
-            if result.stderr:
-                print(result.stderr.decode("utf-8", errors="replace"))
-            sys.exit(1)
+        return
+
+    result = subprocess.run(
+        compose_cmd + ["pull", "--quiet"],
+        cwd=install_dir,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        ui.error("docker compose pull failed")
+        if result.stderr:
+            print(result.stderr.decode("utf-8", errors="replace"))
+        sys.exit(1)
+
+    ui.step("Starting PrimitiveMail")
+    result = subprocess.run(
+        compose_cmd + ["up", "-d"],
+        cwd=install_dir,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        ui.error("docker compose up failed")
+        if result.stderr:
+            print(result.stderr.decode("utf-8", errors="replace"))
+        sys.exit(1)
 
 
 def wait_for_container(timeout: int = 15) -> bool:
@@ -201,9 +190,8 @@ def start_server(
         return
 
     compose_cmd = get_compose_cmd()
-    first_build = is_first_build()
 
-    build_and_start(install_dir, verbose, first_build, compose_cmd)
+    pull_and_start(install_dir, verbose, compose_cmd)
 
     if not wait_for_container():
         ui.error("Container failed to start")
@@ -315,8 +303,18 @@ def restart(install_dir: str) -> None:
         cwd=install_dir,
         capture_output=True,
     )
+    pull_result = subprocess.run(
+        compose_cmd + ["pull", "--quiet"],
+        cwd=install_dir,
+        capture_output=True,
+    )
+    if pull_result.returncode != 0:
+        ui.error("docker compose pull failed during restart")
+        if pull_result.stderr:
+            print(pull_result.stderr.decode("utf-8", errors="replace"))
+        return
     result = subprocess.run(
-        compose_cmd + ["up", "-d", "--quiet-pull"],
+        compose_cmd + ["up", "-d"],
         cwd=install_dir,
         capture_output=True,
     )
