@@ -104,17 +104,18 @@ def wait_for_container(compose_cmd: list, timeout: int = 15) -> bool:
             compose_cmd + ["ps", "-q", "postfix"],
             capture_output=True, text=True,
         )
-        container_id = result.stdout.strip()
-        if result.returncode != 0 or not container_id:
+        container_ids = result.stdout.split()
+        if result.returncode != 0 or not container_ids:
             time.sleep(1)
             continue
 
-        inspect = subprocess.run(
-            ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
-            capture_output=True, text=True,
-        )
-        if inspect.returncode == 0 and inspect.stdout.strip() == "true":
-            return True
+        for container_id in container_ids:
+            inspect = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+                capture_output=True, text=True,
+            )
+            if inspect.returncode == 0 and inspect.stdout.strip() == "true":
+                return True
         time.sleep(1)
     return False
 

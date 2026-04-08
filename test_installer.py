@@ -409,6 +409,24 @@ class TestServerHelpers:
             "docker", "inspect", "--format", "{{.State.Running}}", "abc123",
         ]
 
+    def test_wait_for_container_handles_multiple_container_ids(self):
+        compose_ps = MagicMock(returncode=0, stdout="old123\nnew456\n")
+        stopped_inspect = MagicMock(returncode=0, stdout="false\n")
+        running_inspect = MagicMock(returncode=0, stdout="true\n")
+
+        with patch(
+            "installer.server.subprocess.run",
+            side_effect=[compose_ps, stopped_inspect, running_inspect],
+        ) as run:
+            assert server.wait_for_container(["docker", "compose"], timeout=1) is True
+
+        assert run.call_args_list[1].args[0] == [
+            "docker", "inspect", "--format", "{{.State.Running}}", "old123",
+        ]
+        assert run.call_args_list[2].args[0] == [
+            "docker", "inspect", "--format", "{{.State.Running}}", "new456",
+        ]
+
     def test_restart_retry_uses_local_images_without_pull(self):
         failing_up = MagicMock(returncode=1, stderr=b"pull failed")
         retry_up = MagicMock(returncode=0, stderr=b"")
