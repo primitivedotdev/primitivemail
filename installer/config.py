@@ -5,7 +5,6 @@ import json
 import secrets
 import subprocess
 import urllib.request
-import urllib.error
 from typing import Optional
 
 CLAIM_API_URL = "https://www.primitive.dev/api/v1/claim-subdomain"
