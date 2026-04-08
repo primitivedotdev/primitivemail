@@ -29,6 +29,12 @@ if [[ "${ENABLE_IP_LITERAL:-false}" == "true" && -n "${IP_LITERAL:-}" ]]; then
     postconf -e "smtpd_command_filter = pcre:/etc/postfix/command_filter.pcre"
 fi
 
+# Extend mynetworks with additional trusted CIDRs (e.g., load gen subnet for staging)
+if [[ -n "${MYNETWORKS_EXTRA:-}" ]]; then
+    postconf -e "mynetworks = 127.0.0.0/8 ${MYNETWORKS_EXTRA}"
+    echo "Extended mynetworks with: ${MYNETWORKS_EXTRA}"
+fi
+
 # Append custom transport to master.cf
 cat /opt/mx-box/postfix-master.cf.append >> /etc/postfix/master.cf
 
