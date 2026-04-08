@@ -120,6 +120,35 @@ install_docker() {
     echo ""
 }
 
+ensure_buildx() {
+    local required_major=0 required_minor=17
+    local buildx_version
+    buildx_version="$(docker buildx version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1 || true)"
+
+    if [[ -z "$buildx_version" ]]; then
+        warn "docker buildx not found — installing..."
+    else
+        local major minor
+        major="$(echo "$buildx_version" | cut -d. -f1)"
+        minor="$(echo "$buildx_version" | cut -d. -f2)"
+        if (( major > required_major || (major == required_major && minor >= required_minor) )); then
+            success "docker buildx $buildx_version (>= 0.17.0)"
+            return
+        fi
+        warn "docker buildx $buildx_version is too old (need >= 0.17.0) — upgrading..."
+    fi
+
+    local BUILDX_VERSION="v0.21.2"
+    sudo mkdir -p /usr/local/lib/docker/cli-plugins
+    if ! sudo curl -SL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64" \
+        -o /usr/local/lib/docker/cli-plugins/docker-buildx; then
+        error "Failed to download buildx ${BUILDX_VERSION}"
+        exit 1
+    fi
+    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+    success "docker buildx upgraded to ${BUILDX_VERSION}"
+}
+
 check_docker() {
     step "Checking prerequisites"
 
@@ -136,6 +165,9 @@ check_docker() {
         exit 1
     fi
     success "Docker Compose found"
+
+    # docker compose build requires buildx >= 0.17.0; Amazon Linux ships 0.12.1
+    ensure_buildx
 
     if ! docker info &> /dev/null 2>&1; then
         error "Docker daemon is not running"
