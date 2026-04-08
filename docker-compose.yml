@@ -123,6 +123,7 @@ services:
       PROMETHEUS_KEY: "${PROMETHEUS_KEY:-}"
     volumes:
       - ./alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     tmpfs:
       - /tmp/alloy                         # Writable temp for WAL
 

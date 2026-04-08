@@ -9,11 +9,36 @@ prometheus.scrape "postfix" {
   scrape_interval = "15s"
 }
 
+// Discover and scrape each running milter worker separately.
+discovery.docker "milter" {
+  host = "unix:///var/run/docker.sock"
+  port = 9901
+  refresh_interval = "15s"
+
+  filter {
+    name = "label"
+    values = ["com.docker.compose.service=milter"]
+  }
+
+  filter {
+    name = "status"
+    values = ["running"]
+  }
+}
+
+discovery.relabel "milter" {
+  targets = discovery.docker.milter.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex = "/(.*)"
+    target_label = "instance"
+  }
+}
+
 // Scrape milter Prometheus metrics
 prometheus.scrape "milter" {
-  targets = [{
-    __address__ = "milter:9901",
-  }]
+  targets = discovery.relabel.milter.output
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
   scrape_interval = "15s"
 }
@@ -21,11 +46,11 @@ prometheus.scrape "milter" {
 // Push to remote Prometheus endpoint
 prometheus.remote_write "grafana_cloud" {
   endpoint {
-    url = env("PROMETHEUS_URL")
+    url = sys.env("PROMETHEUS_URL")
 
     basic_auth {
-      username = env("PROMETHEUS_USER")
-      password = env("PROMETHEUS_KEY")
+      username = sys.env("PROMETHEUS_USER")
+      password = sys.env("PROMETHEUS_KEY")
     }
   }
 }
