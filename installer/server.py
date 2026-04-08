@@ -25,6 +25,19 @@ def get_compose_cmd() -> list:
         return ["docker-compose"]
 
 
+def is_compose_plugin(compose_cmd: list) -> bool:
+    """True when using the docker compose plugin instead of docker-compose."""
+    return compose_cmd[:2] == ["docker", "compose"]
+
+
+def get_local_images_up_args(compose_cmd: list) -> list:
+    """Return `up` args that avoid registry pulls when supported."""
+    args = ["up", "-d"]
+    if is_compose_plugin(compose_cmd):
+        args.extend(["--pull", "never"])
+    return args
+
+
 def is_first_build() -> bool:
     """True if no primitivemail docker image exists yet."""
     result = subprocess.run(
@@ -88,10 +101,19 @@ def build_and_start(
 def wait_for_container(compose_cmd: list, timeout: int = 15) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            compose_cmd + ["ps", "--status", "running", "--services", "postfix"],
+            compose_cmd + ["ps", "-q", "postfix"],
             capture_output=True, text=True,
         )
-        if result.returncode == 0 and "postfix" in result.stdout.split():
+        container_id = result.stdout.strip()
+        if result.returncode != 0 or not container_id:
+            time.sleep(1)
+            continue
+
+        inspect = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+            capture_output=True, text=True,
+        )
+        if inspect.returncode == 0 and inspect.stdout.strip() == "true":
             return True
         time.sleep(1)
     return False
@@ -325,7 +347,7 @@ def restart(install_dir: str) -> None:
         if result.stderr:
             print(result.stderr.decode("utf-8", errors="replace"))
         result = subprocess.run(
-            compose_cmd + ["up", "-d"],
+            compose_cmd + get_local_images_up_args(compose_cmd),
             cwd=install_dir,
             capture_output=True,
         )
