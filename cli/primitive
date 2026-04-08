@@ -103,7 +103,7 @@ def cmd_restart(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="primitive",
-        description="Primitive CLI - manage your self-hosted inbox",
+        description="PrimitiveMail CLI - manage your self-hosted inbox",
     )
     parser.add_argument("--path", help="Path to maildata directory")
     sub = parser.add_subparsers(dest="command")
