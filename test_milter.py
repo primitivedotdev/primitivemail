@@ -1106,13 +1106,15 @@ class TestDKIMDMARCEnforcement:
 
     def test_auth_headers_stripped_before_adding(self, spoof_milter):
         """Attacker-injected auth headers are removed before adding real ones"""
-        spoof_milter.envfrom('<sender@example.com>')
-        spoof_milter.envrcpt('<user@example.com>')
-        add_simple_message(spoof_milter)
-
-        with patch.object(spoof_milter, '_check_dkim', return_value=('none', [])), \
+        with patch.object(pm, 'SPF_AVAILABLE', True), \
+             patch('primitivemail_milter.spfmod', create=True) as mock_spf, \
+             patch.object(spoof_milter, '_check_dkim', return_value=('none', [])), \
              patch.object(spoof_milter, '_check_dmarc',
                           return_value={'policy': 'none', 'pass': True}):
+            mock_spf.check2.return_value = ('none', 'no SPF record')
+            spoof_milter.envfrom('<sender@example.com>')
+            spoof_milter.envrcpt('<user@example.com>')
+            add_simple_message(spoof_milter)
             spoof_milter.eom()
 
         # chgheader should have been called to strip attacker headers
