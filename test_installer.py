@@ -16,6 +16,7 @@ from installer.config import (
     build_next_steps,
     resolve_non_interactive_defaults,
 )
+from installer import server
 
 
 # ===========================================================================
@@ -364,7 +365,7 @@ class TestBuildNextSteps:
         lines = build_next_steps(ip_literal="", has_domain=True, install_dir="/home/user/pm")
         text = "\n".join(lines)
         assert "primitive emails-status" in text
-        assert "docker logs" in text
+        assert "docker compose logs postfix" in text
         assert "primitive restart" in text
 
     def test_agent_integration_hint(self):
@@ -376,3 +377,69 @@ class TestBuildNextSteps:
         lines = build_next_steps(ip_literal="", has_domain=True, install_dir="/home/user/pm")
         text = "\n".join(lines)
         assert "port 25" in text.lower() or "Port 25" in text
+
+
+# ===========================================================================
+# Server orchestration helpers
+# ===========================================================================
+
+class TestServerHelpers:
+
+    def test_is_compose_plugin(self):
+        assert server.is_compose_plugin(["docker", "compose"]) is True
+        assert server.is_compose_plugin(["docker-compose"]) is False
+
+    def test_get_local_images_up_args_for_compose_plugin(self):
+        assert server.get_local_images_up_args(["docker", "compose"]) == [
+            "up", "-d", "--pull", "never",
+        ]
+
+    def test_get_local_images_up_args_for_docker_compose_v1(self):
+        assert server.get_local_images_up_args(["docker-compose"]) == ["up", "-d"]
+
+    def test_wait_for_container_checks_running_state(self):
+        compose_ps = MagicMock(returncode=0, stdout="abc123\n")
+        inspect = MagicMock(returncode=0, stdout="true\n")
+
+        with patch("installer.server.subprocess.run", side_effect=[compose_ps, inspect]) as run:
+            assert server.wait_for_container(["docker", "compose"], timeout=1) is True
+
+        assert run.call_args_list[0].args[0] == ["docker", "compose", "ps", "-q", "postfix"]
+        assert run.call_args_list[1].args[0] == [
+            "docker", "inspect", "--format", "{{.State.Running}}", "abc123",
+        ]
+
+    def test_wait_for_container_handles_multiple_container_ids(self):
+        compose_ps = MagicMock(returncode=0, stdout="old123\nnew456\n")
+        stopped_inspect = MagicMock(returncode=0, stdout="false\n")
+        running_inspect = MagicMock(returncode=0, stdout="true\n")
+
+        with patch(
+            "installer.server.subprocess.run",
+            side_effect=[compose_ps, stopped_inspect, running_inspect],
+        ) as run:
+            assert server.wait_for_container(["docker", "compose"], timeout=1) is True
+
+        assert run.call_args_list[1].args[0] == [
+            "docker", "inspect", "--format", "{{.State.Running}}", "old123",
+        ]
+        assert run.call_args_list[2].args[0] == [
+            "docker", "inspect", "--format", "{{.State.Running}}", "new456",
+        ]
+
+    def test_restart_retry_uses_local_images_without_pull(self):
+        failing_up = MagicMock(returncode=1, stderr=b"pull failed")
+        retry_up = MagicMock(returncode=0, stderr=b"")
+
+        with patch("installer.server.get_compose_cmd", return_value=["docker", "compose"]), \
+                patch("installer.server.wait_for_container", return_value=True), \
+                patch("installer.server.wait_for_smtp", return_value=True), \
+                patch("installer.server.ui.warn"), \
+                patch("installer.server.ui.success"), \
+                patch(
+                    "installer.server.subprocess.run",
+                    side_effect=[MagicMock(returncode=0), failing_up, retry_up],
+                ) as run:
+            server.restart("/tmp/primitivemail")
+
+        assert run.call_args_list[2].args[0] == ["docker", "compose", "up", "-d", "--pull", "never"]

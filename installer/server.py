@@ -25,6 +25,19 @@ def get_compose_cmd() -> list:
         return ["docker-compose"]
 
 
+def is_compose_plugin(compose_cmd: list) -> bool:
+    """True when using the docker compose plugin instead of docker-compose."""
+    return compose_cmd[:2] == ["docker", "compose"]
+
+
+def get_local_images_up_args(compose_cmd: list) -> list:
+    """Return `up` args that avoid registry pulls when supported."""
+    args = ["up", "-d"]
+    if is_compose_plugin(compose_cmd):
+        args.extend(["--pull", "never"])
+    return args
+
+
 def is_first_build() -> bool:
     """True if no primitivemail docker image exists yet."""
     result = subprocess.run(
@@ -85,22 +98,32 @@ def build_and_start(
             sys.exit(1)
 
 
-def wait_for_container(timeout: int = 15) -> bool:
+def wait_for_container(compose_cmd: list, timeout: int = 15) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
+            compose_cmd + ["ps", "-q", "postfix"],
             capture_output=True, text=True,
         )
-        if "primitivemail" in result.stdout:
-            return True
+        container_ids = result.stdout.split()
+        if result.returncode != 0 or not container_ids:
+            time.sleep(1)
+            continue
+
+        for container_id in container_ids:
+            inspect = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+                capture_output=True, text=True,
+            )
+            if inspect.returncode == 0 and inspect.stdout.strip() == "true":
+                return True
         time.sleep(1)
     return False
 
 
-def wait_for_smtp(timeout: int = 20) -> bool:
+def wait_for_smtp(compose_cmd: list, timeout: int = 20) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            ["docker", "exec", "primitivemail", "sh", "-c", "ss -tln | grep -q ':25 '"],
+            compose_cmd + ["exec", "-T", "postfix", "sh", "-c", "ss -tln | grep -q ':25 '"],
             capture_output=True,
         )
         if result.returncode == 0:
@@ -205,16 +228,16 @@ def start_server(
 
     build_and_start(install_dir, verbose, first_build, compose_cmd)
 
-    if not wait_for_container():
+    if not wait_for_container(compose_cmd):
         ui.error("Container failed to start")
         print()
-        print("  Check logs: docker logs primitivemail")
+        print("  Check logs: docker compose logs postfix")
         raise SystemExit(1)
 
-    if not wait_for_smtp():
+    if not wait_for_smtp(compose_cmd):
         ui.error("PrimitiveMail started but SMTP did not become ready")
         print()
-        print("  Check logs: docker logs primitivemail")
+        print("  Check logs: docker compose logs postfix")
         raise SystemExit(1)
 
     ui.success("PrimitiveMail is running on port 25")
@@ -234,8 +257,8 @@ def start_server(
         ui.warn(f"Port 25 is not accepting connections on {check_ip}")
         print("  The host is reachable but nothing is listening on port 25.")
         print("  Check that the PrimitiveMail container is running:")
-        print("    docker ps | grep primitivemail")
-        print("    docker logs primitivemail")
+        print("    docker compose ps postfix")
+        print("    docker compose logs postfix")
         print()
     elif status == "blocked":
         print()
@@ -321,14 +344,23 @@ def restart(install_dir: str) -> None:
         capture_output=True,
     )
     if result.returncode != 0:
-        ui.error("docker compose up failed during restart")
+        ui.warn("docker compose up failed during restart; retrying with local images")
         if result.stderr:
             print(result.stderr.decode("utf-8", errors="replace"))
-        return
-    if wait_for_container() and wait_for_smtp():
+        result = subprocess.run(
+            compose_cmd + get_local_images_up_args(compose_cmd),
+            cwd=install_dir,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            ui.error("docker compose up failed during restart")
+            if result.stderr:
+                print(result.stderr.decode("utf-8", errors="replace"))
+            return
+    if wait_for_container(compose_cmd) and wait_for_smtp(compose_cmd):
         ui.success("PrimitiveMail restarted with new domain")
     else:
-        ui.warn("Restart may have failed. Check: docker logs primitivemail")
+        ui.warn("Restart may have failed. Check: docker compose logs postfix")
 
 
 def install_cli(install_dir: str) -> None:

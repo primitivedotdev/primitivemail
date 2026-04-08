@@ -1,9 +1,11 @@
 services:
-  primitivemail:
+  postfix:
     build: .
-    container_name: primitivemail
+    container_name: primitivemail-postfix
     restart: unless-stopped
     environment:
+      SERVICE_ROLE: postfix
+      MILTER_ENDPOINT: "${MILTER_ENDPOINT:-milter-lb:9900}"
       MYHOSTNAME: "${MYHOSTNAME:-mx.example.com}"
       MYDOMAIN: "${MYDOMAIN:-example.com}"
       ENABLE_IP_LITERAL: "${ENABLE_IP_LITERAL:-false}" # Accept mail to user@[IP] without DNS
@@ -26,9 +28,56 @@ services:
       LOKI_KEY: "${LOKI_KEY:-}"                     # Loki auth key (optional)
     ports:
       - "25:25"     # SMTP (public)
+    depends_on:
+      - milter-lb
     volumes:
       - ./maildata:/mail/incoming
       - postfix-logs:/var/log              # Shared with postfix-exporter
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  milter-lb:
+    image: haproxy:2.9
+    restart: unless-stopped
+    depends_on:
+      - milter
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  milter:
+    # Scale this service horizontally, for example:
+    # docker compose up -d --scale milter=4
+    build: .
+    restart: unless-stopped
+    environment: &milter-env
+      SERVICE_ROLE: milter
+      MYHOSTNAME: "${MYHOSTNAME:-mx.example.com}"
+      MYDOMAIN: "${MYDOMAIN:-example.com}"
+      ENABLE_IP_LITERAL: "${ENABLE_IP_LITERAL:-false}"
+      IP_LITERAL: "${IP_LITERAL:-}"
+      WEBHOOK_URL: "${WEBHOOK_URL:-}"
+      WEBHOOK_SECRET: "${WEBHOOK_SECRET:-}"
+      STORAGE_URL: "${STORAGE_URL:-}"
+      STORAGE_KEY: "${STORAGE_KEY:-}"
+      STORAGE_AUTH_STYLE: "${STORAGE_AUTH_STYLE:-s3}"
+      MAIL_DIR: "${MAIL_DIR:-/mail/incoming}"
+      ALLOWED_SENDER_DOMAINS: "${ALLOWED_SENDER_DOMAINS:-}"
+      ALLOWED_SENDERS: "${ALLOWED_SENDERS:-}"
+      ALLOW_BOUNCES: "${ALLOW_BOUNCES:-true}"
+      ALLOWED_RECIPIENTS: "${ALLOWED_RECIPIENTS:-}"
+      SPOOF_PROTECTION: "${SPOOF_PROTECTION:-off}"
+      LOKI_URL: "${LOKI_URL:-}"
+      LOKI_USER: "${LOKI_USER:-}"
+      LOKI_KEY: "${LOKI_KEY:-}"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./maildata:/mail/incoming
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
   watcher:
     build:
@@ -40,7 +89,7 @@ services:
     volumes:
       - ./maildata:/mail/incoming
     depends_on:
-      - primitivemail
+      - postfix
 
   postfix-exporter:
     build:
@@ -62,7 +111,6 @@ services:
     image: grafana/alloy:latest
     container_name: alloy
     restart: unless-stopped
-    user: "65534:65534"                    # Run as nobody
     read_only: true
     command:
       - run
@@ -74,6 +122,7 @@ services:
       PROMETHEUS_KEY: "${PROMETHEUS_KEY:-}"
     volumes:
       - ./alloy-config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     tmpfs:
       - /tmp/alloy                         # Writable temp for WAL
 

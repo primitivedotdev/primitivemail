@@ -160,7 +160,7 @@ def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> lis
 
     lines.append("Useful commands:")
     lines.append("primitive emails-status           # check inbox status")
-    lines.append("docker logs primitivemail -f     # watch logs")
+    lines.append("docker compose logs postfix -f  # watch logs")
     lines.append("primitive restart                # reload after config changes")
     lines.append(f"cat {install_dir}/.env            # view config")
     lines.append("")
