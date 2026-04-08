@@ -33,11 +33,10 @@ smtpd_client_connection_count_limit = 50
 # This enables dual logging: stdout (docker logs) AND file (for metrics)
 maillog_file = /var/log/postfix.log
 
-# Rate limiting - disabled by default to avoid throttling the milter tier.
-# Operators can re-enable tighter limits if they need anti-abuse controls.
-smtpd_client_connection_rate_limit = 0
-smtpd_client_message_rate_limit = 0
-smtpd_client_recipient_rate_limit = 0
+# Keep limits loose enough for fanout while still capping runaway clients.
+smtpd_client_connection_rate_limit = 100
+smtpd_client_message_rate_limit = 500
+smtpd_client_recipient_rate_limit = 1000
 anvil_rate_time_unit = 60s
 
 # Message size limit - 25MB (standard SMTP limit)

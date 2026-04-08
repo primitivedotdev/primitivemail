@@ -111,7 +111,6 @@ services:
     image: grafana/alloy:latest
     container_name: alloy
     restart: unless-stopped
-    user: "65534:65534"                    # Run as nobody
     read_only: true
     command:
       - run
