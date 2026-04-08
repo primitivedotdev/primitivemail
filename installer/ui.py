@@ -1,9 +1,7 @@
 """Terminal UI helpers for PrimitiveMail installer."""
 
-import os
 import sys
 import subprocess
-import time
 import threading
 
 BOLD = "\033[1m"
