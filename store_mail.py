@@ -13,7 +13,7 @@ import base64
 import logging
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Optional, Dict, Any
 import urllib.request
@@ -140,7 +140,7 @@ class EmailProcessor:
         domain_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
 
         # Generate filename
-        timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        timestamp = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
         random_id = os.urandom(4).hex()
         filename = f"{timestamp}-{random_id}.eml"
 
