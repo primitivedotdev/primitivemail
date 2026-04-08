@@ -321,10 +321,19 @@ def restart(install_dir: str) -> None:
         capture_output=True,
     )
     if result.returncode != 0:
-        ui.error("docker compose up failed during restart")
+        ui.warn("docker compose up failed during restart; retrying with local images")
         if result.stderr:
             print(result.stderr.decode("utf-8", errors="replace"))
-        return
+        result = subprocess.run(
+            compose_cmd + ["up", "-d"],
+            cwd=install_dir,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            ui.error("docker compose up failed during restart")
+            if result.stderr:
+                print(result.stderr.decode("utf-8", errors="replace"))
+            return
     if wait_for_container(compose_cmd) and wait_for_smtp(compose_cmd):
         ui.success("PrimitiveMail restarted with new domain")
     else:
