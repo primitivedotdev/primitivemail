@@ -5,7 +5,7 @@ MYHOSTNAME="${MYHOSTNAME:-localhost}"
 MYDOMAIN="${MYDOMAIN:-localhost}"
 export MYHOSTNAME MYDOMAIN
 SERVICE_ROLE="${SERVICE_ROLE:-postfix}"
-MILTER_ENDPOINT="${MILTER_ENDPOINT:-milter:9900}"
+MILTER_ENDPOINT="${MILTER_ENDPOINT:-milter-lb:9900}"
 export MILTER_ENDPOINT
 
 render_postfix() {
@@ -79,15 +79,16 @@ find /mail/incoming -type d -exec chmod 755 {} \; 2>/dev/null || true
 # Clean up old debug logs (legacy, no longer created with non-debug wrapper)
 find /tmp -name 'pipe-debug-*.log' -mtime +1 -delete 2>/dev/null || true
 
-# Start rsyslog (optional, for logs)
-service rsyslog start || true
+if [ "$SERVICE_ROLE" = "postfix" ]; then
+    # Only the Postfix service writes /var/log/postfix.log.
+    service rsyslog start || true
 
-# Optionally tail Postfix log to stdout for container log collectors (Datadog, CloudWatch, etc.)
-# Postfix still writes to /var/log/postfix.log regardless — this just mirrors it to stdout.
-if [ "${POSTFIX_LOG_STDOUT:-false}" = "true" ]; then
-    touch /var/log/postfix.log
-    tail -F /var/log/postfix.log &
-    echo "Postfix log tailing to stdout enabled"
+    # Optionally tail Postfix log to stdout for container log collectors.
+    if [ "${POSTFIX_LOG_STDOUT:-false}" = "true" ]; then
+        touch /var/log/postfix.log
+        tail -F /var/log/postfix.log &
+        echo "Postfix log tailing to stdout enabled"
+    fi
 fi
 
 # Datadog APM tracing (optional — set DATADOG_TRACING_ENABLED=true to enable)

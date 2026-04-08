@@ -74,7 +74,6 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./maildata:/mail/incoming
-      - postfix-logs:/var/log
     ulimits:
       nofile:
         soft: 65535
