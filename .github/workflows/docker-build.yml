@@ -43,5 +43,5 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: false
           load: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
