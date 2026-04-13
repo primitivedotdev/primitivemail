@@ -6,7 +6,6 @@ import subprocess
 import sys
 import time
 import urllib.request
-import urllib.error
 from typing import Optional
 
 from installer import ui
