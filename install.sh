@@ -147,7 +147,7 @@ ensure_buildx() {
         *)       error "Unsupported architecture: $(uname -m)"; exit 1 ;;
     esac
     sudo mkdir -p /usr/local/lib/docker/cli-plugins
-    if ! sudo curl -SL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${arch}" \
+    if ! sudo curl -fSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${arch}" \
         -o /usr/local/lib/docker/cli-plugins/docker-buildx; then
         error "Failed to download buildx ${BUILDX_VERSION}"
         exit 1
