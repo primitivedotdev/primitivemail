@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import {
 	appendFile,
-	readdir,
 	readFile,
+	readdir,
 	rename,
 	stat,
 	writeFile,
