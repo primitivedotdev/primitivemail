@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python tests (${{ matrix.python-version }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+
+      - name: Run full pytest suite
+        run: python -m pytest
+
+  python-lint:
+    name: Python lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install ruff
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff
+
+      - name: Run focused Python lint checks
+        run: |
+          ruff check . \
+            --select E9,F63,F7,F82 \
+            --exclude .git,__pycache__,watcher/node_modules,watcher/dist
+
+  watcher:
+    name: Watcher lint and build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.16.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: watcher/pnpm-lock.yaml
+
+      - name: Install watcher dependencies
+        working-directory: watcher
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint watcher
+        working-directory: watcher
+        run: pnpm lint
+
+      - name: Build watcher
+        working-directory: watcher
+        run: pnpm build
+
+  docker-builds:
+    name: Docker build validation
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: primitivemail
+            dockerfile: Dockerfile
+            context: .
+          - name: watcher
+            dockerfile: watcher/Dockerfile
+            context: .
+          - name: postfix-exporter
+            dockerfile: Dockerfile.postfix-exporter
+            context: .
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  shell-checks:
+    name: Shell syntax and lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
+      - name: Verify bash syntax
+        run: |
+          shopt -s nullglob
+          scripts=(./*.sh)
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
+
+      - name: Run shellcheck
+        run: |
+          shopt -s nullglob
+          scripts=(./*.sh)
+          if [ "${#scripts[@]}" -gt 0 ]; then
+            shellcheck --severity=error "${scripts[@]}"
+          fi

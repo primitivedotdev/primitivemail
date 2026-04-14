@@ -4,7 +4,7 @@ RUN corepack enable && corepack prepare pnpm@10.16.1 --activate
 
 WORKDIR /app
 
-COPY watcher/package.json watcher/pnpm-lock.yaml ./
+COPY watcher/package.json watcher/pnpm-lock.yaml watcher/pnpm-workspace.yaml ./
 
 # Install all deps (including devDependencies for tsc)
 RUN pnpm install --frozen-lockfile
@@ -20,7 +20,7 @@ RUN corepack enable && corepack prepare pnpm@10.16.1 --activate
 
 WORKDIR /app
 
-COPY watcher/package.json watcher/pnpm-lock.yaml ./
+COPY watcher/package.json watcher/pnpm-lock.yaml watcher/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile --prod
 
 COPY --from=build /app/dist ./dist

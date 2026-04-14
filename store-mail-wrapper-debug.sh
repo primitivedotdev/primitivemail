@@ -5,7 +5,7 @@ LOGFILE="/tmp/pipe-debug-$(date +%s).log"
 
 {
   echo "=== Wrapper called at $(date) ==="
-  echo "Args: $@"
+  echo "Args:" "$@"
   echo "User: $(whoami)"
   echo "PWD: $(pwd)"
 
