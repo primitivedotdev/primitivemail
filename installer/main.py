@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allowed-senders", default="", dest="allowed_senders")
     parser.add_argument("--allowed-recipients", default="", dest="allowed_recipients")
     parser.add_argument("--spoof-protection", default="off", dest="spoof_protection")
+    parser.add_argument("--rate-limit", default="normal", dest="rate_limit")
     parser.add_argument("--no-prompt", "-y", action="store_true", dest="no_prompt")
     parser.add_argument("--no-start", action="store_true", dest="no_start")
     parser.add_argument("--verbose", action="store_true")
@@ -69,6 +70,18 @@ def configure(args: argparse.Namespace) -> dict:
     allowed_senders = args.allowed_senders
     allowed_recipients = args.allowed_recipients
     spoof_protection = args.spoof_protection
+    rate_limit = args.rate_limit
+
+    if not config.validate_rate_limit(rate_limit):
+        if args.no_prompt:
+            ui.error(f"Invalid rate limit preset: {rate_limit}")
+            ui.info("Valid values: normal, high, off")
+            sys.exit(1)
+        else:
+            ui.warn(f"Invalid rate limit preset: {rate_limit}")
+            ui.info("Valid values: normal, high, off")
+            ui.info("Defaulting to: normal")
+            rate_limit = "normal"
 
     if not config.validate_spoof_protection(spoof_protection):
         if args.no_prompt:
@@ -181,6 +194,22 @@ def configure(args: argparse.Namespace) -> dict:
         spoof_choice = ui.prompt_choice("Choice (1-4)", 4, 1, no_prompt=False)
         spoof_protection = config.map_spoof_choice(spoof_choice)
 
+        # --- Rate limiting ---
+        print()
+        ui.step("Rate Limiting")
+        print()
+        print(f"  {ui.MUTED}Rate limiting caps how many connections, messages, and recipients{ui.NC}")
+        print(f"  {ui.MUTED}a single client can send per minute. Clients that exceed the limit{ui.NC}")
+        print(f"  {ui.MUTED}get a temporary 450 error. Legitimate senders will retry automatically,{ui.NC}")
+        print(f"  {ui.MUTED}so there is low risk of losing real mail.{ui.NC}")
+        print()
+        print(f"    {ui.BOLD}1{ui.NC}. Normal    {ui.MUTED}- 10 conn, 50 msg, 100 rcpt/min (recommended){ui.NC}")
+        print(f"    {ui.BOLD}2{ui.NC}. High      {ui.MUTED}- 100 conn, 500 msg, 1000 rcpt/min (for high-volume relay){ui.NC}")
+        print(f"    {ui.BOLD}3{ui.NC}. Off       {ui.MUTED}- No limits (not recommended for public servers){ui.NC}")
+        print()
+        rate_choice = ui.prompt_choice("Choice (1-3)", 3, 1, no_prompt=False)
+        rate_limit = config.map_rate_limit_choice(rate_choice)
+
         # --- Sender filtering + spoof warning ---
         if config.should_warn_sender_filtering(allowed_sender_domains, allowed_senders, spoof_protection):
             print()
@@ -208,6 +237,7 @@ def configure(args: argparse.Namespace) -> dict:
         "allowed_senders": allowed_senders,
         "allowed_recipients": allowed_recipients,
         "spoof_protection": spoof_protection,
+        "rate_limit": rate_limit,
     }
 
 
@@ -223,6 +253,7 @@ def write_env(install_dir: str, cfg: dict) -> None:
         allowed_senders=cfg["allowed_senders"],
         allowed_recipients=cfg["allowed_recipients"],
         spoof_protection=cfg["spoof_protection"],
+        rate_limit=cfg["rate_limit"],
     )
     env_path = os.path.join(install_dir, ".env")
     with open(env_path, "w") as f:
@@ -242,6 +273,7 @@ def print_config_summary(cfg: dict) -> None:
         allowed_senders=cfg["allowed_senders"],
         allowed_recipients=cfg["allowed_recipients"],
         spoof_protection=cfg["spoof_protection"],
+        rate_limit=cfg["rate_limit"],
     )
     print()
     ui.step("Configuration summary")

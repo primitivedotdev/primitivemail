@@ -34,9 +34,10 @@ smtpd_client_connection_count_limit = 50
 maillog_file = /var/log/postfix.log
 
 # Keep limits loose enough for fanout while still capping runaway clients.
-smtpd_client_connection_rate_limit = 100
-smtpd_client_message_rate_limit = 500
-smtpd_client_recipient_rate_limit = 1000
+# Override via SMTP_CONN_RATE_LIMIT, SMTP_MSG_RATE_LIMIT, SMTP_RCPT_RATE_LIMIT.
+smtpd_client_connection_rate_limit = ${SMTP_CONN_RATE_LIMIT}
+smtpd_client_message_rate_limit = ${SMTP_MSG_RATE_LIMIT}
+smtpd_client_recipient_rate_limit = ${SMTP_RCPT_RATE_LIMIT}
 anvil_rate_time_unit = 60s
 
 # Message size limit - 25MB (standard SMTP limit)

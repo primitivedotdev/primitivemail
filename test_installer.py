@@ -10,6 +10,8 @@ from installer.config import (
     generate_webhook_secret,
     validate_spoof_protection,
     map_spoof_choice,
+    validate_rate_limit,
+    map_rate_limit_choice,
     should_warn_sender_filtering,
     build_config_summary,
     build_dns_instructions,
@@ -76,7 +78,7 @@ class TestGenerateEnvContent:
         assert "ALLOWED_RECIPIENTS=inbox@example.com" in result
         assert "SPOOF_PROTECTION=standard" in result
 
-    def test_exactly_11_lines(self):
+    def test_exactly_14_lines(self):
         result = generate_env_content(
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
@@ -84,7 +86,46 @@ class TestGenerateEnvContent:
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
-        assert len(result.strip().split("\n")) == 11
+        assert len(result.strip().split("\n")) == 14
+
+    def test_rate_limit_normal(self):
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            rate_limit="normal",
+        )
+        assert "SMTP_CONN_RATE_LIMIT=10" in result
+        assert "SMTP_MSG_RATE_LIMIT=50" in result
+        assert "SMTP_RCPT_RATE_LIMIT=100" in result
+
+    def test_rate_limit_high(self):
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            rate_limit="high",
+        )
+        assert "SMTP_CONN_RATE_LIMIT=100" in result
+        assert "SMTP_MSG_RATE_LIMIT=500" in result
+        assert "SMTP_RCPT_RATE_LIMIT=1000" in result
+
+    def test_rate_limit_off(self):
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            rate_limit="off",
+        )
+        assert "SMTP_CONN_RATE_LIMIT=0" in result
+        assert "SMTP_MSG_RATE_LIMIT=0" in result
+        assert "SMTP_RCPT_RATE_LIMIT=0" in result
 
     def test_no_quoting(self):
         result = generate_env_content(
@@ -179,6 +220,23 @@ class TestBuildConfigSummary:
         assert "trusted.org" in text
         assert "ceo@big.com" in text
 
+    @pytest.mark.parametrize("level,expected", [
+        ("normal", "Normal"),
+        ("high", "High"),
+        ("off", "Off"),
+    ])
+    def test_rate_limit_labels(self, level, expected):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", allowed_sender_domains="",
+            allowed_senders="", allowed_recipients="",
+            spoof_protection="off", rate_limit=level,
+        )
+        text = "\n".join(lines)
+        assert expected in text
+        assert "Rate limiting" in text
+
     def test_tls_always_shown(self):
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
@@ -244,6 +302,30 @@ class TestMapSpoofChoice:
         assert map_spoof_choice(0) == "off"
         assert map_spoof_choice(5) == "off"
         assert map_spoof_choice(-1) == "off"
+
+
+class TestValidateRateLimit:
+
+    @pytest.mark.parametrize("value", ["normal", "high", "off"])
+    def test_valid(self, value):
+        assert validate_rate_limit(value) is True
+
+    @pytest.mark.parametrize("value", ["", "invalid", "Normal", "HIGH", "none", "low"])
+    def test_invalid(self, value):
+        assert validate_rate_limit(value) is False
+
+
+class TestMapRateLimitChoice:
+
+    def test_all_choices(self):
+        assert map_rate_limit_choice(1) == "normal"
+        assert map_rate_limit_choice(2) == "high"
+        assert map_rate_limit_choice(3) == "off"
+
+    def test_invalid_defaults_to_normal(self):
+        assert map_rate_limit_choice(0) == "normal"
+        assert map_rate_limit_choice(4) == "normal"
+        assert map_rate_limit_choice(-1) == "normal"
 
 
 class TestShouldWarnSenderFiltering:

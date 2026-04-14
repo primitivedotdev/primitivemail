@@ -26,6 +26,9 @@ services:
       LOKI_URL: "${LOKI_URL:-}"                     # Loki push endpoint (optional)
       LOKI_USER: "${LOKI_USER:-}"                   # Loki auth user (optional)
       LOKI_KEY: "${LOKI_KEY:-}"                     # Loki auth key (optional)
+      SMTP_CONN_RATE_LIMIT: "${SMTP_CONN_RATE_LIMIT:-10}"    # Max connections/min per client
+      SMTP_MSG_RATE_LIMIT: "${SMTP_MSG_RATE_LIMIT:-50}"      # Max messages/min per client
+      SMTP_RCPT_RATE_LIMIT: "${SMTP_RCPT_RATE_LIMIT:-100}"   # Max recipients/min per client
     ports:
       - "25:25"     # SMTP (public)
     depends_on:
@@ -72,6 +75,9 @@ services:
       LOKI_USER: "${LOKI_USER:-}"
       LOKI_KEY: "${LOKI_KEY:-}"
       PYTHONUNBUFFERED: "1"
+    expose:
+      - "9900"   # milter protocol (HAProxy backends)
+      - "9901"   # Prometheus metrics (Alloy scraping)
     volumes:
       - ./maildata:/mail/incoming
     ulimits:
@@ -112,6 +118,12 @@ services:
     container_name: alloy
     restart: unless-stopped
     read_only: true
+    # Alloy needs the Docker socket for discovery.docker (milter scraping).
+    # The socket grants root-equivalent access to the host. If this is a concern,
+    # replace the bind mount with a read-only Docker socket proxy such as
+    # tecnativa/docker-socket-proxy (only expose containers/events endpoints).
+    security_opt:
+      - no-new-privileges:true
     command:
       - run
       - --storage.path=/tmp/alloy

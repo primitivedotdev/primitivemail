@@ -41,6 +41,21 @@ def map_spoof_choice(choice: int) -> str:
     return {1: "off", 2: "monitor", 3: "standard", 4: "strict"}.get(choice, "off")
 
 
+RATE_LIMIT_PRESETS = {
+    "normal": {"conn": "10", "msg": "50", "rcpt": "100"},
+    "high": {"conn": "100", "msg": "500", "rcpt": "1000"},
+    "off": {"conn": "0", "msg": "0", "rcpt": "0"},
+}
+
+
+def validate_rate_limit(value: str) -> bool:
+    return value in RATE_LIMIT_PRESETS
+
+
+def map_rate_limit_choice(choice: int) -> str:
+    return {1: "normal", 2: "high", 3: "off"}.get(choice, "normal")
+
+
 def should_warn_sender_filtering(
     allowed_sender_domains: str,
     allowed_senders: str,
@@ -62,9 +77,11 @@ def generate_env_content(
     allowed_senders: str,
     allowed_recipients: str,
     spoof_protection: str,
+    rate_limit: str = "normal",
 ) -> str:
-    """Generate .env file content. 11 lines, unquoted values."""
+    """Generate .env file content. Unquoted values."""
     enable = "true" if enable_ip_literal else "false"
+    preset = RATE_LIMIT_PRESETS.get(rate_limit, RATE_LIMIT_PRESETS["normal"])
     lines = [
         f"MYHOSTNAME={hostname}",
         f"MYDOMAIN={domain}",
@@ -77,6 +94,9 @@ def generate_env_content(
         f"ALLOWED_RECIPIENTS={allowed_recipients}",
         "ALLOW_BOUNCES=true",
         f"SPOOF_PROTECTION={spoof_protection}",
+        f"SMTP_CONN_RATE_LIMIT={preset['conn']}",
+        f"SMTP_MSG_RATE_LIMIT={preset['msg']}",
+        f"SMTP_RCPT_RATE_LIMIT={preset['rcpt']}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -91,6 +111,7 @@ def build_config_summary(
     allowed_senders: str,
     allowed_recipients: str,
     spoof_protection: str,
+    rate_limit: str = "normal",
 ) -> list:
     """Build config summary as plain text lines (no ANSI)."""
     lines = []
@@ -129,6 +150,13 @@ def build_config_summary(
         "strict": "Strict (reject on any failure)",
     }
     lines.append(f"Spoof protection:  {spoof_labels.get(spoof_protection, 'Off')}")
+
+    rate_labels = {
+        "normal": "Normal (10 conn, 50 msg, 100 rcpt per min)",
+        "high": "High (100 conn, 500 msg, 1000 rcpt per min)",
+        "off": "Off (no limits)",
+    }
+    lines.append(f"Rate limiting:     {rate_labels.get(rate_limit, 'Normal')}")
     lines.append("TLS:               Self-signed (auto-generated)")
 
     return lines

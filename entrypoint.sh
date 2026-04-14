@@ -6,7 +6,10 @@ MYDOMAIN="${MYDOMAIN:-localhost}"
 export MYHOSTNAME MYDOMAIN
 SERVICE_ROLE="${SERVICE_ROLE:-postfix}"
 MILTER_ENDPOINT="${MILTER_ENDPOINT:-milter-lb:9900}"
-export MILTER_ENDPOINT
+SMTP_CONN_RATE_LIMIT="${SMTP_CONN_RATE_LIMIT:-10}"
+SMTP_MSG_RATE_LIMIT="${SMTP_MSG_RATE_LIMIT:-50}"
+SMTP_RCPT_RATE_LIMIT="${SMTP_RCPT_RATE_LIMIT:-100}"
+export MILTER_ENDPOINT SMTP_CONN_RATE_LIMIT SMTP_MSG_RATE_LIMIT SMTP_RCPT_RATE_LIMIT
 
 render_postfix() {
     TLS_CERT="${TLS_CERT:-/etc/postfix/tls/server.pem}"
@@ -21,7 +24,7 @@ render_postfix() {
         echo "Generated self-signed TLS certificate for ${MYHOSTNAME}"
     fi
 
-    envsubst '$MYHOSTNAME $MYDOMAIN $MILTER_ENDPOINT' < /opt/mx-box/postfix-main.cf.template > /etc/postfix/main.cf
+    envsubst '$MYHOSTNAME $MYDOMAIN $MILTER_ENDPOINT $SMTP_CONN_RATE_LIMIT $SMTP_MSG_RATE_LIMIT $SMTP_RCPT_RATE_LIMIT' < /opt/mx-box/postfix-main.cf.template > /etc/postfix/main.cf
 
     if [[ "${ENABLE_IP_LITERAL:-false}" == "true" && -n "${IP_LITERAL:-}" ]]; then
         echo "Enabling IP literal support for [${IP_LITERAL}]"
@@ -50,8 +53,12 @@ render_postfix() {
     chown -R postfix:postfix /var/spool/postfix
 }
 
-# Create .env file for config (Postfix pipes don't inherit container env)
-cat > /opt/mx-box/.env <<EOF
+# Fix permissions on mail directories (needed by both roles)
+find /mail/incoming -type d -exec chmod 755 {} \; 2>/dev/null || true
+
+if [ "$SERVICE_ROLE" = "postfix" ]; then
+    # Create .env file for config (Postfix pipes don't inherit container env)
+    cat > /opt/mx-box/.env <<EOF
 WEBHOOK_URL=${WEBHOOK_URL:-}
 WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
 STORAGE_URL=${STORAGE_URL:-}
@@ -66,20 +73,16 @@ ALLOWED_RECIPIENTS=${ALLOWED_RECIPIENTS:-}
 SPOOF_PROTECTION=${SPOOF_PROTECTION:-off}
 EOF
 
-# Copy and compile aliases (using luser_relay, not transport_maps)
-cp /opt/mx-box/aliases /etc/aliases
-newaliases
+    # Copy and compile aliases (using luser_relay, not transport_maps)
+    cp /opt/mx-box/aliases /etc/aliases
+    newaliases
 
-# Ensure script is executable
-chmod +x /opt/mx-box/store_mail.py
+    # Ensure script is executable
+    chmod +x /opt/mx-box/store_mail.py
 
-# Fix permissions on mail directories
-find /mail/incoming -type d -exec chmod 755 {} \; 2>/dev/null || true
+    # Clean up old debug logs (legacy, no longer created with non-debug wrapper)
+    find /tmp -name 'pipe-debug-*.log' -mtime +1 -delete 2>/dev/null || true
 
-# Clean up old debug logs (legacy, no longer created with non-debug wrapper)
-find /tmp -name 'pipe-debug-*.log' -mtime +1 -delete 2>/dev/null || true
-
-if [ "$SERVICE_ROLE" = "postfix" ]; then
     # Only the Postfix service writes /var/log/postfix.log.
     service rsyslog start || true
 
