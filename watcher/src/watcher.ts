@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import {
 	appendFile,
-	readFile,
 	readdir,
+	readFile,
 	rename,
 	stat,
 	writeFile,
@@ -14,7 +14,7 @@ import {
 	parseEmailWithAttachments,
 	toCanonicalHeaders,
 	toParsedDataComplete,
-} from "@primitivedotdev/sdk-node/parser";
+} from "@primitivedotdev/sdk/parser";
 
 const MAIL_DIR = process.env.MAIL_DIR ?? "/mail/incoming";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? "1000");
