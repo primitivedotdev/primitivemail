@@ -36,6 +36,19 @@ smtpd_client_message_rate_limit = 50
 smtpd_client_recipient_rate_limit = 100
 anvil_rate_time_unit = 60s
 
+# Process and connection limits
+# default_process_limit controls max smtpd processes (and other daemon types).
+# At 50 concurrent SMTP users with 300ms milter response times,
+# each smtpd process is occupied for the duration of the milter call.
+# 200 processes gives headroom for 100+ concurrent SMTP transactions.
+default_process_limit = 200
+smtpd_client_connection_count_limit = 100
+
+# Milter timeout - must exceed webhook timeout (25s inline, 10s storage-first)
+# plus processing time. 120s gives ample headroom.
+milter_command_timeout = 120s
+milter_content_timeout = 120s
+
 # Message size limit - 25MB (standard SMTP limit)
 message_size_limit = 26214400
 
