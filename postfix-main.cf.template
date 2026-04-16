@@ -42,7 +42,7 @@ anvil_rate_time_unit = 60s
 # each smtpd process is occupied for the duration of the milter call.
 # 200 processes gives headroom for 100+ concurrent SMTP transactions.
 default_process_limit = 200
-smtpd_client_connection_count_limit = 200
+smtpd_client_connection_count_limit = 100
 
 # Milter timeout - must exceed webhook timeout (25s inline, 10s storage-first)
 # plus processing time. 120s gives ample headroom.
