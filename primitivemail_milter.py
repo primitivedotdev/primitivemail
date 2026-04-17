@@ -21,6 +21,7 @@ import base64
 import logging
 import time
 import hashlib
+import ipaddress
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -280,12 +281,27 @@ if SPOOF_PROTECTION != 'off':
 # DNS resolver timeout for SPF/DKIM/DMARC lookups
 DNS_TIMEOUT = 3
 
+# Spamhaus DNSBL (optional).
+# Set SPAMHAUS_DNSBL_DOMAIN to the full query suffix, for example:
+# - zen.spamhaus.org
+# - <your_DQS_key>.zen.dq.spamhaus.net
+# We only enforce the DROP return code (127.0.0.9) for now so the behavior
+# matches the existing DROP-only cron policy.
+SPAMHAUS_DNSBL_DOMAIN = os.environ.get('SPAMHAUS_DNSBL_DOMAIN', '').strip().lower().rstrip('.')
+SPAMHAUS_DROP_CODE = '127.0.0.9'
+
+if SPAMHAUS_DNSBL_DOMAIN and not DNS_AVAILABLE:
+    logger.warning("SPAMHAUS_DNSBL_DOMAIN is set but dnspython is unavailable - DNSBL disabled")
+    SPAMHAUS_DNSBL_DOMAIN = ''
+
 if SENDER_FILTERING_ENABLED:
     logger.info(f"Sender filtering enabled: {len(ALLOWED_SENDER_DOMAINS)} domains, {len(ALLOWED_SENDERS)} addresses")
 if RECIPIENT_FILTERING_ENABLED:
     logger.info(f"Recipient filtering enabled: {len(ALLOWED_RECIPIENTS)} addresses")
 if SPOOF_PROTECTION != 'off':
     logger.info(f"Spoof protection: {SPOOF_PROTECTION}")
+if SPAMHAUS_DNSBL_DOMAIN:
+    logger.info(f"Spamhaus DNSBL enabled: {SPAMHAUS_DNSBL_DOMAIN} (enforcing {SPAMHAUS_DROP_CODE})")
 
 validator = EmailValidator()
 
@@ -376,6 +392,59 @@ class PrimitiveMailMilter(Milter.Base):
             span.finish()
             self._trace_span = None
 
+    @staticmethod
+    def _reverse_ipv4_for_dnsbl(ip: str) -> Optional[str]:
+        """Reverse a global IPv4 address for DNSBL queries."""
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+
+        if parsed.version != 4 or not parsed.is_global:
+            return None
+
+        return '.'.join(reversed(str(parsed).split('.')))
+
+    def _lookup_spamhaus_dnsbl(self) -> Optional[list]:
+        """Return Spamhaus response codes for the client IP, or None if not listed.
+
+        Fail open on lookup errors to avoid blocking legitimate mail when DNS is
+        unavailable.
+        """
+        if not SPAMHAUS_DNSBL_DOMAIN or not self.client_ip:
+            return None
+
+        reversed_ip = self._reverse_ipv4_for_dnsbl(self.client_ip)
+        if not reversed_ip:
+            return None
+
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = DNS_TIMEOUT
+        resolver.timeout = DNS_TIMEOUT
+        query_name = f"{reversed_ip}.{SPAMHAUS_DNSBL_DOMAIN}"
+
+        try:
+            answers = resolver.resolve(query_name, 'A')
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+            return None
+        except dns.resolver.Timeout as e:
+            self.log_error(f"Spamhaus DNSBL lookup timed out for {self.client_ip}: {e}")
+            return None
+        except Exception as e:
+            self.log_error(f"Spamhaus DNSBL lookup failed for {self.client_ip}: {e}")
+            return None
+
+        codes = sorted({rdata.to_text() for rdata in answers})
+
+        # DQS-specific errors should fail open and be very visible in logs.
+        if '127.255.255.250' in codes or '127.255.255.251' in codes:
+            self.log_error(
+                f"Spamhaus DNSBL returned DQS error codes for {self.client_ip}: {', '.join(codes)}"
+            )
+            return None
+
+        return codes or None
+
     @Milter.noreply
     def connect(self, hostname, family, hostaddr):
         """Called when client connects"""
@@ -391,7 +460,7 @@ class PrimitiveMailMilter(Milter.Base):
         return Milter.CONTINUE
 
     def envfrom(self, mailfrom, *params):
-        """MAIL FROM command - get sender, apply sender filtering and SPF"""
+        """MAIL FROM command - get sender, apply DNSBL, sender filtering and SPF"""
         self.reset()  # New message, reset state
         # Parse sender address (handles <addr> format)
         # parse_addr returns (user, domain) tuple for normal addresses
@@ -406,6 +475,15 @@ class PrimitiveMailMilter(Milter.Base):
         else:
             self.sender = str(parts) if parts else ''
         self.log(f"MAIL FROM: {self.sender!r}")
+
+        # Reject DROP-listed IPs early, before reading the message body.
+        dnsbl_codes = self._lookup_spamhaus_dnsbl()
+        if dnsbl_codes and SPAMHAUS_DROP_CODE in dnsbl_codes:
+            self.log(
+                f"Client IP {self.client_ip} listed in Spamhaus DNSBL: {', '.join(dnsbl_codes)}"
+            )
+            self.setreply("554", "5.7.1", "Rejected - client IP listed in Spamhaus DROP")
+            return Milter.REJECT
 
         # --- Sender filtering ---
         if SENDER_FILTERING_ENABLED:
@@ -903,7 +981,7 @@ class PrimitiveMailMilter(Milter.Base):
         # Call webhook once per recipient
         any_accepted = False
         any_tempfail = False
-        hard_rejects = 0   # protocol_violation, domain_not_found
+        hard_rejects = 0   # protocol_violation, domain_not_found, spamhaus_drop_listed
         soft_rejects = 0   # other reject_permanent reasons
         last_hard_reject_result = None  # preserve details for single-recipient reject codes
 
@@ -935,7 +1013,7 @@ class PrimitiveMailMilter(Milter.Base):
                 reason = result.get('reason', '')
                 detail = result.get('detail', '')
                 self.log(f"    Result: reject_permanent (reason: {reason}, detail: {detail})")
-                if reason in ('protocol_violation', 'domain_not_found'):
+                if reason in ('protocol_violation', 'domain_not_found', 'spamhaus_drop_listed'):
                     hard_rejects += 1
                     last_hard_reject_result = result
                 else:
@@ -1001,6 +1079,9 @@ class PrimitiveMailMilter(Milter.Base):
                 elif reason == 'domain_not_found':
                     self.setreply("550", "5.1.2", "Domain not found")
                     self.log("Returning REJECT (550) - domain not found")
+                elif reason == 'spamhaus_drop_listed':
+                    self.setreply("554", "5.7.1", "Rejected - client IP listed in Spamhaus DROP")
+                    self.log("Returning REJECT (554) - Spamhaus DROP")
                 else:
                     self.setreply("550", "5.1.1", "Recipient rejected")
                     self.log(f"Returning REJECT (550) - {reason}")
@@ -1306,6 +1387,7 @@ def main():
     if RECIPIENT_FILTERING_ENABLED:
         logger.info(f"  Recipient filter: {len(ALLOWED_RECIPIENTS)} addresses")
     logger.info(f"  Spoof protection: {SPOOF_PROTECTION}")
+    logger.info(f"  Spamhaus DNSBL: {SPAMHAUS_DNSBL_DOMAIN or 'disabled'}")
     logger.info(f"  Metrics: {'enabled' if METRICS_ENABLED else 'disabled'}")
     logger.info("=" * 60)
 
