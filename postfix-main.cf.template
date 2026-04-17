@@ -49,8 +49,8 @@ smtpd_client_connection_count_limit = 100
 milter_command_timeout = 120s
 milter_content_timeout = 120s
 
-# Message size limit - 25MB (standard SMTP limit)
-message_size_limit = 26214400
+# Message size limit - 50 MiB (matches EmailValidator.MAX_EMAIL_SIZE_BYTES)
+message_size_limit = 52428800
 
 # TLS - enable STARTTLS for incoming connections
 # Self-signed cert auto-generated at startup if not provided

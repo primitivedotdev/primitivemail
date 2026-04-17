@@ -152,13 +152,16 @@ class TestSizeValidation:
     def test_valid_sizes(self, validator):
         assert validator.validate_size(1).valid
         assert validator.validate_size(1000).valid
-        assert validator.validate_size(1024 * 1024).valid  # 1MB
-        assert validator.validate_size(10 * 1024 * 1024).valid  # 10MB
+        assert validator.validate_size(1024 * 1024).valid  # 1 MiB
+        assert validator.validate_size(10 * 1024 * 1024).valid  # 10 MiB
+        assert validator.validate_size(40 * 1024 * 1024).valid  # 40 MiB
+        assert validator.validate_size(50 * 1024 * 1024).valid  # 50 MiB (boundary)
 
     def test_invalid_sizes(self, validator):
         assert not validator.validate_size(0).valid
         assert not validator.validate_size(-1).valid
-        assert not validator.validate_size(100 * 1024 * 1024).valid  # 100MB
+        assert not validator.validate_size(50 * 1024 * 1024 + 1).valid  # just over limit
+        assert not validator.validate_size(100 * 1024 * 1024).valid  # 100 MiB
 
 
 class TestSubjectSanitization:

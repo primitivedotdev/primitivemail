@@ -50,7 +50,7 @@ class EmailValidator:
     MAX_LOCAL_PART_LENGTH = 64  # RFC 5321
     MAX_DOMAIN_LENGTH = 253  # RFC 1035
     MAX_SUBJECT_LENGTH = 998  # RFC 5322
-    MAX_EMAIL_SIZE_BYTES = 25 * 1024 * 1024  # 25MB
+    MAX_EMAIL_SIZE_BYTES = 50 * 1024 * 1024  # 50 MiB (matches postfix message_size_limit)
 
     def validate_email_address(self, email: str) -> ValidationResult:
         """
