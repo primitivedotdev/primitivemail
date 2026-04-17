@@ -842,8 +842,11 @@ class PrimitiveMailMilter(Milter.Base):
         size_validation = validator.validate_size(size)
         if not size_validation.valid:
             self.log_error(f"Email too large: {size} bytes")
-            self._result_label = 'accept'
-            return Milter.ACCEPT
+            self.setreply("552", "5.3.4", "Message size exceeds fixed limit")
+            self._result_label = 'reject_permanent'
+            self._finish_trace("reject_permanent", "size_exceeds_limit")
+            self.log(f"Returning REJECT (552) - size {size} exceeds limit")
+            return Milter.REJECT
 
         # Determine path
         if size > STORAGE_UPLOAD_THRESHOLD:
