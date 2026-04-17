@@ -51,11 +51,20 @@ try:
     import dns.resolver
     DNS_AVAILABLE = True
 except ImportError:
+    class _NXDOMAINShim(Exception):
+        pass
+
+    class _NoAnswerShim(Exception):
+        pass
+
+    class _NoNameserversShim(Exception):
+        pass
+
     dns = SimpleNamespace(
         resolver=SimpleNamespace(
-            NXDOMAIN=Exception,
-            NoAnswer=Exception,
-            NoNameservers=Exception,
+            NXDOMAIN=_NXDOMAINShim,
+            NoAnswer=_NoAnswerShim,
+            NoNameservers=_NoNameserversShim,
             Timeout=TimeoutError,
             Resolver=None,
         )
@@ -70,7 +79,7 @@ try:
         suffix_list_urls=(),
     )
     TLDEXTRACT_AVAILABLE = True
-except ImportError:
+except Exception:
     TLDEXTRACT_EXTRACTOR = None
     TLDEXTRACT_AVAILABLE = False
 
