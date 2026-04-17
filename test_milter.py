@@ -8,6 +8,7 @@ standalone storage, and spoof protection (SPF/DKIM/DMARC enforcement).
 
 import pytest
 import json
+import os
 import sys
 from unittest.mock import patch, MagicMock, PropertyMock
 from urllib.error import HTTPError, URLError
@@ -42,6 +43,7 @@ mock_milter_utils.parse_addr = fake_parse_addr
 
 sys.modules['Milter'] = mock_milter
 sys.modules['Milter.utils'] = mock_milter_utils
+os.environ.setdefault("TLDEXTRACT_CACHE", "/tmp/primitivemail-test-tldextract")
 
 # Now import our milter (with Milter mocked)
 import primitivemail_milter as pm
