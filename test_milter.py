@@ -76,9 +76,11 @@ def milter():
     original_standalone = pm.STANDALONE_MODE
     original_webhook_url = pm.WEBHOOK_URL
     original_webhook_secret = pm.WEBHOOK_SECRET
+    original_dnsbl_domain = pm.SPAMHAUS_DNSBL_DOMAIN
     pm.STANDALONE_MODE = False
     pm.WEBHOOK_URL = 'https://test.example.com/webhook'
     pm.WEBHOOK_SECRET = 'test-secret'
+    pm.SPAMHAUS_DNSBL_DOMAIN = ''
 
     m = pm.PrimitiveMailMilter()
     m.setreply = MagicMock()
@@ -93,13 +95,16 @@ def milter():
     pm.STANDALONE_MODE = original_standalone
     pm.WEBHOOK_URL = original_webhook_url
     pm.WEBHOOK_SECRET = original_webhook_secret
+    pm.SPAMHAUS_DNSBL_DOMAIN = original_dnsbl_domain
 
 
 @pytest.fixture
 def standalone_milter():
     """Create a milter in standalone mode"""
     original_standalone = pm.STANDALONE_MODE
+    original_dnsbl_domain = pm.SPAMHAUS_DNSBL_DOMAIN
     pm.STANDALONE_MODE = True
+    pm.SPAMHAUS_DNSBL_DOMAIN = ''
 
     m = pm.PrimitiveMailMilter()
     m.setreply = MagicMock()
@@ -113,6 +118,7 @@ def standalone_milter():
     yield m
 
     pm.STANDALONE_MODE = original_standalone
+    pm.SPAMHAUS_DNSBL_DOMAIN = original_dnsbl_domain
 
 
 def add_simple_message(m):
@@ -184,6 +190,18 @@ class TestSingleRecipient:
 
         assert result == mock_milter.REJECT
         milter.setreply.assert_called_with("554", "5.5.2", "From domain uses reserved TLD")
+
+    def test_single_recipient_spamhaus_drop_gets_554(self, milter):
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        resp = make_webhook_response('reject_permanent', reason='spamhaus_drop_listed')
+        with patch('urllib.request.urlopen', return_value=resp):
+            result = milter.eom()
+
+        assert result == mock_milter.REJECT
+        milter.setreply.assert_called_with("554", "5.7.1", "Rejected - client IP listed in Spamhaus DROP")
 
     def test_single_recipient_webhook_failure_tempfails(self, milter):
         milter.envfrom('<sender@example.com>')
@@ -306,6 +324,53 @@ class TestMultipleRecipients:
             result = milter.eom()
 
         assert result == mock_milter.TEMPFAIL
+
+
+# ===========================================================================
+# Spamhaus DNSBL
+# ===========================================================================
+
+class TestSpamhausDNSBL:
+
+    def test_drop_hit_rejects_in_envfrom(self, milter):
+        pm.SPAMHAUS_DNSBL_DOMAIN = 'zen.spamhaus.org'
+        milter.client_ip = '1.2.3.4'
+
+        resolver = MagicMock()
+        resolver.resolve.return_value = [MagicMock(to_text=MagicMock(return_value='127.0.0.9'))]
+
+        with patch('primitivemail_milter.dns.resolver.Resolver', return_value=resolver):
+            result = milter.envfrom('<sender@example.com>')
+
+        assert result == mock_milter.REJECT
+        resolver.resolve.assert_called_once_with('4.3.2.1.zen.spamhaus.org', 'A')
+        milter.setreply.assert_called_with("554", "5.7.1", "Rejected - client IP listed in Spamhaus DROP")
+
+    def test_unlisted_ip_continues(self, milter):
+        pm.SPAMHAUS_DNSBL_DOMAIN = 'zen.spamhaus.org'
+        milter.client_ip = '1.2.3.4'
+
+        resolver = MagicMock()
+        resolver.resolve.side_effect = pm.dns.resolver.NXDOMAIN()
+
+        with patch('primitivemail_milter.dns.resolver.Resolver', return_value=resolver):
+            result = milter.envfrom('<sender@example.com>')
+
+        assert result == mock_milter.CONTINUE
+        milter.setreply.assert_not_called()
+
+    def test_lookup_error_fails_open(self, milter):
+        pm.SPAMHAUS_DNSBL_DOMAIN = 'zen.spamhaus.org'
+        milter.client_ip = '1.2.3.4'
+
+        resolver = MagicMock()
+        resolver.resolve.side_effect = RuntimeError('resolver blew up')
+
+        with patch('primitivemail_milter.dns.resolver.Resolver', return_value=resolver):
+            result = milter.envfrom('<sender@example.com>')
+
+        assert result == mock_milter.CONTINUE
+        milter.setreply.assert_not_called()
 
     def test_all_hard_rejected_returns_reject(self, milter):
         milter.envfrom('<sender@example.com>')
