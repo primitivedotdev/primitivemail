@@ -8,6 +8,7 @@ standalone storage, and spoof protection (SPF/DKIM/DMARC enforcement).
 
 import pytest
 import json
+import os
 import sys
 from unittest.mock import patch, MagicMock, PropertyMock
 from urllib.error import HTTPError, URLError
@@ -42,6 +43,7 @@ mock_milter_utils.parse_addr = fake_parse_addr
 
 sys.modules['Milter'] = mock_milter
 sys.modules['Milter.utils'] = mock_milter_utils
+os.environ.setdefault("TLDEXTRACT_CACHE", "/tmp/primitivemail-test-tldextract")
 
 # Now import our milter (with Milter mocked)
 import primitivemail_milter as pm
@@ -1314,6 +1316,23 @@ class TestDomainAlignment:
         """Without tldextract, relaxed alignment degrades to strict"""
         with patch.object(pm, 'TLDEXTRACT_AVAILABLE', False):
             assert milter._domains_aligned('mail.example.com', 'example.com', 'r') is False
+
+    def test_org_domain_constructor_error_falls_back(self, milter):
+        """Constructor or extractor errors should not crash org-domain fallback."""
+        with patch.object(pm, 'TLDEXTRACT_AVAILABLE', True), \
+             patch.object(pm, 'TLDEXTRACT_EXTRACTOR', side_effect=PermissionError("bad cache")):
+            assert milter._org_domain('mail.example.com') == 'mail.example.com'
+
+
+class TestDnsShim:
+    """Unit tests for fallback DNS shim behavior when dnspython is absent."""
+
+    def test_dns_shim_exceptions_are_distinct(self):
+        assert pm.dns.resolver.NXDOMAIN is not Exception
+        assert pm.dns.resolver.NoAnswer is not Exception
+        assert pm.dns.resolver.NoNameservers is not Exception
+        assert pm.dns.resolver.NXDOMAIN is not pm.dns.resolver.NoAnswer
+        assert pm.dns.resolver.NoAnswer is not pm.dns.resolver.NoNameservers
 
 
 class TestCheckDMARC:

@@ -24,6 +24,7 @@ import hashlib
 import ipaddress
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, Dict, Any
 import urllib.request
 import urllib.error
@@ -50,12 +51,36 @@ try:
     import dns.resolver
     DNS_AVAILABLE = True
 except ImportError:
+    class _NXDOMAINShim(Exception):
+        pass
+
+    class _NoAnswerShim(Exception):
+        pass
+
+    class _NoNameserversShim(Exception):
+        pass
+
+    dns = SimpleNamespace(
+        resolver=SimpleNamespace(
+            NXDOMAIN=_NXDOMAINShim,
+            NoAnswer=_NoAnswerShim,
+            NoNameservers=_NoNameserversShim,
+            Timeout=TimeoutError,
+            Resolver=None,
+        )
+    )
     DNS_AVAILABLE = False
 
 try:
     import tldextract
+    TLDEXTRACT_CACHE_DIR = os.environ.get('TLDEXTRACT_CACHE', '/tmp/primitivemail-tldextract')
+    TLDEXTRACT_EXTRACTOR = tldextract.TLDExtract(
+        cache_dir=TLDEXTRACT_CACHE_DIR,
+        suffix_list_urls=(),
+    )
     TLDEXTRACT_AVAILABLE = True
-except ImportError:
+except Exception:
+    TLDEXTRACT_EXTRACTOR = None
     TLDEXTRACT_AVAILABLE = False
 
 # Prometheus metrics (optional - degrades gracefully if not installed)
@@ -582,7 +607,10 @@ class PrimitiveMailMilter(Milter.Base):
         """Extract organizational domain using tldextract (e.g., mail.example.com -> example.com)."""
         if not TLDEXTRACT_AVAILABLE:
             return domain.lower()
-        ext = tldextract.extract(domain)
+        try:
+            ext = TLDEXTRACT_EXTRACTOR(domain)
+        except Exception:
+            return domain.lower()
         if ext.domain and ext.suffix:
             return f"{ext.domain}.{ext.suffix}".lower()
         return domain.lower()
