@@ -844,7 +844,6 @@ class PrimitiveMailMilter(Milter.Base):
             self.log_error(f"Email too large: {size} bytes")
             self.setreply("552", "5.3.4", "Message size exceeds fixed limit")
             self._result_label = 'reject_permanent'
-            self._finish_trace("reject_permanent", "size_exceeds_limit")
             self.log(f"Returning REJECT (552) - size {size} exceeds limit")
             return Milter.REJECT
 
