@@ -74,6 +74,9 @@ def _restore_pm_after_reload(monkeypatch):
 @pytest.mark.parametrize(
     "header_name",
     [
+        "authorization",
+        "Authorization",
+        "AUTHORIZATION",
         "content-type",
         "Content-Type",
         "webhook-id",
@@ -206,8 +209,9 @@ def _build_milter_for_webhook_call(monkeypatch):
     return m
 
 
-def test_live_call_emits_standard_webhooks_headers(monkeypatch):
-    """Signature headers present; no Bearer, no legacy Primitive signature."""
+def test_live_call_emits_standard_webhooks_headers_and_bearer(monkeypatch):
+    """Signature headers present; Bearer present for primitive.dev mx_main
+    receiver compatibility. Legacy primitive-signature NOT emitted."""
     m = _build_milter_for_webhook_call(monkeypatch)
     captured = {}
 
@@ -229,9 +233,11 @@ def test_live_call_emits_standard_webhooks_headers(monkeypatch):
     assert "webhook-timestamp" in captured["headers"]
     assert "webhook-signature" in captured["headers"]
     assert captured["headers"]["content-type"] == "application/json"
-    # Neither Bearer nor legacy Stripe-style signature are emitted. Standard
-    # Webhooks is the only signing scheme we ship.
-    assert "authorization" not in captured["headers"]
+    # Bearer header is required by primitive.dev's current mx_main receiver.
+    # Stays until that receiver migrates to SDK verification.
+    assert captured["headers"]["authorization"] == f"Bearer {VALID_SECRET}"
+    # Legacy primitive-signature is still NOT emitted; only used for the
+    # hosted primitive.dev -> customer webhook flow, not MX -> mx_main.
     assert "primitive-signature" not in captured["headers"]
     assert captured["headers"]["webhook-signature"].startswith("v1,")
 

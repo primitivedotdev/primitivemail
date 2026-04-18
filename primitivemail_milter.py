@@ -49,6 +49,7 @@ WEBHOOK_ID_NAMESPACE = uuid.UUID("6f79e4a8-a494-4f7e-9124-90d94cb26d5d")
 # Reserved webhook header names. WEBHOOK_EXTRA_HEADERS cannot override these;
 # the milter refuses to start if it tries. Comparison is ASCII case-folded.
 RESERVED_WEBHOOK_HEADER_NAMES = frozenset({
+    "authorization",
     "content-type",
     "webhook-id",
     "webhook-timestamp",
@@ -1335,6 +1336,11 @@ class PrimitiveMailMilter(Milter.Base):
                 STANDARD_WEBHOOK_ID_HEADER: sw['msg_id'],
                 STANDARD_WEBHOOK_TIMESTAMP_HEADER: str(sw['timestamp']),
                 STANDARD_WEBHOOK_SIGNATURE_HEADER: sw['signature'],
+                # Bearer is what primitive.dev's mx_main receiver currently
+                # checks (see primitive-mono-repo/web/app/api/internal_webhooks/
+                # mx_main/route.ts:87). Keep it until that receiver migrates to
+                # SDK-based verification. Drop only after that migration ships.
+                'Authorization': f'Bearer {WEBHOOK_SECRET}',
             }
             # Safe: startup validation rejected any collision with reserved names.
             webhook_headers.update(WEBHOOK_EXTRA_HEADERS)

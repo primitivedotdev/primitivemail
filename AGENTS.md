@@ -89,11 +89,12 @@ After editing `.env`, run `primitive restart` to apply changes.
 
 ## Webhooks
 
-When `WEBHOOK_URL` is set, the milter POSTs each accepted delivery to that URL and signs every request with Standard Webhooks. Headers:
+When `WEBHOOK_URL` is set, the milter POSTs each accepted delivery to that URL. Headers:
 
-- `webhook-id` — per-delivery idempotency key. Stable across Postfix retries of the same delivery. Distinct for different recipients of the same message.
-- `webhook-timestamp` — Unix seconds. The SDK verifier accepts a 5-minute window by default.
+- `webhook-id` — per-delivery idempotency key (Standard Webhooks). Stable across Postfix retries of the same delivery. Distinct for different recipients of the same message.
+- `webhook-timestamp` — Unix seconds (Standard Webhooks). The SDK verifier accepts a 5-minute window by default.
 - `webhook-signature` — Standard Webhooks HMAC: `v1,<base64>`.
+- `Authorization: Bearer <WEBHOOK_SECRET>` — transitional. Will be dropped once all known receivers have adopted SDK-based signature verification.
 
 Verify with `@primitivedotdev/sdk/webhook` (Node) or `from primitive import handle_webhook` (Python). Do not reimplement the verification; the signer is tested against shared cross-language fixtures.
 
