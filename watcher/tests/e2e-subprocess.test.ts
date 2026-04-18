@@ -195,6 +195,7 @@ describe("e2e subprocess watcher", () => {
 	let mailDir: string;
 	let watcher: SpawnedWatcher | null = null;
 	let receiver: Awaited<ReturnType<typeof startReceiver>> | null = null;
+	let hangingServer: Server | null = null;
 
 	beforeEach(async () => {
 		mailDir = await mkdtemp(join(tmpdir(), "watcher-subproc-"));
@@ -203,9 +204,17 @@ describe("e2e subprocess watcher", () => {
 	afterEach(async () => {
 		await watcher?.kill().catch(() => {});
 		await receiver?.close().catch(() => {});
+		if (hangingServer) {
+			await new Promise<void>((resolve) => {
+				hangingServer?.close(() => resolve());
+				// Some connections may still be open; force them shut.
+				hangingServer?.closeAllConnections?.();
+			});
+		}
 		await rm(mailDir, { recursive: true, force: true });
 		watcher = null;
 		receiver = null;
+		hangingServer = null;
 	});
 
 	it("processes a dropped email and delivers a signed webhook", async () => {
@@ -284,6 +293,82 @@ describe("e2e subprocess watcher", () => {
 		expect(downloadRes.status).toBe(200);
 		const downloadedBytes = Buffer.from(await downloadRes.arrayBuffer());
 		expect(downloadedBytes.equals(emlBytes)).toBe(true);
+	}, 30_000);
+
+	it("logs abandoned-at-shutdown when drain budget expires with in-flight deliveries", async () => {
+		// Receiver that accepts the connection but never responds — the fetch
+		// hangs until either the watcher's timeout fires or the process exits.
+		const hangingPort = await new Promise<number>((resolve, reject) => {
+			const s = createServer((req) => {
+				// Consume the body so the client finishes the request, then never reply.
+				req.on("data", () => {});
+				req.on("end", () => {});
+			});
+			s.listen(0, "127.0.0.1", () => {
+				const port = (s.address() as AddressInfo).port;
+				resolve(port);
+			});
+			s.once("error", reject);
+			// Stash for cleanup
+			hangingServer = s;
+		});
+
+		const workerId = Number(process.env.VITEST_WORKER_ID ?? 1);
+		const downloadPort = 50_000 + workerId * 1000 + (process.pid % 1000);
+
+		watcher = await startWatcher({
+			MAIL_DIR: mailDir,
+			POLL_INTERVAL_MS: "100",
+			EVENT_WEBHOOK_URL: `http://127.0.0.1:${hangingPort}/hook`,
+			EVENT_WEBHOOK_SECRET: SECRET,
+			EVENT_WEBHOOK_MAX_ATTEMPTS: "1",
+			// Timeout longer than drain budget so the delivery is still mid-flight
+			// when SIGTERM fires and the drain elapses.
+			EVENT_WEBHOOK_TIMEOUT_MS: "30000",
+			SIGTERM_DRAIN_MS: "500",
+			DOWNLOAD_SERVER_PORT: String(downloadPort),
+			DOWNLOAD_BASE_URL: `http://127.0.0.1:${downloadPort}`,
+		});
+
+		const domain = "example.com";
+		const id = "20260417T120000Z-abandon1";
+		const domainDir = join(mailDir, domain);
+		await mkdir(domainDir, { recursive: true });
+		const emlBytes = await readFile(join(FIXTURE_DIR, "sample.eml"));
+		await writeFile(join(domainDir, `${id}.eml`), emlBytes);
+		await writeFile(
+			join(domainDir, `${id}.meta.json`),
+			JSON.stringify({
+				smtp: {
+					helo: "mail.example.com",
+					mail_from: "alice@example.com",
+					rcpt_to: ["bob@example.com"],
+				},
+				auth: { spf: "pass" },
+			}),
+		);
+
+		// Give the poll loop enough time to pick up the file and fire a delivery.
+		await new Promise((r) => setTimeout(r, 800));
+
+		// SIGTERM and wait for the child to exit (kill resolves on 'exit').
+		await watcher.kill();
+		watcher = null;
+
+		// Deliveries log should now have exactly one abandoned-at-shutdown entry.
+		const deliveries = await waitForFile(
+			join(mailDir, "deliveries.jsonl"),
+			5_000,
+		);
+		const lines = deliveries
+			.trim()
+			.split("\n")
+			.map((l) => JSON.parse(l));
+		const abandoned = lines.find((l) => l.status === "abandoned-at-shutdown");
+		expect(abandoned).toBeDefined();
+		expect(abandoned.id).toBe(id);
+		expect(abandoned.domain).toBe(domain);
+		expect(abandoned.last_error).toMatch(/drain budget/i);
 	}, 30_000);
 
 	it("does not start a download server or deliver when webhook URL is unset", async () => {

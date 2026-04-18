@@ -17,7 +17,8 @@ import {
 } from "@primitivedotdev/sdk/parser";
 
 import { type LoadedDeliveryConfig, loadDeliveryConfig } from "./config.js";
-import { deliverEvent } from "./delivery.js";
+import { appendDeliveryLog } from "./delivery-log.js";
+import { deliverEvent, hashUrl } from "./delivery.js";
 import {
 	type StartedDownloadServer,
 	startDownloadServer,
@@ -29,13 +30,26 @@ const HEARTBEAT_PATH = "/tmp/watcher-heartbeat";
 const BATCH_LIMIT = Number(process.env.BATCH_LIMIT ?? "50");
 const JOURNAL_PATH = join(MAIL_DIR, "emails.jsonl");
 const DELIVERIES_PATH = join(MAIL_DIR, "deliveries.jsonl");
-const SIGTERM_DRAIN_MS = 15_000;
+// Drain budget for in-flight deliveries on SIGTERM. Env-overridable so tests
+// can trigger the abandoned-at-shutdown path without waiting 15 seconds.
+const SIGTERM_DRAIN_MS = Number(process.env.SIGTERM_DRAIN_MS ?? "15000");
 
 let shuttingDown = false;
 let processing = false;
 let nextSeq = 1;
 
-const inFlightDeliveries = new Set<Promise<void>>();
+/**
+ * One in-flight delivery. The promise resolves when deliverEvent completes
+ * (success or exhausted retries). The metadata is kept so the drain path on
+ * SIGTERM can log an "abandoned-at-shutdown" entry if the delivery is still
+ * running when the drain budget expires.
+ */
+interface InFlightDelivery {
+	promise: Promise<void>;
+	meta: { id: string; seq: number; domain: string; url_hash: string };
+}
+
+const inFlightDeliveries = new Set<InFlightDelivery>();
 let deliveryConfig: LoadedDeliveryConfig = { enabled: false };
 let downloadServer: StartedDownloadServer | null = null;
 
@@ -223,6 +237,12 @@ async function processEmail(metaPath: string): Promise<void> {
 	// `type` field) are skipped here preemptively; none exist yet.
 	if (deliveryConfig.enabled) {
 		const config = deliveryConfig;
+		const meta = {
+			id: canonical.id,
+			seq: journalEntry.seq,
+			domain: domainDir,
+			url_hash: hashUrl(config.webhookUrl),
+		};
 		const promise = deliverEvent({
 			config,
 			canonicalJsonPath: jsonPath,
@@ -236,9 +256,10 @@ async function processEmail(metaPath: string): Promise<void> {
 				console.error(`  delivery error for ${canonical.id}: ${err}`);
 			})
 			.then(() => undefined);
-		inFlightDeliveries.add(promise);
+		const entry: InFlightDelivery = { promise, meta };
+		inFlightDeliveries.add(entry);
 		promise.finally(() => {
-			inFlightDeliveries.delete(promise);
+			inFlightDeliveries.delete(entry);
 		});
 	}
 }
@@ -334,10 +355,37 @@ async function drainAndExit(code: number): Promise<never> {
 			`Draining ${inFlightDeliveries.size} in-flight deliveries (max ${SIGTERM_DRAIN_MS}ms)...`,
 		);
 		await Promise.race([
-			Promise.all(inFlightDeliveries),
+			Promise.all(Array.from(inFlightDeliveries).map((entry) => entry.promise)),
 			new Promise((resolve) => setTimeout(resolve, SIGTERM_DRAIN_MS)),
 		]);
 	}
+
+	// Anything still in-flight after the race exhausted the drain budget.
+	// Log an `abandoned-at-shutdown` entry for each so operators see the
+	// email's journal entry AND a corresponding delivery-log record, instead
+	// of a silent gap. After the log, the process exits — the deliverer's
+	// timer and fetch promise are torn down with it.
+	if (inFlightDeliveries.size > 0) {
+		console.warn(
+			`Drain budget exhausted with ${inFlightDeliveries.size} deliveries still in-flight; logging as abandoned-at-shutdown`,
+		);
+		const abandonedAt = new Date().toISOString();
+		for (const entry of inFlightDeliveries) {
+			await appendDeliveryLog(DELIVERIES_PATH, {
+				seq: entry.meta.seq,
+				id: entry.meta.id,
+				domain: entry.meta.domain,
+				url_hash: entry.meta.url_hash,
+				attempts: 0,
+				status: "abandoned-at-shutdown",
+				last_error: `drain budget ${SIGTERM_DRAIN_MS}ms exhausted`,
+				last_attempt_at: abandonedAt,
+			}).catch((err) => {
+				console.error(`  failed to log abandoned entry: ${err}`);
+			});
+		}
+	}
+
 	if (downloadServer) {
 		await downloadServer.close().catch(() => {});
 	}
