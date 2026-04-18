@@ -34,6 +34,31 @@ from Milter.utils import parse_addr
 
 from email_validator import EmailValidator
 
+from primitive import (
+    PRIMITIVE_SIGNATURE_HEADER,
+    STANDARD_WEBHOOK_ID_HEADER,
+    STANDARD_WEBHOOK_SIGNATURE_HEADER,
+    STANDARD_WEBHOOK_TIMESTAMP_HEADER,
+    sign_standard_webhooks_payload,
+    sign_webhook_payload,
+)
+
+# Fixed namespace UUID for webhook-id derivation. Stable across replicas and
+# restarts. Published in AGENTS.md so operators can reproduce webhook-id values
+# by hand: uuid.uuid5(WEBHOOK_ID_NAMESPACE, f"{message_id}:{recipient}:{queue_id}").
+WEBHOOK_ID_NAMESPACE = uuid.UUID("6f79e4a8-a494-4f7e-9124-90d94cb26d5d")
+
+# Reserved webhook header names. WEBHOOK_EXTRA_HEADERS cannot override these;
+# the milter refuses to start if it tries. Comparison is ASCII case-folded.
+RESERVED_WEBHOOK_HEADER_NAMES = frozenset({
+    "authorization",
+    "content-type",
+    "webhook-id",
+    "webhook-timestamp",
+    "webhook-signature",
+    "primitive-signature",
+})
+
 # SPF/DKIM/DMARC support (optional - only needed when SPOOF_PROTECTION != off)
 try:
     import spf as spfmod
@@ -228,6 +253,13 @@ try:
 except (json.JSONDecodeError, ValueError) as e:
     logger.error(f"Invalid WEBHOOK_EXTRA_HEADERS JSON: {e}")
 
+# Reject reserved-header collisions at startup. A misconfigured env var should
+# fail loud and fast, not produce tempfails on every delivery.
+for _extra_key in WEBHOOK_EXTRA_HEADERS:
+    if _extra_key.lower() in RESERVED_WEBHOOK_HEADER_NAMES:
+        logger.error(f"WEBHOOK_EXTRA_HEADERS reserved name: {_extra_key.lower()}")
+        sys.exit(2)
+
 # Storage configuration for large email uploads
 # Supports S3-compatible storage (AWS S3, R2, MinIO, Supabase Storage, etc.)
 STORAGE_URL = os.environ.get('STORAGE_URL')        # e.g. https://s3.amazonaws.com/my-bucket
@@ -248,6 +280,24 @@ if STANDALONE_MODE:
 else:
     if not WEBHOOK_SECRET:
         logger.error("WEBHOOK_SECRET must be set when WEBHOOK_URL is configured")
+        sys.exit(1)
+    # Fail-fast on invalid secret format. sign_standard_webhooks_payload raises
+    # WebhookVerificationError("MISSING_SECRET") if WEBHOOK_SECRET is not
+    # base64 (optionally prefixed with whsec_). Better to crash at startup
+    # than to tempfail every message.
+    try:
+        sign_standard_webhooks_payload(
+            raw_body=b'{}',
+            secret=WEBHOOK_SECRET,
+            msg_id='startup-check',
+            timestamp=int(time.time()),
+        )
+    except Exception as e:
+        logger.error(
+            "WEBHOOK_SECRET is not a Standard-Webhooks-compatible value. "
+            "Rotate to whsec_<base64> format. Error: %s",
+            e,
+        )
         sys.exit(1)
 
 # Storage upload (optional - only needed for large emails when webhook is configured)
@@ -1256,18 +1306,54 @@ class PrimitiveMailMilter(Milter.Base):
 
         start_time = time.time()
 
+        # Delivery-level id. Stable across Postfix retries of the same
+        # (message_id, recipient, queue_id). Distinct across recipients and
+        # across independently-resubmitted messages (new queue id).
+        queue_id = ''
+        try:
+            queue_id = self.getsymval("i") or ''
+        except Exception:
+            pass
+        delivery_id = str(uuid.uuid5(
+            WEBHOOK_ID_NAMESPACE,
+            f"{self.message_id}:{recipient}:{queue_id}",
+        ))
+
+        raw_body = json.dumps(payload).encode('utf-8')
+        timestamp = int(time.time())
+
+        sw = sign_standard_webhooks_payload(
+            raw_body=raw_body,
+            secret=WEBHOOK_SECRET,
+            msg_id=delivery_id,
+            timestamp=timestamp,
+        )
+        legacy = sign_webhook_payload(
+            raw_body=raw_body,
+            secret=WEBHOOK_SECRET,
+            timestamp=timestamp,
+        )
+
         try:
             webhook_headers = {
-                'Authorization': f'Bearer {WEBHOOK_SECRET}',
                 'Content-Type': 'application/json',
-                **WEBHOOK_EXTRA_HEADERS,
+                STANDARD_WEBHOOK_ID_HEADER: sw['msg_id'],
+                STANDARD_WEBHOOK_TIMESTAMP_HEADER: str(sw['timestamp']),
+                STANDARD_WEBHOOK_SIGNATURE_HEADER: sw['signature'],
+                PRIMITIVE_SIGNATURE_HEADER: legacy['header'],
+                # Bearer is deprecated in v0.4; scheduled for removal in v0.5.
+                'Authorization': f'Bearer {WEBHOOK_SECRET}',
             }
+            # Safe: startup validation rejected any collision with reserved names.
+            webhook_headers.update(WEBHOOK_EXTRA_HEADERS)
+
             if TRACING_ENABLED and webhook_span and HTTPPropagator:
+                # Writes x-datadog-* keys. Not reserved, no conflict.
                 HTTPPropagator.inject(webhook_span.context, webhook_headers)
 
             req = urllib.request.Request(
                 WEBHOOK_URL,
-                data=json.dumps(payload).encode('utf-8'),
+                data=raw_body,
                 headers=webhook_headers,
                 method='POST'
             )

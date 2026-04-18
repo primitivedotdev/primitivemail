@@ -81,7 +81,9 @@ def milter():
     original_dnsbl_domain = pm.SPAMHAUS_DNSBL_DOMAIN
     pm.STANDALONE_MODE = False
     pm.WEBHOOK_URL = 'https://test.example.com/webhook'
-    pm.WEBHOOK_SECRET = 'test-secret'
+    # Standard Webhooks requires base64-encoded bytes; the whsec_ prefix is optional.
+    # Hard-coded value is fine for tests because it is never valid off-host.
+    pm.WEBHOOK_SECRET = 'whsec_dGVzdHNlY3JldHNob3VsZGJlMzJieXRlc2xvbmcxMjM0NTY='
     pm.SPAMHAUS_DNSBL_DOMAIN = ''
 
     m = pm.PrimitiveMailMilter()

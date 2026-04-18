@@ -19,6 +19,11 @@ RUN apt-get update && \
     pip3 install --no-cache-dir python-logging-loki pymilter prometheus_client 'pyspf>=2.0,<3' 'dnspython>=2.7,<3' 'dkimpy>=1.1,<2' 'tldextract>=5.0,<6' && \
     rm -rf /var/lib/apt/lists/*
 
+# Production Python dependencies (Primitive SDK, etc.). Installed as a separate
+# layer so requirements.txt changes don't bust the cache above.
+COPY requirements.txt /opt/mx-box/requirements.txt
+RUN pip3 install --no-cache-dir -r /opt/mx-box/requirements.txt
+
 # Optional: Datadog APM tracing (enabled via DATADOG_TRACING_ENABLED=true at runtime)
 ARG INSTALL_DDTRACE=false
 RUN if [ "$INSTALL_DDTRACE" = "true" ]; then \
