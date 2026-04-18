@@ -37,6 +37,21 @@ services:
     container_name: primitivemail-watcher
     restart: unless-stopped
     # TODO: run as non-root once milter creates dirs with shared group
+    environment:
+      EVENT_WEBHOOK_URL: "${EVENT_WEBHOOK_URL:-}"              # Self-host webhook target. Unset = disabled.
+      EVENT_WEBHOOK_SECRET: "${EVENT_WEBHOOK_SECRET:-}"        # HMAC secret (required if URL is set)
+      EVENT_WEBHOOK_MAX_ATTEMPTS: "${EVENT_WEBHOOK_MAX_ATTEMPTS:-5}"
+      EVENT_WEBHOOK_TIMEOUT_MS: "${EVENT_WEBHOOK_TIMEOUT_MS:-10000}"
+      DOWNLOAD_SERVER_PORT: "${DOWNLOAD_SERVER_PORT:-4001}"    # Port the watcher's download server binds to
+      DOWNLOAD_BASE_URL: "${DOWNLOAD_BASE_URL:-http://localhost:4001}" # Base URL written into download.url
+    # Expose the download server so host-side receivers can fetch raw email / attachments.
+    # Only bound when EVENT_WEBHOOK_URL is set — watcher no-ops this block otherwise.
+    ports:
+      - "${DOWNLOAD_SERVER_PORT:-4001}:${DOWNLOAD_SERVER_PORT:-4001}"
+    # host.docker.internal lets the watcher POST to a receiver running on the host.
+    # Use EVENT_WEBHOOK_URL=http://host.docker.internal:3000/hook for local dev.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./maildata:/mail/incoming
     depends_on:

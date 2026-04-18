@@ -67,6 +67,63 @@ done
 cat ~/primitivemail/maildata/<path from journal line>
 ```
 
+## Receiving webhooks
+
+Two consumption models, pick one.
+
+**Pull** (`tail -f emails.jsonl`, above) is the default and works with zero config.
+
+**Push** — new email triggers a signed HTTP POST to a URL you control. Set two env vars in your `~/primitivemail/.env` and `primitive restart`:
+
+```
+EVENT_WEBHOOK_URL=http://host.docker.internal:3000/hook   # dev: receiver runs on host
+EVENT_WEBHOOK_SECRET=<random-64-hex>                       # HMAC signing key
+```
+
+The watcher signs each payload with HMAC-SHA256 and POSTs it to your URL. The payload is byte-identical to what managed Primitive produces — verify it with `@primitivedotdev/sdk`'s `handleWebhook`. The **raw request body** is what's signed; use `express.raw({ type: "application/json" })`, NOT `express.json()`, or the signature won't verify.
+
+Minimal Express receiver:
+
+```js
+const express = require("express");
+const { handleWebhook, PrimitiveWebhookError } = require("@primitivedotdev/sdk");
+
+const app = express();
+app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
+	try {
+		const event = handleWebhook({
+			body: req.body,
+			headers: req.headers,
+			secret: process.env.EVENT_WEBHOOK_SECRET,
+		});
+		console.log("received:", event.email.headers.from, event.email.headers.subject);
+		res.status(200).send();
+	} catch (err) {
+		if (err instanceof PrimitiveWebhookError) return res.status(400).send(err.code);
+		res.status(500).send();
+	}
+});
+
+app.listen(3000);
+```
+
+Response contract: plain 2xx on success. Any 5xx will be retried with exponential backoff up to `EVENT_WEBHOOK_MAX_ATTEMPTS` (default 5). 4xx (except 429) is considered a permanent failure — no retry. Redirects (3xx) are never followed; point `EVENT_WEBHOOK_URL` at the final destination.
+
+Large emails (>256 KB) are not embedded inline. The payload's `email.content.download.url` points at the watcher's local download server (exposed on `DOWNLOAD_SERVER_PORT`, default 4001) and carries a 15-minute signed token. Fetching the URL is just `await fetch(event.email.content.download.url)` — no extra auth plumbing needed.
+
+Backlog behavior: turning on `EVENT_WEBHOOK_URL` does NOT replay historical emails. Deliveries fire only for emails processed after the watcher restarts. To replay history, iterate `emails.jsonl` yourself.
+
+Every final delivery outcome is logged to `~/primitivemail/maildata/deliveries.jsonl` (rotates at 100 MB).
+
+### Optional env vars
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EVENT_WEBHOOK_MAX_ATTEMPTS` | `5` | Total attempts per delivery |
+| `EVENT_WEBHOOK_TIMEOUT_MS` | `10000` | Per-request timeout |
+| `DOWNLOAD_SERVER_PORT` | `4001` | Port the watcher binds its download server to |
+| `DOWNLOAD_BASE_URL` | `http://localhost:4001` | Base URL embedded in `download.url`. Override in sibling-container topologies to e.g. `http://watcher:4001` |
+
 ## CLI Commands
 
 ```bash
@@ -93,6 +150,7 @@ After editing `.env`, run `primitive restart` to apply changes.
 ~/primitivemail/
   maildata/
     emails.jsonl                          # journal (append-only)
+    deliveries.jsonl                      # webhook delivery outcomes (only when push is enabled)
     <domain>/
       <id>.eml                            # raw email
       <id>.meta.json                      # SMTP envelope + auth data

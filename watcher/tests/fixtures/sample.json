@@ -1,0 +1,47 @@
+{
+	"id": "20260417T120000Z-testtest",
+	"received_at": "2026-04-17T12:00:00Z",
+	"smtp": {
+		"helo": "mail.example.com",
+		"mail_from": "alice@example.com",
+		"rcpt_to": ["bob@example.com"]
+	},
+	"headers": {
+		"message_id": "<unit-test-1@example.com>",
+		"subject": "Unit test subject",
+		"from": "Alice <alice@example.com>",
+		"to": "Bob <bob@example.com>",
+		"date": "Fri, 17 Apr 2026 12:00:00 +0000"
+	},
+	"parsed": {
+		"status": "complete",
+		"error": null,
+		"body_text": "This is the body of a unit test email.\n",
+		"body_html": null,
+		"reply_to": null,
+		"cc": null,
+		"bcc": null,
+		"in_reply_to": null,
+		"references": null,
+		"attachments": [],
+		"attachments_download_url": null
+	},
+	"content": {
+		"raw_path": "example.com/20260417T120000Z-testtest.eml",
+		"size_bytes": 215,
+		"sha256": "placeholder"
+	},
+	"auth": {
+		"spf": "pass",
+		"dmarc": "pass",
+		"dmarc_policy": "reject",
+		"dmarc_from_domain": "example.com",
+		"dkim_signatures": [
+			{
+				"domain": "example.com",
+				"result": "pass",
+				"aligned": true
+			}
+		]
+	}
+}

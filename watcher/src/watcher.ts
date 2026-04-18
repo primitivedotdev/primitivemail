@@ -16,15 +16,28 @@ import {
 	toParsedDataComplete,
 } from "@primitivedotdev/sdk/parser";
 
+import { type LoadedDeliveryConfig, loadDeliveryConfig } from "./config.js";
+import { deliverEvent } from "./delivery.js";
+import {
+	type StartedDownloadServer,
+	startDownloadServer,
+} from "./download-server.js";
+
 const MAIL_DIR = process.env.MAIL_DIR ?? "/mail/incoming";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? "1000");
 const HEARTBEAT_PATH = "/tmp/watcher-heartbeat";
 const BATCH_LIMIT = Number(process.env.BATCH_LIMIT ?? "50");
 const JOURNAL_PATH = join(MAIL_DIR, "emails.jsonl");
+const DELIVERIES_PATH = join(MAIL_DIR, "deliveries.jsonl");
+const SIGTERM_DRAIN_MS = 15_000;
 
 let shuttingDown = false;
 let processing = false;
 let nextSeq = 1;
+
+const inFlightDeliveries = new Set<Promise<void>>();
+let deliveryConfig: LoadedDeliveryConfig = { enabled: false };
+let downloadServer: StartedDownloadServer | null = null;
 
 /**
  * Extract bare email address from RFC 5322 format.
@@ -204,6 +217,30 @@ async function processEmail(metaPath: string): Promise<void> {
 	await appendFile(JOURNAL_PATH, `${JSON.stringify(journalEntry)}\n`);
 
 	console.log(`  Wrote ${jsonPath}`);
+
+	// Fire and forget — delivery runs outside the scan loop and tracks itself
+	// via inFlightDeliveries so SIGTERM can drain. Tombstone entries (future
+	// `type` field) are skipped here preemptively; none exist yet.
+	if (deliveryConfig.enabled) {
+		const config = deliveryConfig;
+		const promise = deliverEvent({
+			config,
+			canonicalJsonPath: jsonPath,
+			emlPath,
+			id: canonical.id,
+			seq: journalEntry.seq,
+			domain: domainDir,
+			deliveriesJsonlPath: DELIVERIES_PATH,
+		})
+			.catch((err) => {
+				console.error(`  delivery error for ${canonical.id}: ${err}`);
+			})
+			.then(() => undefined);
+		inFlightDeliveries.add(promise);
+		promise.finally(() => {
+			inFlightDeliveries.delete(promise);
+		});
+	}
 }
 
 /**
@@ -266,19 +303,62 @@ console.log(`  Mail dir: ${MAIL_DIR}`);
 console.log(`  Poll interval: ${POLL_INTERVAL_MS}ms`);
 console.log(`  Journal seq: ${nextSeq}`);
 
-// Graceful shutdown: let current processing finish, then exit
+try {
+	deliveryConfig = loadDeliveryConfig(process.env);
+} catch (err) {
+	console.error(
+		`Invalid delivery configuration: ${err instanceof Error ? err.message : String(err)}`,
+	);
+	process.exit(1);
+}
+
+if (deliveryConfig.enabled) {
+	console.log(
+		`  Delivery enabled: endpointId=${deliveryConfig.endpointId} maxAttempts=${deliveryConfig.maxAttempts} timeoutMs=${deliveryConfig.timeoutMs}`,
+	);
+	console.log(
+		`  Download server: port=${deliveryConfig.downloadServerPort} baseUrl=${deliveryConfig.downloadBaseUrl}`,
+	);
+	downloadServer = await startDownloadServer({
+		port: deliveryConfig.downloadServerPort,
+		secret: deliveryConfig.webhookSecret,
+		mailDir: MAIL_DIR,
+	});
+} else {
+	console.log("  Delivery disabled (EVENT_WEBHOOK_URL not set)");
+}
+
+async function drainAndExit(code: number): Promise<never> {
+	if (inFlightDeliveries.size > 0) {
+		console.log(
+			`Draining ${inFlightDeliveries.size} in-flight deliveries (max ${SIGTERM_DRAIN_MS}ms)...`,
+		);
+		await Promise.race([
+			Promise.all(inFlightDeliveries),
+			new Promise((resolve) => setTimeout(resolve, SIGTERM_DRAIN_MS)),
+		]);
+	}
+	if (downloadServer) {
+		await downloadServer.close().catch(() => {});
+	}
+	process.exit(code);
+}
+
+// Graceful shutdown: let current processing finish, drain deliveries, then exit.
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
 	process.on(signal, () => {
 		console.log(`Received ${signal}, shutting down gracefully...`);
 		shuttingDown = true;
-		if (!processing) process.exit(0);
+		if (!processing) {
+			void drainAndExit(0);
+		}
 	});
 }
 
 // Poll loop using setTimeout to prevent overlapping cycles
 async function loop() {
 	if (shuttingDown) {
-		process.exit(0);
+		await drainAndExit(0);
 		return;
 	}
 	processing = true;
@@ -290,7 +370,7 @@ async function loop() {
 	await writeFile(HEARTBEAT_PATH, Date.now().toString()).catch(() => {});
 	processing = false;
 	if (shuttingDown) {
-		process.exit(0);
+		await drainAndExit(0);
 		return;
 	}
 	setTimeout(loop, POLL_INTERVAL_MS);
