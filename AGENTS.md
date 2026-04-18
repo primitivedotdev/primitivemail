@@ -107,19 +107,18 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 app.listen(3000);
 ```
 
-Response contract: plain 2xx on success. Any 5xx will be retried with exponential backoff up to `EVENT_WEBHOOK_MAX_ATTEMPTS` (default 5). 4xx (except 429) is considered a permanent failure — no retry. Redirects (3xx) are never followed; point `EVENT_WEBHOOK_URL` at the final destination.
+Response contract: plain 2xx on success. Any non-2xx (or network failure) is logged as a failed delivery in `deliveries.jsonl` — **no retries**. The journal (`emails.jsonl`) is the source of truth; if you need retry semantics, tail the journal and re-POST manually or write your own daemon. Redirects (3xx) are never followed; point `EVENT_WEBHOOK_URL` at the final destination.
 
 Large emails (>256 KB) are not embedded inline. The payload's `email.content.download.url` points at the watcher's local download server (exposed on `DOWNLOAD_SERVER_PORT`, default 4001) and carries a 15-minute signed token. Fetching the URL is just `await fetch(event.email.content.download.url)` — no extra auth plumbing needed.
 
 Backlog behavior: turning on `EVENT_WEBHOOK_URL` does NOT replay historical emails. Deliveries fire only for emails processed after the watcher restarts. To replay history, iterate `emails.jsonl` yourself.
 
-Every final delivery outcome is logged to `~/primitivemail/maildata/deliveries.jsonl` (rotates at 100 MB).
+Every delivery outcome is logged to `~/primitivemail/maildata/deliveries.jsonl`. Rotate it yourself (logrotate / scripts) if your volume warrants it.
 
 ### Optional env vars
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EVENT_WEBHOOK_MAX_ATTEMPTS` | `5` | Total attempts per delivery |
 | `EVENT_WEBHOOK_TIMEOUT_MS` | `10000` | Per-request timeout |
 | `DOWNLOAD_SERVER_PORT` | `4001` | Port the watcher binds its download server to |
 | `DOWNLOAD_BASE_URL` | `http://localhost:4001` | Base URL embedded in `download.url`. Override in sibling-container topologies to e.g. `http://watcher:4001` |

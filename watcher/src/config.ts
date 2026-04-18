@@ -15,7 +15,6 @@ export interface DeliveryConfig {
 	enabled: true;
 	webhookUrl: string;
 	webhookSecret: string;
-	maxAttempts: number;
 	timeoutMs: number;
 	downloadServerPort: number;
 	downloadBaseUrl: string;
@@ -25,14 +24,12 @@ export interface DeliveryConfig {
 
 export type LoadedDeliveryConfig = DeliveryConfig | { enabled: false };
 
-const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_PORT = 4001;
 
 export interface EnvLike {
 	EVENT_WEBHOOK_URL?: string;
 	EVENT_WEBHOOK_SECRET?: string;
-	EVENT_WEBHOOK_MAX_ATTEMPTS?: string;
 	EVENT_WEBHOOK_TIMEOUT_MS?: string;
 	DOWNLOAD_SERVER_PORT?: string;
 	DOWNLOAD_BASE_URL?: string;
@@ -108,13 +105,6 @@ export function loadDeliveryConfig(
 		);
 	}
 
-	const maxAttempts = parseIntWithBounds(
-		env.EVENT_WEBHOOK_MAX_ATTEMPTS,
-		"EVENT_WEBHOOK_MAX_ATTEMPTS",
-		DEFAULT_MAX_ATTEMPTS,
-		1,
-		20,
-	);
 	const timeoutMs = parseIntWithBounds(
 		env.EVENT_WEBHOOK_TIMEOUT_MS,
 		"EVENT_WEBHOOK_TIMEOUT_MS",
@@ -151,7 +141,6 @@ export function loadDeliveryConfig(
 		enabled: true,
 		webhookUrl: url,
 		webhookSecret: secret,
-		maxAttempts,
 		timeoutMs,
 		downloadServerPort,
 		downloadBaseUrl: downloadBaseUrl.replace(/\/$/, ""),

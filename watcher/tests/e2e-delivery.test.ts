@@ -166,7 +166,6 @@ async function setupE2E(
 		enabled: true,
 		webhookUrl: receiver.url,
 		webhookSecret: SECRET,
-		maxAttempts: 3,
 		timeoutMs: 5_000,
 		downloadServerPort: downloadServer.port,
 		downloadBaseUrl: `http://127.0.0.1:${downloadServer.port}`,
@@ -210,11 +209,9 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
-			sleep: async () => {},
 		});
 
 		expect(outcome.status).toBe("delivered");
-		expect(outcome.attempts).toBe(1);
 
 		// Receiver got the POST and handleWebhook verifies the signature end-to-end.
 		const captured = fx.receiver.lastPost();
@@ -262,19 +259,14 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
-			sleep: async () => {},
 		});
 		expect(outcome.status).toBe("delivered");
 		expect(outcome.confirmed).toBe(true);
 	});
 
-	it("retries when the receiver returns 500 then succeeds", async () => {
-		let attempt = 0;
+	it("logs failed status when receiver returns 500 — no retry", async () => {
 		fx = await setupE2E({
-			onPost: () => {
-				attempt += 1;
-				return attempt < 3 ? { status: 500 } : { status: 200 };
-			},
+			onPost: () => ({ status: 500 }),
 		});
 
 		const outcome = await deliverEvent({
@@ -285,36 +277,15 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
-			sleep: async () => {},
-		});
-
-		expect(outcome.status).toBe("delivered");
-		expect(outcome.attempts).toBe(3);
-	});
-
-	it("stops and logs failed status when receiver returns 400", async () => {
-		fx = await setupE2E({
-			onPost: () => ({ status: 400 }),
-		});
-
-		const outcome = await deliverEvent({
-			config: fx.config,
-			canonicalJsonPath: fx.canonicalJsonPath,
-			emlPath: fx.emlPath,
-			id: fx.id,
-			seq: 1,
-			domain: fx.domain,
-			deliveriesJsonlPath: fx.deliveriesJsonlPath,
-			sleep: async () => {},
 		});
 
 		expect(outcome.status).toBe("failed");
-		expect(outcome.attempts).toBe(1);
+		expect(outcome.statusCode).toBe(500);
 
 		const log = await readFile(fx.deliveriesJsonlPath, "utf-8");
 		const line = JSON.parse(log.trim());
 		expect(line.status).toBe("failed");
-		expect(line.status_code).toBe(400);
+		expect(line.status_code).toBe(500);
 	});
 
 	it("the download URL in the payload fails with 401 if secret is rotated", async () => {
@@ -327,7 +298,6 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
-			sleep: async () => {},
 		});
 		expect(outcome.status).toBe("delivered");
 

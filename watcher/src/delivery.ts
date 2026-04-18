@@ -1,19 +1,24 @@
 /**
- * Outbound webhook delivery for self-host.
+ * Outbound webhook delivery for self-host — one-shot.
  *
- * After the watcher durably appends a journal entry for a new email, the
- * deliverer constructs an `EmailReceivedEvent` (via the SDK, byte-identical
- * to the managed path), signs it with HMAC, and POSTs to the operator's
- * configured URL. On retryable failure it backs off exponentially up to
- * `maxAttempts`. On final outcome (success or exhaustion) it appends one
- * line to `deliveries.jsonl`, which rotates at 100 MB.
+ * After the watcher appends a journal entry for a new email, the deliverer
+ * builds an `EmailReceivedEvent` via the SDK, signs it, and POSTs it once
+ * to the operator's configured URL. The outcome (success or failure) is
+ * appended to `deliveries.jsonl`.
  *
- * Never follows redirects. User-controlled URLs should point at the final
- * destination; 3xx is treated as terminal (except 307, which we retry).
+ * Why no retries? The journal is the source of truth. If a delivery fails
+ * (receiver unreachable, 5xx, 4xx), the operator sees both the email in
+ * `emails.jsonl` and the failure in `deliveries.jsonl` and can re-post
+ * manually or tail the journal to recover. Self-host's ethos is "hand
+ * the operator the primitives; trust them with the policy."
+ *
+ * Redirects are never followed (`redirect: "manual"`). Any 3xx is logged
+ * as a failure — the operator should point `EVENT_WEBHOOK_URL` at the
+ * final destination.
  */
 
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import {
 	type EmailReceivedEvent,
 	buildEventFromParsedData,
@@ -25,7 +30,6 @@ import {
 	signWebhookPayload,
 } from "@primitivedotdev/sdk/webhook";
 import type { DeliveryConfig } from "./config.js";
-import { appendDeliveryLog } from "./delivery-log.js";
 
 /** Token audience strings — these MUST match what the download server verifies. */
 export const AUDIENCE_RAW = "primitive:raw-download";
@@ -33,14 +37,6 @@ export const AUDIENCE_ATTACHMENTS = "primitive:attachments-download";
 
 /** How long a download token is valid for. */
 const DOWNLOAD_TOKEN_TTL_SECONDS = 15 * 60;
-
-/** Backoff delays between attempts, in ms. Indexed by attempt number minus 1. */
-const BACKOFF_SCHEDULE_MS = [
-	1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000,
-];
-
-/** Cap honored on 429 Retry-After. */
-const MAX_RETRY_AFTER_SECONDS = 5 * 60;
 
 /**
  * Canonical JSON file shape as written by the watcher's email processor.
@@ -95,122 +91,30 @@ export interface DeliverEventInput {
 	fetchImpl?: typeof fetch;
 	/** Optional for tests: override current time (ms since epoch). */
 	now?: () => number;
-	/** Optional for tests: override sleep between retries. */
-	sleep?: (ms: number) => Promise<void>;
 }
 
 export interface DeliveryOutcome {
-	status:
-		| "delivered"
-		| "failed"
-		| "abandoned-at-shutdown"
-		| "skipped"
-		| "redirect-endpoint-moved";
+	status: "delivered" | "failed" | "skipped";
 	confirmed: boolean;
-	attempts: number;
 	lastError: string | null;
 	statusCode: number | null;
 }
 
-type AttemptResult =
-	| { kind: "success"; statusCode: number; confirmed: boolean }
-	| { kind: "permanent"; statusCode: number | null; error: string }
-	| {
-			kind: "retryable";
-			statusCode: number | null;
-			error: string;
-			retryAfterMs?: number;
-	  };
-
-function defaultSleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function backoffFor(attempt: number): number {
-	const idx = Math.max(
-		0,
-		Math.min(attempt - 1, BACKOFF_SCHEDULE_MS.length - 1),
-	);
-	return BACKOFF_SCHEDULE_MS[idx];
+/** One line appended to `deliveries.jsonl` per delivery attempt. */
+interface DeliveryLogEntry {
+	seq: number;
+	id: string;
+	domain: string;
+	url_hash: string;
+	status: DeliveryOutcome["status"];
+	confirmed?: boolean;
+	status_code: number | null;
+	last_error: string | null;
+	at: string;
 }
 
 /**
- * Parse Retry-After header (either seconds or HTTP date) into a delay in ms.
- * Returns null if absent or unparseable.
- */
-export function parseRetryAfterMs(
-	header: string | null,
-	now: number,
-): number | null {
-	if (!header) return null;
-	const seconds = Number.parseInt(header, 10);
-	if (Number.isFinite(seconds) && String(seconds) === header.trim()) {
-		const bounded = Math.max(0, Math.min(seconds, MAX_RETRY_AFTER_SECONDS));
-		return bounded * 1000;
-	}
-	const date = Date.parse(header);
-	if (!Number.isNaN(date)) {
-		const delta = Math.max(0, date - now);
-		return Math.min(delta, MAX_RETRY_AFTER_SECONDS * 1000);
-	}
-	return null;
-}
-
-/**
- * Classify an HTTP response into success/retryable/permanent.
- * Pure function — doesn't touch the body.
- */
-export function classifyResponse(
-	response: { status: number; headers: { get(name: string): string | null } },
-	now: number,
-): AttemptResult {
-	const { status } = response;
-
-	if (status >= 200 && status < 300) {
-		const confirmed =
-			response.headers.get("primitive-confirmed") === "true" ||
-			response.headers.get("mymx-confirmed") === "true";
-		return { kind: "success", statusCode: status, confirmed };
-	}
-
-	// 3xx — treat redirect responses as terminal. 307 (Temporary Redirect)
-	// retries against the same URL; everything else is permanent because we
-	// refuse to chase user-controlled destinations.
-	if (status >= 300 && status < 400) {
-		if (status === 307) {
-			return { kind: "retryable", statusCode: status, error: `HTTP ${status}` };
-		}
-		return {
-			kind: "permanent",
-			statusCode: status,
-			error: `HTTP ${status} — endpoint moved; reconfigure URL`,
-		};
-	}
-
-	if (status === 429) {
-		const retryAfterMs = parseRetryAfterMs(
-			response.headers.get("retry-after"),
-			now,
-		);
-		return {
-			kind: "retryable",
-			statusCode: status,
-			error: `HTTP ${status}`,
-			retryAfterMs: retryAfterMs ?? undefined,
-		};
-	}
-
-	if (status >= 400 && status < 500) {
-		return { kind: "permanent", statusCode: status, error: `HTTP ${status}` };
-	}
-
-	return { kind: "retryable", statusCode: status, error: `HTTP ${status}` };
-}
-
-/**
- * Build the signed, retryable event payload for a specific attempt.
- * Timestamp is fresh per-attempt so the receiver's tolerance window always
- * sees a recent signature even after backoff delays.
+ * Build the signed payload for the POST.
  */
 export function buildSignedPayload(params: {
 	event: EmailReceivedEvent;
@@ -232,9 +136,10 @@ export function buildSignedPayload(params: {
 }
 
 /**
- * Hash the (configured URL) down to a short fingerprint suitable for delivery
- * logs. We log the hash, not the URL, so operators can grep logs without
- * re-emitting the URL everywhere.
+ * Hash the (configured URL) down to a short fingerprint suitable for
+ * delivery logs. We log the hash, not the URL, so operators can grep logs
+ * without re-emitting the full URL (which carries the signed token in the
+ * download-URL case, and is redundant in the webhook-URL case).
  */
 export function hashUrl(url: string): string {
 	return createHash("sha256").update(url).digest("hex").slice(0, 16);
@@ -248,9 +153,8 @@ export async function buildEventFromFiles(params: {
 	canonicalJsonPath: string;
 	emlPath: string;
 	config: DeliveryConfig;
-	attemptCount: number;
 }): Promise<EmailReceivedEvent> {
-	const { canonicalJsonPath, emlPath, config, attemptCount } = params;
+	const { canonicalJsonPath, emlPath, config } = params;
 
 	const [canonicalText, rawBytes] = await Promise.all([
 		readFile(canonicalJsonPath, "utf-8"),
@@ -319,17 +223,18 @@ export async function buildEventFromFiles(params: {
 		downloadUrl,
 		downloadExpiresAt,
 		attachmentsDownloadUrl,
-		attemptCount,
+		attemptCount: 1,
 	});
 }
 
 /**
- * Map the canonical JSON's snake_case auth block (as written by the watcher)
- * into the SDK schema's camelCase `EmailAuth` shape.
+ * Map the canonical JSON's snake_case auth block (as written by the
+ * watcher) into the SDK schema's camelCase `EmailAuth` shape.
  *
- * We accept what we have and fill defaults for anything the watcher didn't
- * supply, rather than failing — self-host auth populated by the milter is
- * best-effort today.
+ * Fill defaults when the watcher didn't supply a field — self-host auth
+ * from the milter is best-effort today. `dmarcDkimAligned` is derived
+ * from the per-signature `aligned` flags; `dmarcSpfAligned` and the
+ * Strict flags need data the milter doesn't expose yet.
  */
 function authFromCanonical(auth: Record<string, unknown>): {
 	spf:
@@ -440,19 +345,13 @@ function authFromCanonical(auth: Record<string, unknown>): {
 		)
 		.filter((s): s is NonNullable<typeof s> => s !== null);
 
-	// `dmarcDkimAligned` is derivable: any DKIM signature flagged as aligned
-	// in the canonical JSON implies DMARC-DKIM alignment. `dmarcSpfAligned`
-	// and the Strict flags need milter-side data the watcher doesn't have
-	// today, so they default to false — document that gap for receivers.
-	const dmarcDkimAligned = dkimSignatures.some((s) => s.aligned);
-
 	return {
 		spf,
 		dmarc,
 		dmarcPolicy,
 		dmarcFromDomain,
 		dmarcSpfAligned: false,
-		dmarcDkimAligned,
+		dmarcDkimAligned: dkimSignatures.some((s) => s.aligned),
 		dmarcSpfStrict: false,
 		dmarcDkimStrict: false,
 		dkimSignatures,
@@ -460,30 +359,90 @@ function authFromCanonical(auth: Record<string, unknown>): {
 }
 
 /**
- * Perform one signed POST attempt. Returns a classified result.
- * Wraps fetch in try/catch to convert network errors into `retryable`.
+ * Append one line to `deliveries.jsonl`. No rotation — operators rotate
+ * their own logs. Errors are logged and swallowed; a log-write failure
+ * shouldn't itself crash the deliverer.
  */
-export async function attemptOnce(params: {
-	event: EmailReceivedEvent;
-	config: DeliveryConfig;
-	timestampSeconds: number;
-	fetchImpl: typeof fetch;
-	now: number;
-}): Promise<AttemptResult> {
-	const { event, config, timestampSeconds, fetchImpl, now } = params;
+async function appendDeliveryLog(
+	path: string,
+	entry: DeliveryLogEntry,
+): Promise<void> {
+	try {
+		await appendFile(path, `${JSON.stringify(entry)}\n`);
+	} catch (err) {
+		console.error(`[delivery-log] failed to append: ${err}`);
+	}
+}
+
+/**
+ * One-shot delivery: build, sign, POST, log. Never throws — the caller
+ * doesn't care which way it went.
+ */
+export async function deliverEvent(
+	input: DeliverEventInput,
+): Promise<DeliveryOutcome> {
+	const fetchImpl = input.fetchImpl ?? fetch;
+	const now = input.now ?? (() => Date.now());
+	const urlHash = hashUrl(input.config.webhookUrl);
+
+	const logAndReturn = async (
+		outcome: DeliveryOutcome,
+	): Promise<DeliveryOutcome> => {
+		await appendDeliveryLog(input.deliveriesJsonlPath, {
+			seq: input.seq,
+			id: input.id,
+			domain: input.domain,
+			url_hash: urlHash,
+			status: outcome.status,
+			confirmed: outcome.confirmed,
+			status_code: outcome.statusCode,
+			last_error: outcome.lastError,
+			at: new Date(now()).toISOString(),
+		});
+		return outcome;
+	};
+
+	// Pre-flight: the download server can only serve what's on disk. If the
+	// .eml is missing we skip the POST entirely — the receiver's download.url
+	// would 404 anyway.
+	const emlStat = await stat(input.emlPath).catch(() => null);
+	if (!emlStat) {
+		return logAndReturn({
+			status: "skipped",
+			confirmed: false,
+			statusCode: null,
+			lastError: `raw .eml missing: ${input.emlPath}`,
+		});
+	}
+
+	let event: EmailReceivedEvent;
+	try {
+		event = await buildEventFromFiles({
+			canonicalJsonPath: input.canonicalJsonPath,
+			emlPath: input.emlPath,
+			config: input.config,
+		});
+	} catch (err) {
+		return logAndReturn({
+			status: "failed",
+			confirmed: false,
+			statusCode: null,
+			lastError: `build event failed: ${err instanceof Error ? err.message : String(err)}`,
+		});
+	}
+
+	const timestampSeconds = Math.floor(now() / 1000);
 	const { rawBody, signatureHeader } = buildSignedPayload({
 		event,
-		secret: config.webhookSecret,
+		secret: input.config.webhookSecret,
 		timestampSeconds,
 	});
 
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 	try {
-		const response = await fetchImpl(config.webhookUrl, {
+		const response = await fetchImpl(input.config.webhookUrl, {
 			method: "POST",
 			redirect: "manual",
-			signal: controller.signal,
+			signal: AbortSignal.timeout(input.config.timeoutMs),
 			headers: {
 				"Content-Type": "application/json",
 				"User-Agent": "primitive-webhooks/1",
@@ -494,153 +453,24 @@ export async function attemptOnce(params: {
 			},
 			body: rawBody,
 		});
-		return classifyResponse(response, now);
+
+		const delivered = response.status >= 200 && response.status < 300;
+		const confirmed =
+			response.headers.get("primitive-confirmed") === "true" ||
+			response.headers.get("mymx-confirmed") === "true";
+
+		return logAndReturn({
+			status: delivered ? "delivered" : "failed",
+			confirmed,
+			statusCode: response.status,
+			lastError: delivered ? null : `HTTP ${response.status}`,
+		});
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		return {
-			kind: "retryable",
-			statusCode: null,
-			error: `fetch failed: ${msg}`,
-		};
-	} finally {
-		clearTimeout(timer);
-	}
-}
-
-/**
- * Run the full delivery loop for one email: build event, attempt, backoff,
- * log outcome. Never throws — the caller doesn't care which way it went.
- */
-export async function deliverEvent(
-	input: DeliverEventInput,
-): Promise<DeliveryOutcome> {
-	const fetchImpl = input.fetchImpl ?? fetch;
-	const now = input.now ?? (() => Date.now());
-	const sleep = input.sleep ?? defaultSleep;
-
-	// Pre-flight: ensure the files the download server will serve exist.
-	// If the raw .eml is missing we can't build a valid event anyway.
-	const emlStat = await stat(input.emlPath).catch(() => null);
-	if (!emlStat) {
-		const outcome: DeliveryOutcome = {
-			status: "skipped",
+		return logAndReturn({
+			status: "failed",
 			confirmed: false,
-			attempts: 0,
-			lastError: `raw .eml missing: ${input.emlPath}`,
 			statusCode: null,
-		};
-		await appendDeliveryLog(input.deliveriesJsonlPath, {
-			seq: input.seq,
-			id: input.id,
-			domain: input.domain,
-			url_hash: hashUrl(input.config.webhookUrl),
-			attempts: 0,
-			status: outcome.status,
-			last_error: outcome.lastError,
-			last_attempt_at: new Date(now()).toISOString(),
+			lastError: `fetch failed: ${err instanceof Error ? err.message : String(err)}`,
 		});
-		return outcome;
 	}
-
-	let lastError: string | null = null;
-	let lastStatusCode: number | null = null;
-	let attempt = 0;
-	const startedAt = now();
-
-	while (attempt < input.config.maxAttempts) {
-		attempt += 1;
-		const event = await buildEventFromFiles({
-			canonicalJsonPath: input.canonicalJsonPath,
-			emlPath: input.emlPath,
-			config: input.config,
-			attemptCount: attempt,
-		});
-
-		const timestampSeconds = Math.floor(now() / 1000);
-		const result = await attemptOnce({
-			event,
-			config: input.config,
-			timestampSeconds,
-			fetchImpl,
-			now: now(),
-		});
-
-		if (result.kind === "success") {
-			const outcome: DeliveryOutcome = {
-				status: "delivered",
-				confirmed: result.confirmed,
-				attempts: attempt,
-				lastError: null,
-				statusCode: result.statusCode,
-			};
-			await appendDeliveryLog(input.deliveriesJsonlPath, {
-				seq: input.seq,
-				id: input.id,
-				domain: input.domain,
-				url_hash: hashUrl(input.config.webhookUrl),
-				attempts: attempt,
-				status: outcome.status,
-				confirmed: outcome.confirmed,
-				status_code: result.statusCode,
-				last_attempt_at: new Date(now()).toISOString(),
-				duration_ms: now() - startedAt,
-			});
-			return outcome;
-		}
-
-		lastError = result.error;
-		lastStatusCode = result.statusCode;
-
-		if (result.kind === "permanent") {
-			const status =
-				result.statusCode && result.statusCode >= 300 && result.statusCode < 400
-					? "redirect-endpoint-moved"
-					: "failed";
-			const outcome: DeliveryOutcome = {
-				status,
-				confirmed: false,
-				attempts: attempt,
-				lastError: result.error,
-				statusCode: result.statusCode,
-			};
-			await appendDeliveryLog(input.deliveriesJsonlPath, {
-				seq: input.seq,
-				id: input.id,
-				domain: input.domain,
-				url_hash: hashUrl(input.config.webhookUrl),
-				attempts: attempt,
-				status: outcome.status,
-				last_error: outcome.lastError,
-				status_code: result.statusCode,
-				last_attempt_at: new Date(now()).toISOString(),
-			});
-			return outcome;
-		}
-
-		// retryable — sleep before next attempt unless we're out of budget
-		if (attempt < input.config.maxAttempts) {
-			const delay = result.retryAfterMs ?? backoffFor(attempt);
-			await sleep(delay);
-		}
-	}
-
-	const outcome: DeliveryOutcome = {
-		status: "failed",
-		confirmed: false,
-		attempts: attempt,
-		lastError,
-		statusCode: lastStatusCode,
-	};
-	await appendDeliveryLog(input.deliveriesJsonlPath, {
-		seq: input.seq,
-		id: input.id,
-		domain: input.domain,
-		url_hash: hashUrl(input.config.webhookUrl),
-		attempts: attempt,
-		status: outcome.status,
-		last_error: outcome.lastError,
-		status_code: lastStatusCode,
-		last_attempt_at: new Date(now()).toISOString(),
-	});
-	return outcome;
 }

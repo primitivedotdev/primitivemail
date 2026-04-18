@@ -40,7 +40,6 @@ services:
     environment:
       EVENT_WEBHOOK_URL: "${EVENT_WEBHOOK_URL:-}"              # Self-host webhook target. Unset = disabled.
       EVENT_WEBHOOK_SECRET: "${EVENT_WEBHOOK_SECRET:-}"        # HMAC secret (required if URL is set)
-      EVENT_WEBHOOK_MAX_ATTEMPTS: "${EVENT_WEBHOOK_MAX_ATTEMPTS:-5}"
       EVENT_WEBHOOK_TIMEOUT_MS: "${EVENT_WEBHOOK_TIMEOUT_MS:-10000}"
       DOWNLOAD_SERVER_PORT: "${DOWNLOAD_SERVER_PORT:-4001}"    # Port the watcher's download server binds to
       DOWNLOAD_BASE_URL: "${DOWNLOAD_BASE_URL:-http://localhost:4001}" # Base URL written into download.url

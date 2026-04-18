@@ -16,7 +16,6 @@ describe("loadDeliveryConfig", () => {
 		if (cfg.enabled) {
 			expect(cfg.webhookUrl).toBe("https://example.com/hook");
 			expect(cfg.webhookSecret).toBe("s3cret");
-			expect(cfg.maxAttempts).toBe(5);
 			expect(cfg.timeoutMs).toBe(10_000);
 			expect(cfg.downloadServerPort).toBe(4001);
 			expect(cfg.downloadBaseUrl).toBe("http://localhost:4001");
@@ -74,35 +73,33 @@ describe("loadDeliveryConfig", () => {
 		).toThrow(/not a valid URL/);
 	});
 
-	it("throws on non-integer MAX_ATTEMPTS", () => {
+	it("throws on non-integer TIMEOUT_MS", () => {
 		expect(() =>
 			loadDeliveryConfig({
 				EVENT_WEBHOOK_URL: "https://example.com/hook",
 				EVENT_WEBHOOK_SECRET: "s3cret",
-				EVENT_WEBHOOK_MAX_ATTEMPTS: "abc",
+				EVENT_WEBHOOK_TIMEOUT_MS: "abc",
 			}),
-		).toThrow(/EVENT_WEBHOOK_MAX_ATTEMPTS/);
+		).toThrow(/EVENT_WEBHOOK_TIMEOUT_MS/);
 	});
 
-	it("throws when MAX_ATTEMPTS is out of range", () => {
+	it("throws when TIMEOUT_MS is out of range", () => {
 		expect(() =>
 			loadDeliveryConfig({
 				EVENT_WEBHOOK_URL: "https://example.com/hook",
 				EVENT_WEBHOOK_SECRET: "s3cret",
-				EVENT_WEBHOOK_MAX_ATTEMPTS: "0",
+				EVENT_WEBHOOK_TIMEOUT_MS: "100",
 			}),
-		).toThrow(/between 1 and 20/);
+		).toThrow(/between/);
 	});
 
-	it("accepts custom MAX_ATTEMPTS, TIMEOUT_MS, and PORT within bounds", () => {
+	it("accepts custom TIMEOUT_MS and PORT within bounds", () => {
 		const cfg = loadDeliveryConfig({
 			EVENT_WEBHOOK_URL: "https://example.com/hook",
 			EVENT_WEBHOOK_SECRET: "s3cret",
-			EVENT_WEBHOOK_MAX_ATTEMPTS: "3",
 			EVENT_WEBHOOK_TIMEOUT_MS: "5000",
 			DOWNLOAD_SERVER_PORT: "9876",
 		});
-		expect(cfg.enabled && cfg.maxAttempts).toBe(3);
 		expect(cfg.enabled && cfg.timeoutMs).toBe(5000);
 		expect(cfg.enabled && cfg.downloadServerPort).toBe(9876);
 	});
