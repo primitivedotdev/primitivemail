@@ -11,7 +11,7 @@
     "lint:fix": "biome check --write src/"
   },
   "dependencies": {
-    "@primitivedotdev/sdk": "^0.2.3"
+    "@primitivedotdev/sdk": "^0.4.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
