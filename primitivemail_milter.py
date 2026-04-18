@@ -1315,16 +1315,21 @@ class PrimitiveMailMilter(Milter.Base):
             f"{self.message_id}:{recipient}:{queue_id}",
         ))
 
-        raw_body = json.dumps(payload).encode('utf-8')
-
-        sw = sign_standard_webhooks_payload(
-            raw_body=raw_body,
-            secret=WEBHOOK_SECRET,
-            msg_id=delivery_id,
-            timestamp=int(time.time()),
-        )
-
         try:
+            # Inside the try so any failure in body serialization or signing
+            # is absorbed by the outer `except Exception` (returns tempfail)
+            # and the `finally` that closes webhook_span still runs. Real
+            # failure modes here: json.dumps on a non-serializable payload
+            # field, or an unexpected SDK-side signing error. Both are rare
+            # but the cost of guarding them is zero.
+            raw_body = json.dumps(payload).encode('utf-8')
+            sw = sign_standard_webhooks_payload(
+                raw_body=raw_body,
+                secret=WEBHOOK_SECRET,
+                msg_id=delivery_id,
+                timestamp=int(time.time()),
+            )
+
             webhook_headers = {
                 'Content-Type': 'application/json',
                 STANDARD_WEBHOOK_ID_HEADER: sw['msg_id'],
