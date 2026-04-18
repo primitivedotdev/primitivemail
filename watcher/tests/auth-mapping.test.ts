@@ -63,7 +63,7 @@ describe("emailAuthFromMilter", () => {
 		expect(out.dmarcDkimAligned).toBe(false);
 	});
 
-	it("marks a signature aligned iff its domain matches DMARC from-domain", () => {
+	it("marks a signature aligned iff domain matches AND DKIM verified", () => {
 		const out = emailAuthFromMilter({
 			spf: "pass",
 			dkim: "pass",
@@ -73,6 +73,34 @@ describe("emailAuthFromMilter", () => {
 		expect(out.dkimSignatures[0].aligned).toBe(true);
 		expect(out.dkimSignatures[1].aligned).toBe(false);
 		expect(out.dmarcDkimAligned).toBe(true);
+	});
+
+	it("never reports alignment when DKIM verification failed, even for a matching domain", () => {
+		// DMARC DKIM alignment requires BOTH domain match AND successful
+		// verification. A receiver gating security decisions on
+		// `dmarcDkimAligned` must not see `true` when DKIM actually failed.
+		const out = emailAuthFromMilter({
+			spf: "pass",
+			dkim: "fail",
+			dkim_domains: ["example.com"],
+			dmarc_from_domain: "example.com",
+		});
+		expect(out.dkimSignatures[0].result).toBe("fail");
+		expect(out.dkimSignatures[0].aligned).toBe(false);
+		expect(out.dmarcDkimAligned).toBe(false);
+	});
+
+	it("never reports alignment when DKIM is temperror/permerror", () => {
+		for (const result of ["temperror", "permerror"] as const) {
+			const out = emailAuthFromMilter({
+				spf: "pass",
+				dkim: result,
+				dkim_domains: ["example.com"],
+				dmarc_from_domain: "example.com",
+			});
+			expect(out.dkimSignatures[0].aligned).toBe(false);
+			expect(out.dmarcDkimAligned).toBe(false);
+		}
 	});
 
 	it("coerces unknown SPF / DMARC values to 'none'", () => {

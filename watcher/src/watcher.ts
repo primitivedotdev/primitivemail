@@ -161,10 +161,15 @@ export function emailAuthFromMilter(auth: MetaJson["auth"]): EmailAuth {
 		domain,
 		selector: null,
 		result: dkimResult,
-		// Aligned if the DKIM domain matches the DMARC RFC5322.From domain.
-		aligned: dmarcFromDomain
-			? domain.toLowerCase() === dmarcFromDomain.toLowerCase()
-			: false,
+		// DMARC DKIM alignment requires BOTH (a) the signing domain matches
+		// the RFC5322.From domain AND (b) the signature itself verified.
+		// A failed or erroring signature from an aligned domain MUST NOT be
+		// reported as aligned — a receiver gating security decisions on
+		// `dmarcDkimAligned` would otherwise see a false positive.
+		aligned:
+			dkimResult === "pass" &&
+			!!dmarcFromDomain &&
+			domain.toLowerCase() === dmarcFromDomain.toLowerCase(),
 		keyBits: null,
 		algo: null,
 	}));
@@ -426,9 +431,15 @@ if (deliveryConfig.enabled) {
 	// every download URL 404s at the receiver. Warn loudly at startup;
 	// don't fail, since an operator may intentionally route via proxy.
 	try {
-		const basePort = new URL(deliveryConfig.downloadBaseUrl).port;
+		const parsedBase = new URL(deliveryConfig.downloadBaseUrl);
+		// `URL.port` is empty string when the URL uses the protocol's default
+		// port (80 for http, 443 for https). Resolve the effective port so an
+		// operator who set `DOWNLOAD_BASE_URL=http://host` (implicit port 80)
+		// with `DOWNLOAD_SERVER_PORT=4001` still gets warned about the mismatch.
+		const basePort =
+			parsedBase.port || (parsedBase.protocol === "https:" ? "443" : "80");
 		const expectedPort = String(deliveryConfig.downloadServerPort);
-		if (basePort && basePort !== expectedPort) {
+		if (basePort !== expectedPort) {
 			console.warn(
 				`  WARNING: DOWNLOAD_BASE_URL port (${basePort}) differs from DOWNLOAD_SERVER_PORT (${expectedPort}). If no reverse proxy is rewriting, download URLs in webhooks will be unreachable.`,
 			);
