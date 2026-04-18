@@ -113,7 +113,11 @@ Large emails (>256 KB) are not embedded inline. The payload's `email.content.dow
 
 Backlog behavior: turning on `EVENT_WEBHOOK_URL` does NOT replay historical emails. Deliveries fire only for emails processed after the watcher restarts. To replay history, iterate `emails.jsonl` yourself.
 
-Every delivery outcome is logged to `~/primitivemail/maildata/deliveries.jsonl`. Rotate it yourself (logrotate / scripts) if your volume warrants it.
+Every completed delivery is logged to `~/primitivemail/maildata/deliveries.jsonl`. Rotate it yourself (logrotate / scripts) if your volume warrants it.
+
+**Shutdown gap.** If the watcher receives SIGTERM while a delivery is in flight, it has a 3-second grace window to finish; anything still running after that is abandoned without a log line. A journal entry in `emails.jsonl` without a corresponding row in `deliveries.jsonl` therefore means "status unknown" — either the delivery is still in-progress (check back in a moment) or it was cut short by a restart. The journal is authoritative; re-post from the journal if you need guaranteed delivery.
+
+**Endpoint ID rotation.** Each event carries `delivery.endpoint_id` derived from `sha256(EVENT_WEBHOOK_URL + EVENT_WEBHOOK_SECRET)`. Changing either value changes the ID — receivers doing idempotency keyed on `endpoint_id` will see a rotated deployment as a new endpoint. Plan secret rotations accordingly.
 
 ### Optional env vars
 

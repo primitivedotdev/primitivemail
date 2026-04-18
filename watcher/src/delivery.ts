@@ -77,7 +77,9 @@ export interface CanonicalJson {
 		}>;
 		attachments_download_url: string | null;
 	};
-	auth: Record<string, unknown>;
+	// The on-disk `auth` block is not declared here: delivery takes
+	// auth in-memory from the watcher (see `DeliverEventInput.auth`)
+	// and never reads this field from the canonical JSON.
 }
 
 export interface DeliverEventInput {
