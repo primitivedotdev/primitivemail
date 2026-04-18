@@ -34,10 +34,32 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { handleWebhook } from "@primitivedotdev/sdk";
+import type { EmailAuth } from "@primitivedotdev/sdk/contract";
 import { afterEach, describe, expect, it } from "vitest";
 import type { DeliveryConfig } from "../src/config.js";
 import { computeEndpointId } from "../src/config.js";
 import { deliverEvent } from "../src/delivery.js";
+
+const TEST_AUTH: EmailAuth = {
+	spf: "pass",
+	dmarc: "pass",
+	dmarcPolicy: "reject",
+	dmarcFromDomain: "example.com",
+	dmarcSpfAligned: false,
+	dmarcDkimAligned: true,
+	dmarcSpfStrict: false,
+	dmarcDkimStrict: false,
+	dkimSignatures: [
+		{
+			domain: "example.com",
+			selector: null,
+			result: "pass",
+			aligned: true,
+			keyBits: null,
+			algo: null,
+		},
+	],
+};
 import {
 	type StartedDownloadServer,
 	startDownloadServer,
@@ -209,6 +231,7 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
+			auth: TEST_AUTH,
 		});
 
 		expect(outcome.status).toBe("delivered");
@@ -259,6 +282,7 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
+			auth: TEST_AUTH,
 		});
 		expect(outcome.status).toBe("delivered");
 		expect(outcome.confirmed).toBe(true);
@@ -277,6 +301,7 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
+			auth: TEST_AUTH,
 		});
 
 		expect(outcome.status).toBe("failed");
@@ -298,6 +323,7 @@ describe("e2e delivery + download round-trip", () => {
 			seq: 1,
 			domain: fx.domain,
 			deliveriesJsonlPath: fx.deliveriesJsonlPath,
+			auth: TEST_AUTH,
 		});
 		expect(outcome.status).toBe("delivered");
 

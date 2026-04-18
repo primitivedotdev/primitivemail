@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
+import type { EmailAuth } from "@primitivedotdev/sdk/contract";
 import {
 	bundleAttachments,
 	parseEmailWithAttachments,
@@ -86,34 +87,119 @@ interface MetaJson {
 	};
 }
 
+/** Valid SPF results per the schema. Unknown values coerce to "none". */
+const SPF_RESULTS = new Set([
+	"pass",
+	"fail",
+	"softfail",
+	"neutral",
+	"none",
+	"temperror",
+	"permerror",
+] as const);
+type SpfResult = EmailAuth["spf"];
+
+const DMARC_RESULTS = new Set([
+	"pass",
+	"fail",
+	"none",
+	"temperror",
+	"permerror",
+] as const);
+type DmarcResult = EmailAuth["dmarc"];
+
+const DMARC_POLICIES = new Set(["reject", "quarantine", "none"] as const);
+type DmarcPolicy = NonNullable<EmailAuth["dmarcPolicy"]>;
+
+const DKIM_RESULTS = new Set([
+	"pass",
+	"fail",
+	"temperror",
+	"permerror",
+] as const);
+type DkimResult = EmailAuth["dkimSignatures"][number]["result"];
+
 /**
- * Build the canonical auth object from .meta.json auth data.
- * Maps the milter's flat dkim/dkim_domains into the richer dkim_signatures array.
+ * Map the milter's flat `.meta.json` auth fields into the SDK's `EmailAuth`
+ * shape in a single pass. This is the one and only auth adapter — the
+ * canonical JSON on disk stores a snake_case serialization of the SAME
+ * `EmailAuth` object (written at `processEmail` time), not a separate
+ * representation, so there's nothing downstream to re-translate.
+ *
+ * `dmarcSpfAligned` and the `Strict` flags require milter-side data that
+ * isn't exposed today; they default to `false`. `dmarcDkimAligned` is
+ * derived from the per-signature `aligned` flags (DMARC passes iff at
+ * least one DKIM signature is aligned with the RFC5322.From domain).
  */
-function buildAuth(auth: MetaJson["auth"]) {
-	const result: Record<string, unknown> = {
-		spf: auth.spf,
+function emailAuthFromMilter(auth: MetaJson["auth"]): EmailAuth {
+	const spfRaw = typeof auth.spf === "string" ? auth.spf.toLowerCase() : "none";
+	const spf: SpfResult = (SPF_RESULTS as Set<string>).has(spfRaw)
+		? (spfRaw as SpfResult)
+		: "none";
+
+	const dmarcRaw =
+		typeof auth.dmarc === "string" ? auth.dmarc.toLowerCase() : "none";
+	const dmarc: DmarcResult = (DMARC_RESULTS as Set<string>).has(dmarcRaw)
+		? (dmarcRaw as DmarcResult)
+		: "none";
+
+	const policyRaw = auth.dmarc_policy?.toLowerCase() ?? null;
+	const dmarcPolicy: DmarcPolicy | null =
+		policyRaw && (DMARC_POLICIES as Set<string>).has(policyRaw)
+			? (policyRaw as DmarcPolicy)
+			: null;
+
+	const dmarcFromDomain = auth.dmarc_from_domain ?? null;
+
+	const dkimResult: DkimResult =
+		auth.dkim && (DKIM_RESULTS as Set<string>).has(auth.dkim)
+			? (auth.dkim as DkimResult)
+			: "permerror";
+
+	const dkimSignatures = (auth.dkim_domains ?? []).map((domain) => ({
+		domain,
+		selector: null,
+		result: dkimResult,
+		// Aligned if the DKIM domain matches the DMARC RFC5322.From domain.
+		aligned: dmarcFromDomain
+			? domain.toLowerCase() === dmarcFromDomain.toLowerCase()
+			: false,
+		keyBits: null,
+		algo: null,
+	}));
+
+	return {
+		spf,
+		dmarc,
+		dmarcPolicy,
+		dmarcFromDomain,
+		dmarcSpfAligned: false,
+		dmarcDkimAligned: dkimSignatures.some((s) => s.aligned),
+		dmarcSpfStrict: false,
+		dmarcDkimStrict: false,
+		dkimSignatures,
 	};
+}
 
-	// Build dkim_signatures array from milter's flat data
-	if (auth.dkim !== undefined && auth.dkim_domains) {
-		result.dkim_signatures = auth.dkim_domains.map((domain) => ({
-			domain,
-			result: auth.dkim,
-			// Aligned if the DKIM domain matches the DMARC from_domain
-			aligned: auth.dmarc_from_domain
-				? domain.toLowerCase() === auth.dmarc_from_domain.toLowerCase()
-				: false,
-		}));
-	}
-
-	if (auth.dmarc !== undefined) {
-		result.dmarc = auth.dmarc;
-		result.dmarc_policy = auth.dmarc_policy ?? null;
-		result.dmarc_from_domain = auth.dmarc_from_domain ?? null;
-	}
-
-	return result;
+/**
+ * Serialize an `EmailAuth` object into the snake_case subset we write to
+ * canonical JSON on disk. Kept minimal (only fields the milter populates)
+ * so the on-disk shape is a stable debug-readable view, not a duplicate
+ * of the full SDK type. External readers of `<id>.json` should continue
+ * to rely on the managed webhook payload for the canonical auth shape.
+ */
+function canonicalAuth(auth: EmailAuth): Record<string, unknown> {
+	return {
+		spf: auth.spf,
+		dmarc: auth.dmarc,
+		dmarc_policy: auth.dmarcPolicy,
+		dmarc_from_domain: auth.dmarcFromDomain,
+		dkim_signatures: auth.dkimSignatures.map((s) => ({
+			domain: s.domain,
+			result: s.result,
+			aligned: s.aligned,
+		})),
+	};
 }
 
 /**
@@ -155,24 +241,29 @@ async function processEmail(metaPath: string): Promise<void> {
 	// Parse the email using the SDK
 	const parsed = await parseEmailWithAttachments(emlBuffer);
 
-	// Bundle attachments if any are downloadable
+	// Bundle attachments if any are downloadable. The canonical JSON's
+	// `attachments_download_url` is null on disk — the real URL is minted
+	// at delivery time by the watcher's download server with a signed
+	// token, and isn't knowable at canonical-write time. The tar.gz path
+	// is determined entirely by the filename convention
+	// (<domain>/<id>.attachments.tar.gz) if any external reader needs it.
 	const downloadable = parsed.attachments.filter((a) => a.isDownloadable);
-	let attachmentsDownloadUrl: string | null = null;
+	const hasAttachments = downloadable.length > 0;
 
-	if (downloadable.length > 0) {
+	if (hasAttachments) {
 		const bundle = await bundleAttachments(downloadable);
 		if (!bundle) throw new Error("Failed to bundle attachments");
 		// Atomic write: tmp then rename
 		const tarTmpPath = `${tarGzPath}.tmp`;
 		await writeFile(tarTmpPath, bundle.tarGzBuffer);
 		await rename(tarTmpPath, tarGzPath);
-		attachmentsDownloadUrl = `${domainDir}/${base}.attachments.tar.gz`;
 		console.log(`  Bundled ${downloadable.length} attachments -> ${tarGzPath}`);
 	}
 
 	// Map parser output to canonical format using SDK mapping functions
 	const headers = toCanonicalHeaders(parsed);
-	const parsedData = toParsedDataComplete(parsed, attachmentsDownloadUrl);
+	const parsedData = toParsedDataComplete(parsed, null);
+	const auth = emailAuthFromMilter(meta.auth);
 
 	// Compute content metadata
 	const emlSha256 = createHash("sha256").update(emlBuffer).digest("hex");
@@ -196,7 +287,7 @@ async function processEmail(metaPath: string): Promise<void> {
 			size_bytes: emlBuffer.length,
 			sha256: emlSha256,
 		},
-		auth: buildAuth(meta.auth),
+		auth: canonicalAuth(auth),
 	};
 
 	// Atomic write: .tmp then rename
@@ -229,6 +320,7 @@ async function processEmail(metaPath: string): Promise<void> {
 			config,
 			canonicalJsonPath: jsonPath,
 			emlPath,
+			auth,
 			id: canonical.id,
 			seq: journalEntry.seq,
 			domain: domainDir,
@@ -330,7 +422,18 @@ if (deliveryConfig.enabled) {
 	console.log("  Delivery disabled (EVENT_WEBHOOK_URL not set)");
 }
 
+let shutdownStarted = false;
 async function shutdownAndExit(code: number): Promise<never> {
+	// Re-entry guard: SIGTERM + SIGINT arriving together, or the poll loop
+	// detecting `shuttingDown` at the same moment a signal handler fires,
+	// could otherwise invoke this twice. Second caller hangs until the
+	// first one's `process.exit` tears the event loop down.
+	if (shutdownStarted) {
+		await new Promise<never>(() => {});
+		throw new Error("unreachable");
+	}
+	shutdownStarted = true;
+
 	// One-shot deliveries usually finish in well under SHUTDOWN_GRACE_MS.
 	// If any are still in-flight after the grace period we exit anyway —
 	// the journal entry persists, so the operator can re-post manually.

@@ -1,7 +1,10 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { generateDownloadToken } from "@primitivedotdev/sdk/webhook";
+import {
+	generateDownloadToken,
+	verifyDownloadToken,
+} from "@primitivedotdev/sdk/webhook";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AUDIENCE_ATTACHMENTS, AUDIENCE_RAW } from "../src/delivery.js";
 import {
@@ -157,6 +160,33 @@ describe("download server", () => {
 		const token = tokenFor(fx.id, AUDIENCE_RAW, { expiresAt: 1 });
 		const res = await fetch(`${fx.baseUrl}/raw/${fx.id}?token=${token}`);
 		expect(res.status).toBe(410);
+	});
+
+	it("pins the SDK's expired-token error message shape", () => {
+		// The download server discriminates 410 (Gone) vs 401 (Unauthorized)
+		// based on whether verifyDownloadToken's `error` field contains the
+		// substring "expired". That's a string-coupling to the SDK's public
+		// contract; if the SDK ever reworks the message (`"Token is
+		// expired"` → `"Expired token"`) the coupling still holds because
+		// both contain "expired", but anything that drops that substring
+		// (e.g. `"TTL exhausted"`) would silently flip 410s into 401s.
+		// This test pins the current contract as a tripwire for SDK drift.
+		const expired = generateDownloadToken({
+			emailId: "em_x",
+			expiresAt: 1,
+			audience: AUDIENCE_RAW,
+			secret: SECRET,
+		});
+		const result = verifyDownloadToken({
+			token: expired,
+			emailId: "em_x",
+			audience: AUDIENCE_RAW,
+			secret: SECRET,
+		});
+		expect(result.valid).toBe(false);
+		if (!result.valid) {
+			expect(result.error.toLowerCase()).toContain("expired");
+		}
 	});
 
 	it("returns 404 for unknown email id (with a valid token)", async () => {

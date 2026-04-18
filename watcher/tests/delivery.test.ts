@@ -3,10 +3,33 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { handleWebhook } from "@primitivedotdev/sdk";
+import type { EmailAuth } from "@primitivedotdev/sdk/contract";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeliveryConfig } from "../src/config.js";
 import { computeEndpointId } from "../src/config.js";
 import { buildEventFromFiles, deliverEvent, hashUrl } from "../src/delivery.js";
+
+/** Minimal-but-valid EmailAuth fixture for tests that don't care about auth. */
+const TEST_AUTH: EmailAuth = {
+	spf: "pass",
+	dmarc: "pass",
+	dmarcPolicy: "reject",
+	dmarcFromDomain: "example.com",
+	dmarcSpfAligned: false,
+	dmarcDkimAligned: true,
+	dmarcSpfStrict: false,
+	dmarcDkimStrict: false,
+	dkimSignatures: [
+		{
+			domain: "example.com",
+			selector: null,
+			result: "pass",
+			aligned: true,
+			keyBits: null,
+			algo: null,
+		},
+	],
+};
 
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -70,6 +93,7 @@ describe("buildEventFromFiles", () => {
 				canonicalJsonPath,
 				emlPath,
 				config: makeConfig(),
+				auth: TEST_AUTH,
 			});
 			expect(event.event).toBe("email.received");
 			expect(event.email.headers.message_id).toBe("<unit-test-1@example.com>");
@@ -112,6 +136,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("delivered");
@@ -135,6 +160,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("failed");
@@ -152,6 +178,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("failed");
@@ -174,6 +201,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("failed");
@@ -190,6 +218,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		const [, init] = fetchImpl.mock.calls[0] as unknown as [
@@ -211,6 +240,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("failed");
@@ -235,6 +265,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("delivered");
@@ -258,6 +289,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			seq: 1,
 			domain: tmp.domain,
 			deliveriesJsonlPath,
+			auth: TEST_AUTH,
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(outcome.status).toBe("skipped");

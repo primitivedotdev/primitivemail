@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, readFile, stat } from "node:fs/promises";
 import {
+	type EmailAuth,
 	type EmailReceivedEvent,
 	buildEventFromParsedData,
 } from "@primitivedotdev/sdk/contract";
@@ -83,6 +84,13 @@ export interface DeliverEventInput {
 	config: DeliveryConfig;
 	canonicalJsonPath: string;
 	emlPath: string;
+	/**
+	 * EmailAuth built from the milter's `.meta.json` input. Passed in
+	 * memory rather than re-derived from the canonical JSON's snake_case
+	 * auth block so there's only one place in the watcher that maps
+	 * milter → SDK auth.
+	 */
+	auth: EmailAuth;
 	id: string;
 	seq: number;
 	domain: string;
@@ -114,28 +122,6 @@ interface DeliveryLogEntry {
 }
 
 /**
- * Build the signed payload for the POST.
- */
-export function buildSignedPayload(params: {
-	event: EmailReceivedEvent;
-	secret: string;
-	timestampSeconds: number;
-}): { rawBody: string; signatureHeader: string } {
-	const attempted_at = new Date(params.timestampSeconds * 1000).toISOString();
-	const payload = {
-		...params.event,
-		delivery: { ...params.event.delivery, attempted_at },
-	};
-	const rawBody = JSON.stringify(payload);
-	const { header } = signWebhookPayload(
-		rawBody,
-		params.secret,
-		params.timestampSeconds,
-	);
-	return { rawBody, signatureHeader: header };
-}
-
-/**
  * Hash the (configured URL) down to a short fingerprint suitable for
  * delivery logs. We log the hash, not the URL, so operators can grep logs
  * without re-emitting the full URL (which carries the signed token in the
@@ -147,14 +133,17 @@ export function hashUrl(url: string): string {
 
 /**
  * Read the canonical JSON + raw .eml, hand them to the SDK helper, and
- * return a schema-valid event ready for signing.
+ * return a schema-valid event ready for signing. Auth is passed in
+ * memory from the caller (see `DeliverEventInput.auth`) rather than
+ * re-parsed from the canonical JSON's snake_case serialization.
  */
 export async function buildEventFromFiles(params: {
 	canonicalJsonPath: string;
 	emlPath: string;
 	config: DeliveryConfig;
+	auth: EmailAuth;
 }): Promise<EmailReceivedEvent> {
-	const { canonicalJsonPath, emlPath, config } = params;
+	const { canonicalJsonPath, emlPath, config, auth } = params;
 
 	const [canonicalText, rawBytes] = await Promise.all([
 		readFile(canonicalJsonPath, "utf-8"),
@@ -218,144 +207,13 @@ export async function buildEventFromFiles(params: {
 		smtpHelo: canonical.smtp.helo,
 		smtpMailFrom: canonical.smtp.mail_from,
 		smtpRcptTo: canonical.smtp.rcpt_to as [string, ...string[]],
-		auth: authFromCanonical(canonical.auth),
+		auth,
 		analysis: {},
 		downloadUrl,
 		downloadExpiresAt,
 		attachmentsDownloadUrl,
 		attemptCount: 1,
 	});
-}
-
-/**
- * Map the canonical JSON's snake_case auth block (as written by the
- * watcher) into the SDK schema's camelCase `EmailAuth` shape.
- *
- * Fill defaults when the watcher didn't supply a field — self-host auth
- * from the milter is best-effort today. `dmarcDkimAligned` is derived
- * from the per-signature `aligned` flags; `dmarcSpfAligned` and the
- * Strict flags need data the milter doesn't expose yet.
- */
-function authFromCanonical(auth: Record<string, unknown>): {
-	spf:
-		| "pass"
-		| "fail"
-		| "softfail"
-		| "neutral"
-		| "none"
-		| "temperror"
-		| "permerror";
-	dmarc: "pass" | "fail" | "none" | "temperror" | "permerror";
-	dmarcPolicy: "reject" | "quarantine" | "none" | null;
-	dmarcFromDomain: string | null;
-	dmarcSpfAligned: boolean;
-	dmarcDkimAligned: boolean;
-	dmarcSpfStrict: boolean;
-	dmarcDkimStrict: boolean;
-	dkimSignatures: Array<{
-		domain: string;
-		selector: string | null;
-		result: "pass" | "fail" | "temperror" | "permerror";
-		aligned: boolean;
-		keyBits: number | null;
-		algo: string | null;
-	}>;
-} {
-	type Spf =
-		| "pass"
-		| "fail"
-		| "softfail"
-		| "neutral"
-		| "none"
-		| "temperror"
-		| "permerror";
-	type Dmarc = "pass" | "fail" | "none" | "temperror" | "permerror";
-	type DmarcPolicy = "reject" | "quarantine" | "none";
-	type DkimRes = "pass" | "fail" | "temperror" | "permerror";
-
-	const spfRaw = typeof auth.spf === "string" ? auth.spf.toLowerCase() : "none";
-	const spfValid: Spf[] = [
-		"pass",
-		"fail",
-		"softfail",
-		"neutral",
-		"none",
-		"temperror",
-		"permerror",
-	];
-	const spf: Spf = (spfValid as string[]).includes(spfRaw)
-		? (spfRaw as Spf)
-		: "none";
-
-	const dmarcRaw =
-		typeof auth.dmarc === "string" ? auth.dmarc.toLowerCase() : "none";
-	const dmarcValid: Dmarc[] = [
-		"pass",
-		"fail",
-		"none",
-		"temperror",
-		"permerror",
-	];
-	const dmarc: Dmarc = (dmarcValid as string[]).includes(dmarcRaw)
-		? (dmarcRaw as Dmarc)
-		: "none";
-
-	const policyRaw =
-		typeof auth.dmarc_policy === "string"
-			? auth.dmarc_policy.toLowerCase()
-			: null;
-	const policyValid: DmarcPolicy[] = ["reject", "quarantine", "none"];
-	const dmarcPolicy: DmarcPolicy | null =
-		policyRaw && (policyValid as string[]).includes(policyRaw)
-			? (policyRaw as DmarcPolicy)
-			: null;
-
-	const dmarcFromDomain =
-		typeof auth.dmarc_from_domain === "string" ? auth.dmarc_from_domain : null;
-
-	const rawSigs = Array.isArray(auth.dkim_signatures)
-		? auth.dkim_signatures
-		: [];
-	const dkimValid: DkimRes[] = ["pass", "fail", "temperror", "permerror"];
-	const dkimSignatures = rawSigs
-		.map(
-			(
-				entry,
-			):
-				| ReturnType<typeof authFromCanonical>["dkimSignatures"][number]
-				| null => {
-				if (!entry || typeof entry !== "object") return null;
-				const e = entry as Record<string, unknown>;
-				const domain = typeof e.domain === "string" ? e.domain : null;
-				if (!domain) return null;
-				const resultRaw =
-					typeof e.result === "string" ? e.result.toLowerCase() : "permerror";
-				const result: DkimRes = (dkimValid as string[]).includes(resultRaw)
-					? (resultRaw as DkimRes)
-					: "permerror";
-				return {
-					domain,
-					selector: typeof e.selector === "string" ? e.selector : null,
-					result,
-					aligned: e.aligned === true,
-					keyBits: typeof e.keyBits === "number" ? e.keyBits : null,
-					algo: typeof e.algo === "string" ? e.algo : null,
-				};
-			},
-		)
-		.filter((s): s is NonNullable<typeof s> => s !== null);
-
-	return {
-		spf,
-		dmarc,
-		dmarcPolicy,
-		dmarcFromDomain,
-		dmarcSpfAligned: false,
-		dmarcDkimAligned: dkimSignatures.some((s) => s.aligned),
-		dmarcSpfStrict: false,
-		dmarcDkimStrict: false,
-		dkimSignatures,
-	};
 }
 
 /**
@@ -421,6 +279,7 @@ export async function deliverEvent(
 			canonicalJsonPath: input.canonicalJsonPath,
 			emlPath: input.emlPath,
 			config: input.config,
+			auth: input.auth,
 		});
 	} catch (err) {
 		return logAndReturn({
@@ -431,12 +290,14 @@ export async function deliverEvent(
 		});
 	}
 
-	const timestampSeconds = Math.floor(now() / 1000);
-	const { rawBody, signatureHeader } = buildSignedPayload({
-		event,
-		secret: input.config.webhookSecret,
-		timestampSeconds,
-	});
+	// Sign the event as-built. No re-stamp: with one-shot delivery there's
+	// no backoff window that could age the signature, so the SDK's default
+	// `Date.now()` timestamp is fine for the `t=` header.
+	const rawBody = JSON.stringify(event);
+	const { header: signatureHeader } = signWebhookPayload(
+		rawBody,
+		input.config.webhookSecret,
+	);
 
 	try {
 		const response = await fetchImpl(input.config.webhookUrl, {
