@@ -921,9 +921,8 @@ class PrimitiveMailMilter(Milter.Base):
         if self._trace_span is not None:
             domain = valid_recipients[0].split('@')[1].lower()
             self._trace_span.resource = f"email:{domain}"
-            self._trace_span.set_tag("email.recipients", ", ".join(valid_recipients))
-            self._trace_span.set_tag("email.recipient_count", len(valid_recipients))
-            self._trace_span.set_tag("email.size_bytes", size)
+            self._trace_span.set_metric("email.recipient_count", len(valid_recipients))
+            self._trace_span.set_metric("email.size_bytes", size)
             if self.message_id:
                 self._trace_span.set_tag("email.message_id", self.message_id)
 
