@@ -824,11 +824,27 @@ class PrimitiveMailMilter(Milter.Base):
         self._result_label = 'tempfail'
         self._path_label = 'inline'
 
+        # Start APM trace span early so every exit path can emit one
+        # (no-op if tracing disabled). Resource and tags that depend on
+        # later processing (filtered recipients, byte size) are refined
+        # once known.
+        self._trace_span = None
+        if TRACING_ENABLED:
+            self._trace_span = tracer.trace(
+                "milter.process_email",
+                service="milter",
+                resource="email:unknown",
+            )
+            self._trace_span.set_tag("email.sender", self.sender or "")
+            self._trace_span.set_tag("email.subject", self.subject or "")
+            self._trace_span.set_tag("email.message_id", self.message_id or "")
+
         # Validate recipients
         if not self.recipients:
             self.log_error("No recipients - rejecting")
             self.setreply("550", "5.1.1", "No recipient")
             self._result_label = 'reject_permanent'
+            self._finish_trace("reject_permanent", "no_recipients")
             return Milter.REJECT
 
         # De-duplicate recipients (case-insensitive, preserve first occurrence)
@@ -853,6 +869,7 @@ class PrimitiveMailMilter(Milter.Base):
         if not valid_recipients:
             self.log("All recipients invalid - accepting (silent drop)")
             self._result_label = 'accept'
+            self._finish_trace("accepted")
             return Milter.ACCEPT
 
         # Build the raw email as bytes (preserves binary attachment data)
@@ -872,6 +889,7 @@ class PrimitiveMailMilter(Milter.Base):
             self.log_error(f"Email too large: {size} bytes")
             self.setreply("552", "5.3.4", "Message size exceeds fixed limit")
             self._result_label = 'reject_permanent'
+            self._finish_trace("reject_permanent", "size_exceeds_limit")
             self.log(f"Returning REJECT (552) - size {size} exceeds limit")
             return Milter.REJECT
 
@@ -897,21 +915,16 @@ class PrimitiveMailMilter(Milter.Base):
         self.log(f"  Subject: {self.subject}")
         self.log(f"  Size: {size} bytes")
 
-        # Start APM trace span (no-op if tracing disabled)
-        self._trace_span = None
-        if TRACING_ENABLED:
-            domain = valid_recipients[0].split('@')[1].lower() if valid_recipients else 'unknown'
-            self._trace_span = tracer.trace(
-                "milter.process_email",
-                service="milter",
-                resource=f"email:{domain}",
-            )
-            self._trace_span.set_tag("email.sender", self.sender or "")
-            self._trace_span.set_tag("email.recipients", ", ".join(valid_recipients))
-            self._trace_span.set_tag("email.recipient_count", len(valid_recipients))
-            self._trace_span.set_tag("email.size_bytes", size)
-            self._trace_span.set_tag("email.subject", self.subject or "")
-            self._trace_span.set_tag("email.message_id", self.message_id or "")
+        # Refine APM trace span now that recipients and size are known.
+        # Span was opened at the top of _process_eom; here we set the tags
+        # that depend on values computed downstream.
+        if self._trace_span is not None:
+            domain = valid_recipients[0].split('@')[1].lower()
+            self._trace_span.resource = f"email:{domain}"
+            self._trace_span.set_metric("email.recipient_count", len(valid_recipients))
+            self._trace_span.set_metric("email.size_bytes", size)
+            if self.message_id:
+                self._trace_span.set_tag("email.message_id", self.message_id)
 
         # --- DKIM + DMARC checks (need full message) ---
         if SPOOF_PROTECTION != 'off':
