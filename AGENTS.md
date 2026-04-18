@@ -107,7 +107,9 @@ app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
 app.listen(3000);
 ```
 
-Response contract: plain 2xx on success. Any non-2xx (or network failure) is logged as a failed delivery in `deliveries.jsonl` — **no retries**. The journal (`emails.jsonl`) is the source of truth; if you need retry semantics, tail the journal and re-POST manually or write your own daemon. Redirects (3xx) are never followed; point `EVENT_WEBHOOK_URL` at the final destination.
+Response contract: plain 2xx on success. Any non-2xx (or network failure) is logged as a failed delivery in `deliveries.jsonl` — **no retries**. Redirects (3xx) are never followed; point `EVENT_WEBHOOK_URL` at the final destination.
+
+**What the journal preserves (and what it doesn't).** `emails.jsonl` is the source of truth for the **email** — envelope, headers, body, attachments. It's not a record of the signed wire payload we POSTed. If you want to re-deliver a failed event, don't copy the failure line and expect to replay the exact same bytes — signatures are timestamped, download URLs carry 15-minute tokens that have long since expired. Instead: look up the email by `id` in the journal, regenerate the event with a tool that calls `buildEventFromParsedData` from `@primitivedotdev/sdk/contract`, sign it with your `EVENT_WEBHOOK_SECRET`, POST it. A `primitive replay <id>` CLI that does exactly this is on the roadmap.
 
 Large emails (>256 KB) are not embedded inline. The payload's `email.content.download.url` points at the watcher's local download server (exposed on `DOWNLOAD_SERVER_PORT`, default 4001) and carries a 15-minute signed token. Fetching the URL is just `await fetch(event.email.content.download.url)` — no extra auth plumbing needed.
 
@@ -118,6 +120,24 @@ Every completed delivery is logged to `~/primitivemail/maildata/deliveries.jsonl
 **Shutdown gap.** If the watcher receives SIGTERM while a delivery is in flight, it has a 3-second grace window to finish; anything still running after that is abandoned without a log line. A journal entry in `emails.jsonl` without a corresponding row in `deliveries.jsonl` therefore means "status unknown" — either the delivery is still in-progress (check back in a moment) or it was cut short by a restart. The journal is authoritative; re-post from the journal if you need guaranteed delivery.
 
 **Endpoint ID rotation.** Each event carries `delivery.endpoint_id` derived from `sha256(EVENT_WEBHOOK_URL + EVENT_WEBHOOK_SECRET)`. Changing either value changes the ID — receivers doing idempotency keyed on `endpoint_id` will see a rotated deployment as a new endpoint. Plan secret rotations accordingly.
+
+**Migrating between self-host and managed Primitive.** Receiver code that verifies with `handleWebhook({ body, headers, secret })` works identically against both — zero changes. Three gotchas if your receiver does anything beyond that:
+
+1. If you hardcoded the download-URL origin (e.g. in a CSP, allowlist, or link-rewriter), the origin flips from `http://localhost:4001/...` (self-host) to an HTTPS managed origin. Use `event.email.content.download.url` verbatim instead.
+2. If you use `delivery.endpoint_id` as an idempotency key, expect every event to look like a new endpoint after cutover — same root cause as rotation above.
+3. If you're verifying download URLs off-band with `verifyDownloadToken`, the audience is `"primitive:raw-download"` / `"primitive:attachments-download"` on both products as of SDK 0.5.1.
+
+**TLS for self-signed or internal CAs.** The watcher's outbound fetch uses Node's default TLS. If your receiver is behind a corporate/internal CA that Node doesn't trust out of the box, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in the watcher container's environment and mount the CA bundle in. Example addition to `docker-compose.yml`:
+
+```yaml
+watcher:
+  environment:
+    NODE_EXTRA_CA_CERTS: /etc/ssl/certs/my-ca.pem
+  volumes:
+    - ./my-ca.pem:/etc/ssl/certs/my-ca.pem:ro
+```
+
+Without this, TLS failures appear in `deliveries.jsonl` as `fetch failed: self-signed certificate in certificate chain` / `unable to verify the first certificate`. No in-app escape hatch is provided — this is the right lever.
 
 ### Optional env vars
 

@@ -128,7 +128,7 @@ describe("deliverEvent (fetch stubbed)", () => {
 			async () =>
 				new Response("", {
 					status: 200,
-					headers: { "primitive-confirmed": "true" },
+					headers: { "X-Primitive-Confirmed": "true" },
 				}),
 		);
 		const outcome = await deliverEvent({
@@ -155,14 +155,14 @@ describe("deliverEvent (fetch stubbed)", () => {
 
 	it("does not set confirmed=true on a non-2xx response even if the header is present", async () => {
 		// A reverse-proxy or partial-failure handler might echo the
-		// `primitive-confirmed` header on a 5xx/4xx. The deliverer must
+		// `X-Primitive-Confirmed` header on a 5xx/4xx. The deliverer must
 		// refuse to mark that as confirmed — the receiver hasn't actually
 		// successfully processed anything.
 		const fetchImpl = vi.fn(
 			async () =>
 				new Response("", {
 					status: 500,
-					headers: { "primitive-confirmed": "true" },
+					headers: { "X-Primitive-Confirmed": "true" },
 				}),
 		);
 		const outcome = await deliverEvent({

@@ -25,7 +25,9 @@ import {
 	buildEventFromParsedData,
 } from "@primitivedotdev/sdk/contract";
 import {
+	LEGACY_CONFIRMED_HEADER,
 	LEGACY_SIGNATURE_HEADER,
+	PRIMITIVE_CONFIRMED_HEADER,
 	PRIMITIVE_SIGNATURE_HEADER,
 	generateDownloadToken,
 	signWebhookPayload,
@@ -323,10 +325,12 @@ export async function deliverEvent(
 		// non-2xx response that happens to echo `primitive-confirmed: true`
 		// (reverse-proxy behavior, partial-failure handlers) must not
 		// produce a contradictory `{status: "failed", confirmed: true}`.
+		// Header names come from the SDK so they can't silently drift from
+		// what managed Primitive emits.
 		const confirmed =
 			delivered &&
-			(response.headers.get("primitive-confirmed") === "true" ||
-				response.headers.get("mymx-confirmed") === "true");
+			(response.headers.get(PRIMITIVE_CONFIRMED_HEADER) === "true" ||
+				response.headers.get(LEGACY_CONFIRMED_HEADER) === "true");
 
 		return logAndReturn({
 			status: delivered ? "delivered" : "failed",

@@ -419,6 +419,23 @@ if (deliveryConfig.enabled) {
 		secret: deliveryConfig.webhookSecret,
 		mailDir: MAIL_DIR,
 	});
+
+	// Cross-check: the configured base URL's port should match the port
+	// the server actually listens on. Mismatches are a silent misconfig —
+	// the watcher binds one port and embeds URLs pointing at another, so
+	// every download URL 404s at the receiver. Warn loudly at startup;
+	// don't fail, since an operator may intentionally route via proxy.
+	try {
+		const basePort = new URL(deliveryConfig.downloadBaseUrl).port;
+		const expectedPort = String(deliveryConfig.downloadServerPort);
+		if (basePort && basePort !== expectedPort) {
+			console.warn(
+				`  WARNING: DOWNLOAD_BASE_URL port (${basePort}) differs from DOWNLOAD_SERVER_PORT (${expectedPort}). If no reverse proxy is rewriting, download URLs in webhooks will be unreachable.`,
+			);
+		}
+	} catch {
+		// URL already validated at config load; swallow.
+	}
 } else {
 	console.log("  Delivery disabled (EVENT_WEBHOOK_URL not set)");
 }

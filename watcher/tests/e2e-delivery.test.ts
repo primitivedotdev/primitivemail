@@ -271,7 +271,7 @@ describe("e2e delivery + download round-trip", () => {
 		fx = await setupE2E({
 			onPost: () => ({
 				status: 200,
-				headers: { "Primitive-Confirmed": "true" },
+				headers: { "X-Primitive-Confirmed": "true" },
 			}),
 		});
 		const outcome = await deliverEvent({
