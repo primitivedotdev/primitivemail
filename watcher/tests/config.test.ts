@@ -24,6 +24,15 @@ describe("loadDeliveryConfig", () => {
 		}
 	});
 
+	it("derives downloadBaseUrl from DOWNLOAD_SERVER_PORT when base URL is unset", () => {
+		const cfg = loadDeliveryConfig({
+			EVENT_WEBHOOK_URL: "https://example.com/hook",
+			EVENT_WEBHOOK_SECRET: "s3cret",
+			DOWNLOAD_SERVER_PORT: "9876",
+		});
+		expect(cfg.enabled && cfg.downloadBaseUrl).toBe("http://localhost:9876");
+	});
+
 	it("strips trailing slash from DOWNLOAD_BASE_URL", () => {
 		const cfg = loadDeliveryConfig({
 			EVENT_WEBHOOK_URL: "https://example.com/hook",

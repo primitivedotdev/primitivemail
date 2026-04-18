@@ -28,7 +28,6 @@ export type LoadedDeliveryConfig = DeliveryConfig | { enabled: false };
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_PORT = 4001;
-const DEFAULT_BASE_URL = "http://localhost:4001";
 
 export interface EnvLike {
 	EVENT_WEBHOOK_URL?: string;
@@ -131,7 +130,11 @@ export function loadDeliveryConfig(
 		65_535,
 	);
 
-	const downloadBaseUrl = env.DOWNLOAD_BASE_URL?.trim() || DEFAULT_BASE_URL;
+	// When DOWNLOAD_BASE_URL isn't set, derive it from the (possibly
+	// overridden) port so an operator flipping just DOWNLOAD_SERVER_PORT gets
+	// download URLs that actually resolve.
+	const downloadBaseUrl =
+		env.DOWNLOAD_BASE_URL?.trim() || `http://localhost:${downloadServerPort}`;
 	try {
 		const parsedBase = new URL(downloadBaseUrl);
 		if (parsedBase.protocol !== "http:" && parsedBase.protocol !== "https:") {

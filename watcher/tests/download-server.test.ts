@@ -179,6 +179,39 @@ describe("download server", () => {
 		const res = await fetch(`${fx.baseUrl}/healthz?token=anything`);
 		expect(res.status).toBe(200);
 	});
+
+	it("rejects %2F-encoded path traversal in raw id even with a valid token", async () => {
+		// `%2F` decodes to `/` — a naive decoder would turn a seemingly safe id
+		// into `../../etc/passwd`. We refuse before touching the filesystem.
+		const malicious = "..%2F..%2Fetc%2Fpasswd";
+		const token = generateDownloadToken({
+			emailId: "../../etc/passwd", // token bound to decoded form
+			expiresAt: Math.floor(Date.now() / 1000) + 600,
+			audience: AUDIENCE_RAW,
+			secret: SECRET,
+		});
+		const res = await fetch(`${fx.baseUrl}/raw/${malicious}?token=${token}`);
+		expect(res.status).toBe(400);
+	});
+
+	it("rejects ids with backslashes, control bytes, or disallowed chars", async () => {
+		for (const bad of [
+			"has space",
+			"has\\backslash",
+			"has|pipe",
+			"../sibling",
+		]) {
+			const encoded = encodeURIComponent(bad);
+			const token = generateDownloadToken({
+				emailId: bad,
+				expiresAt: Math.floor(Date.now() / 1000) + 600,
+				audience: AUDIENCE_RAW,
+				secret: SECRET,
+			});
+			const res = await fetch(`${fx.baseUrl}/raw/${encoded}?token=${token}`);
+			expect(res.status).toBe(400);
+		}
+	});
 });
 
 describe("download server — file not on disk", () => {

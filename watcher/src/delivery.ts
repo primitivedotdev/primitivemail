@@ -13,7 +13,6 @@
  */
 
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import {
 	type EmailReceivedEvent,
@@ -441,13 +440,19 @@ function authFromCanonical(auth: Record<string, unknown>): {
 		)
 		.filter((s): s is NonNullable<typeof s> => s !== null);
 
+	// `dmarcDkimAligned` is derivable: any DKIM signature flagged as aligned
+	// in the canonical JSON implies DMARC-DKIM alignment. `dmarcSpfAligned`
+	// and the Strict flags need milter-side data the watcher doesn't have
+	// today, so they default to false — document that gap for receivers.
+	const dmarcDkimAligned = dkimSignatures.some((s) => s.aligned);
+
 	return {
 		spf,
 		dmarc,
 		dmarcPolicy,
 		dmarcFromDomain,
 		dmarcSpfAligned: false,
-		dmarcDkimAligned: false,
+		dmarcDkimAligned,
 		dmarcSpfStrict: false,
 		dmarcDkimStrict: false,
 		dkimSignatures,
@@ -638,15 +643,4 @@ export async function deliverEvent(
 		last_attempt_at: new Date(now()).toISOString(),
 	});
 	return outcome;
-}
-
-/**
- * For use by watchers draining in-flight deliveries on SIGTERM: produces a
- * stream of bytes for a given `.eml` file, for callers that want a Node
- * Readable for HTTP responses. Convenience wrapper.
- */
-export function openRawStream(
-	emlPath: string,
-): ReturnType<typeof createReadStream> {
-	return createReadStream(emlPath);
 }

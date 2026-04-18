@@ -7,7 +7,8 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { handleWebhook } from "@primitivedotdev/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeliveryConfig } from "../src/config.js";
@@ -25,7 +26,7 @@ import {
 	parseRetryAfterMs,
 } from "../src/delivery.js";
 
-const FIXTURE_DIR = join(__dirname, "fixtures");
+const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 async function makeTmpEmailDir(): Promise<{
 	dir: string;

@@ -77,6 +77,12 @@ function startWatcher(env: Record<string, string>): Promise<SpawnedWatcher> {
 						stderr: stderrLines,
 						kill: () =>
 							new Promise((r) => {
+								// If the child already exited (e.g. crashed), don't wait
+								// forever for an "exit" event that will never fire.
+								if (child.exitCode !== null || child.signalCode !== null) {
+									r();
+									return;
+								}
 								child.once("exit", () => r());
 								child.kill("SIGTERM");
 								setTimeout(() => child.kill("SIGKILL"), 3_000);
@@ -108,6 +114,23 @@ function startWatcher(env: Record<string, string>): Promise<SpawnedWatcher> {
 interface CapturedPost {
 	headers: Record<string, string>;
 	body: string;
+}
+
+/**
+ * Poll until a file exists with non-empty content and return its text.
+ * Used to bridge the async gap between the webhook POST arriving and
+ * the watcher's delivery log write landing on disk.
+ */
+async function waitForFile(path: string, timeoutMs: number): Promise<string> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const content = await readFile(path, "utf-8").catch(() => null);
+		if (content && content.length > 0) return content;
+		if (Date.now() > deadline) {
+			throw new Error(`file ${path} did not appear within ${timeoutMs}ms`);
+		}
+		await new Promise((r) => setTimeout(r, 50));
+	}
 }
 
 function startReceiver(): Promise<{
@@ -187,9 +210,12 @@ describe("e2e subprocess watcher", () => {
 
 	it("processes a dropped email and delivers a signed webhook", async () => {
 		receiver = await startReceiver();
-		// Use 0 as DOWNLOAD_SERVER_PORT isn't supported (config bounds), so pick
-		// an ephemeral high port that is extremely unlikely to collide.
-		const downloadPort = 40_000 + Math.floor(Math.random() * 20_000);
+		// Config rejects port 0 (bounds 1-65535), so key off VITEST_WORKER_ID
+		// to avoid collisions when the suite runs in parallel. PID gives further
+		// entropy across concurrent local-dev runs.
+		const workerId = Number(process.env.VITEST_WORKER_ID ?? 1);
+		const pidOffset = process.pid % 1000;
+		const downloadPort = 40_000 + workerId * 1000 + pidOffset;
 
 		watcher = await startWatcher({
 			MAIL_DIR: mailDir,
@@ -241,10 +267,13 @@ describe("e2e subprocess watcher", () => {
 		expect(event.email.headers.from).toContain("alice@example.com");
 		expect(event.email.smtp.rcpt_to).toEqual(["bob@example.com"]);
 
-		// Delivery log exists under the shared maildata dir.
-		const deliveries = await readFile(
+		// Delivery log lands after deliverEvent() finishes writing — that
+		// happens strictly after the POST resolves, but the fs write isn't
+		// observable until it's flushed. Poll briefly instead of asserting
+		// immediately after the POST.
+		const deliveries = await waitForFile(
 			join(mailDir, "deliveries.jsonl"),
-			"utf-8",
+			5_000,
 		);
 		const line = JSON.parse(deliveries.trim().split("\n")[0]);
 		expect(line.status).toBe("delivered");

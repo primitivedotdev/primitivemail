@@ -31,7 +31,8 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { handleWebhook } from "@primitivedotdev/sdk";
 import { afterEach, describe, expect, it } from "vitest";
 import type { DeliveryConfig } from "../src/config.js";
@@ -43,7 +44,7 @@ import {
 } from "../src/download-server.js";
 
 const SECRET = "e2e-test-secret-value";
-const FIXTURE_DIR = join(__dirname, "fixtures");
+const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 interface CapturedPost {
 	headers: Record<string, string>;

@@ -45,7 +45,10 @@ services:
       DOWNLOAD_SERVER_PORT: "${DOWNLOAD_SERVER_PORT:-4001}"    # Port the watcher's download server binds to
       DOWNLOAD_BASE_URL: "${DOWNLOAD_BASE_URL:-http://localhost:4001}" # Base URL written into download.url
     # Expose the download server so host-side receivers can fetch raw email / attachments.
-    # Only bound when EVENT_WEBHOOK_URL is set — watcher no-ops this block otherwise.
+    # NOTE: Docker binds this host port unconditionally. The watcher only starts
+    # the actual download server when EVENT_WEBHOOK_URL is set — with webhooks
+    # disabled, the port is held but connections get ECONNREFUSED. If you don't
+    # plan to enable push delivery, remove or comment out this block to free the port.
     ports:
       - "${DOWNLOAD_SERVER_PORT:-4001}:${DOWNLOAD_SERVER_PORT:-4001}"
     # host.docker.internal lets the watcher POST to a receiver running on the host.
