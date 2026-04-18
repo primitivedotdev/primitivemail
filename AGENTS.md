@@ -89,15 +89,13 @@ After editing `.env`, run `primitive restart` to apply changes.
 
 ## Webhooks
 
-When `WEBHOOK_URL` is set, the milter POSTs each accepted delivery to that URL. Headers:
+When `WEBHOOK_URL` is set, the milter POSTs each accepted delivery to that URL and signs every request with Standard Webhooks. Headers:
 
 - `webhook-id` — per-delivery idempotency key. Stable across Postfix retries of the same delivery. Distinct for different recipients of the same message.
 - `webhook-timestamp` — Unix seconds. The SDK verifier accepts a 5-minute window by default.
 - `webhook-signature` — Standard Webhooks HMAC: `v1,<base64>`.
-- `primitive-signature` — legacy Stripe-style header for older SDK consumers: `t=<ts>,v1=<hex>`.
-- `Authorization: Bearer <WEBHOOK_SECRET>` — opt-in only via `EMIT_LEGACY_BEARER=true`. Off by default in v0.4 because it transmits the HMAC signing secret; any receiver that logs headers would expose the secret and enable signature forgery. Removed in v0.5.
 
-Verify with `@primitivedotdev/sdk/webhook` (Node) or `from primitive import handle_webhook` (Python). Do not reimplement the verification; both signers are tested against shared cross-language fixtures.
+Verify with `@primitivedotdev/sdk/webhook` (Node) or `from primitive import handle_webhook` (Python). Do not reimplement the verification; the signer is tested against shared cross-language fixtures.
 
 `webhook-id` is derived as `uuid.uuid5(ns, f"{message_id}:{recipient}:{queue_id}")` where `ns = 6f79e4a8-a494-4f7e-9124-90d94cb26d5d` (published here so operators can reproduce a value by hand) and `queue_id` is the Postfix queue id. Same recipient, same queue id produces the same `webhook-id` on retry. Different recipient or different queue id produces a different `webhook-id`. Receivers MUST deduplicate on `webhook-id`.
 

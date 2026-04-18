@@ -35,12 +35,10 @@ from Milter.utils import parse_addr
 from email_validator import EmailValidator
 
 from primitive import (
-    PRIMITIVE_SIGNATURE_HEADER,
     STANDARD_WEBHOOK_ID_HEADER,
     STANDARD_WEBHOOK_SIGNATURE_HEADER,
     STANDARD_WEBHOOK_TIMESTAMP_HEADER,
     sign_standard_webhooks_payload,
-    sign_webhook_payload,
 )
 
 # Fixed namespace UUID for webhook-id derivation. Stable across replicas and
@@ -51,12 +49,10 @@ WEBHOOK_ID_NAMESPACE = uuid.UUID("6f79e4a8-a494-4f7e-9124-90d94cb26d5d")
 # Reserved webhook header names. WEBHOOK_EXTRA_HEADERS cannot override these;
 # the milter refuses to start if it tries. Comparison is ASCII case-folded.
 RESERVED_WEBHOOK_HEADER_NAMES = frozenset({
-    "authorization",
     "content-type",
     "webhook-id",
     "webhook-timestamp",
     "webhook-signature",
-    "primitive-signature",
 })
 
 # SPF/DKIM/DMARC support (optional - only needed when SPOOF_PROTECTION != off)
@@ -268,14 +264,6 @@ STANDALONE_MODE = not WEBHOOK_URL
 # Mail storage directory for standalone mode
 MAIL_DIR = os.environ.get('MAIL_DIR', '/mail/incoming')
 
-# Emit legacy Authorization: Bearer <WEBHOOK_SECRET> for receivers that have
-# not migrated to signature verification. Off by default in v0.4 because it
-# transmits the HMAC signing secret to every receiver, which then ends up in
-# their access logs, APM traces, and gateway headers. An attacker with log
-# access would be able to forge signatures. Operators who still need it can
-# opt in explicitly; the v0.5 release removes the flag.
-EMIT_LEGACY_BEARER = os.environ.get('EMIT_LEGACY_BEARER', '').lower() in ('1', 'true', 'yes')
-
 if STANDALONE_MODE:
     logger.info("No WEBHOOK_URL configured - running in standalone mode (accept all valid emails)")
 else:
@@ -307,15 +295,6 @@ else:
         if _extra_key.lower() in RESERVED_WEBHOOK_HEADER_NAMES:
             logger.error(f"WEBHOOK_EXTRA_HEADERS reserved name: {_extra_key.lower()}")
             sys.exit(2)
-    if EMIT_LEGACY_BEARER:
-        logger.warning(
-            "EMIT_LEGACY_BEARER=true: webhooks will include an "
-            "Authorization: Bearer <WEBHOOK_SECRET> header. This transmits the "
-            "HMAC signing secret to every receiver; if the receiver logs headers "
-            "(debug middleware, APM, API gateway), the secret is exposed and can "
-            "be used to forge signatures. Disable as soon as receivers support "
-            "signature verification. This flag is removed in v0.5."
-        )
 
 # Storage upload (optional - only needed for large emails when webhook is configured)
 if not STANDALONE_MODE and not STORAGE_URL:
@@ -1337,18 +1316,12 @@ class PrimitiveMailMilter(Milter.Base):
         ))
 
         raw_body = json.dumps(payload).encode('utf-8')
-        timestamp = int(time.time())
 
         sw = sign_standard_webhooks_payload(
             raw_body=raw_body,
             secret=WEBHOOK_SECRET,
             msg_id=delivery_id,
-            timestamp=timestamp,
-        )
-        legacy = sign_webhook_payload(
-            raw_body=raw_body,
-            secret=WEBHOOK_SECRET,
-            timestamp=timestamp,
+            timestamp=int(time.time()),
         )
 
         try:
@@ -1357,12 +1330,7 @@ class PrimitiveMailMilter(Milter.Base):
                 STANDARD_WEBHOOK_ID_HEADER: sw['msg_id'],
                 STANDARD_WEBHOOK_TIMESTAMP_HEADER: str(sw['timestamp']),
                 STANDARD_WEBHOOK_SIGNATURE_HEADER: sw['signature'],
-                PRIMITIVE_SIGNATURE_HEADER: legacy['header'],
             }
-            if EMIT_LEGACY_BEARER:
-                # Deprecated in v0.4. Transmits the HMAC signing secret; see
-                # startup warning. Removed in v0.5.
-                webhook_headers['Authorization'] = f'Bearer {WEBHOOK_SECRET}'
             # Safe: startup validation rejected any collision with reserved names.
             webhook_headers.update(WEBHOOK_EXTRA_HEADERS)
 
