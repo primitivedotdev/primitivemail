@@ -103,6 +103,9 @@ describe("buildEventFromFiles", () => {
 			expect(event.email.content.raw.included).toBe(true);
 			expect(event.email.content.download.url).toContain("/raw/");
 			expect(event.email.content.download.url).toContain("token=");
+			// The canonical JSON's `headers.date` must round-trip to the event.
+			// Missing this field silently returns null to receivers.
+			expect(event.email.headers.date).toBe("Fri, 17 Apr 2026 12:00:00 +0000");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}

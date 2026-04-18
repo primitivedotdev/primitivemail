@@ -203,6 +203,7 @@ export async function buildEventFromFiles(params: {
 		sender: canonical.headers.from,
 		recipient: canonical.headers.to,
 		subject: canonical.headers.subject,
+		dateHeader: canonical.headers.date,
 		receivedAt: canonical.received_at,
 		smtpHelo: canonical.smtp.helo,
 		smtpMailFrom: canonical.smtp.mail_from,
