@@ -319,9 +319,14 @@ export async function deliverEvent(
 		});
 
 		const delivered = response.status >= 200 && response.status < 300;
+		// Only honor the confirmed header on a successful delivery — a
+		// non-2xx response that happens to echo `primitive-confirmed: true`
+		// (reverse-proxy behavior, partial-failure handlers) must not
+		// produce a contradictory `{status: "failed", confirmed: true}`.
 		const confirmed =
-			response.headers.get("primitive-confirmed") === "true" ||
-			response.headers.get("mymx-confirmed") === "true";
+			delivered &&
+			(response.headers.get("primitive-confirmed") === "true" ||
+				response.headers.get("mymx-confirmed") === "true");
 
 		return logAndReturn({
 			status: delivered ? "delivered" : "failed",

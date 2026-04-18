@@ -131,7 +131,7 @@ type DkimResult = EmailAuth["dkimSignatures"][number]["result"];
  * derived from the per-signature `aligned` flags (DMARC passes iff at
  * least one DKIM signature is aligned with the RFC5322.From domain).
  */
-function emailAuthFromMilter(auth: MetaJson["auth"]): EmailAuth {
+export function emailAuthFromMilter(auth: MetaJson["auth"]): EmailAuth {
 	const spfRaw = typeof auth.spf === "string" ? auth.spf.toLowerCase() : "none";
 	const spf: SpfResult = (SPF_RESULTS as Set<string>).has(spfRaw)
 		? (spfRaw as SpfResult)
@@ -151,9 +151,10 @@ function emailAuthFromMilter(auth: MetaJson["auth"]): EmailAuth {
 
 	const dmarcFromDomain = auth.dmarc_from_domain ?? null;
 
+	const dkimRaw = auth.dkim?.toLowerCase();
 	const dkimResult: DkimResult =
-		auth.dkim && (DKIM_RESULTS as Set<string>).has(auth.dkim)
-			? (auth.dkim as DkimResult)
+		dkimRaw && (DKIM_RESULTS as Set<string>).has(dkimRaw)
+			? (dkimRaw as DkimResult)
 			: "permerror";
 
 	const dkimSignatures = (auth.dkim_domains ?? []).map((domain) => ({

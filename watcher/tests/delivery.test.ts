@@ -153,6 +153,38 @@ describe("deliverEvent (fetch stubbed)", () => {
 		expect(line.status_code).toBe(200);
 	});
 
+	it("does not set confirmed=true on a non-2xx response even if the header is present", async () => {
+		// A reverse-proxy or partial-failure handler might echo the
+		// `primitive-confirmed` header on a 5xx/4xx. The deliverer must
+		// refuse to mark that as confirmed — the receiver hasn't actually
+		// successfully processed anything.
+		const fetchImpl = vi.fn(
+			async () =>
+				new Response("", {
+					status: 500,
+					headers: { "primitive-confirmed": "true" },
+				}),
+		);
+		const outcome = await deliverEvent({
+			config: makeConfig(),
+			canonicalJsonPath: tmp.canonicalJsonPath,
+			emlPath: tmp.emlPath,
+			id: tmp.id,
+			seq: 1,
+			domain: tmp.domain,
+			deliveriesJsonlPath,
+			auth: TEST_AUTH,
+			fetchImpl: fetchImpl as unknown as typeof fetch,
+		});
+		expect(outcome.status).toBe("failed");
+		expect(outcome.confirmed).toBe(false);
+
+		const log = await readFile(deliveriesJsonlPath, "utf-8");
+		const line = JSON.parse(log.trim());
+		expect(line.status).toBe("failed");
+		expect(line.confirmed).toBe(false);
+	});
+
 	it("logs failed on 5xx — no retry", async () => {
 		const fetchImpl = vi.fn(async () => new Response("", { status: 503 }));
 		const outcome = await deliverEvent({
