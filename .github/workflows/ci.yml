@@ -29,12 +29,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements-test.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-test.txt
 
-      - name: Install test dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-test.txt
+          python -m pip install -r requirements.txt -r requirements-test.txt
 
       - name: Run full pytest suite
         run: python -m pytest

@@ -45,6 +45,28 @@ from primitive import handle_webhook, verify_standard_webhooks_signature
 VALID_SECRET = "whsec_dGVzdHNlY3JldHNob3VsZGJlMzJieXRlc2xvbmcxMjM0NTY="
 
 
+@pytest.fixture(autouse=True)
+def _restore_pm_after_reload(monkeypatch):
+    """Reload-based tests can partially mutate the `pm` module when a
+    module-level `sys.exit(...)` fires. Tests that run afterward would
+    otherwise see a half-initialized module. Reload once post-test under a
+    known-good env to restore a clean state.
+    """
+    yield
+    # Restore to standalone mode (the simplest valid config) so subsequent
+    # tests, including ones in other files, see a consistent `pm`.
+    monkeypatch.delenv("WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("WEBHOOK_EXTRA_HEADERS", raising=False)
+    monkeypatch.delenv("EMIT_LEGACY_BEARER", raising=False)
+    try:
+        importlib.reload(pm)
+    except SystemExit:
+        # Recovery reload should not fail under standalone mode. If it does,
+        # it is a real bug and should surface on the next test, not here.
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Reserved-header startup validation
 # ---------------------------------------------------------------------------
@@ -170,11 +192,15 @@ class _CapturingResponse:
         return json.dumps({"status": "accepted"}).encode()
 
 
-def _build_milter_for_webhook_call(monkeypatch):
+def _build_milter_for_webhook_call(monkeypatch, emit_legacy_bearer=False):
     """Reload pm under a webhook config and return a configured instance."""
     monkeypatch.setenv("WEBHOOK_URL", "https://example.com/hook")
     monkeypatch.setenv("WEBHOOK_SECRET", VALID_SECRET)
     monkeypatch.delenv("WEBHOOK_EXTRA_HEADERS", raising=False)
+    if emit_legacy_bearer:
+        monkeypatch.setenv("EMIT_LEGACY_BEARER", "true")
+    else:
+        monkeypatch.delenv("EMIT_LEGACY_BEARER", raising=False)
     importlib.reload(pm)
 
     m = pm.PrimitiveMailMilter()
@@ -189,8 +215,8 @@ def _build_milter_for_webhook_call(monkeypatch):
     return m
 
 
-def test_live_call_emits_full_header_set(monkeypatch):
-    """Assert every expected header is present on a real signed POST."""
+def test_live_call_emits_signature_headers_and_omits_bearer_by_default(monkeypatch):
+    """Default v0.4 mode: signature headers present, Bearer absent."""
     m = _build_milter_for_webhook_call(monkeypatch)
     captured = {}
 
@@ -212,12 +238,36 @@ def test_live_call_emits_full_header_set(monkeypatch):
     assert "webhook-timestamp" in captured["headers"]
     assert "webhook-signature" in captured["headers"]
     assert "primitive-signature" in captured["headers"]
-    assert captured["headers"]["authorization"] == f"Bearer {VALID_SECRET}"
     assert captured["headers"]["content-type"] == "application/json"
+    # Authorization: Bearer must NOT be present by default; it leaks the
+    # HMAC signing secret via receiver logs.
+    assert "authorization" not in captured["headers"]
 
     # Shapes
     assert captured["headers"]["webhook-signature"].startswith("v1,")
     assert captured["headers"]["primitive-signature"].startswith("t=")
+
+
+def test_live_call_emits_bearer_only_when_opted_in(monkeypatch):
+    """Opt-in mode: EMIT_LEGACY_BEARER=true adds the Bearer header."""
+    m = _build_milter_for_webhook_call(monkeypatch, emit_legacy_bearer=True)
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
+        return _CapturingResponse()
+
+    with patch("primitivemail_milter.urllib.request.urlopen", fake_urlopen):
+        m._call_webhook_for_recipient(
+            recipient="bob@example.com",
+            domain="example.com",
+            raw_bytes=b"From: a\n\nhi",
+            size=10,
+        )
+
+    assert captured["headers"]["authorization"] == f"Bearer {VALID_SECRET}"
+    # Signature headers still present alongside.
+    assert "webhook-signature" in captured["headers"]
 
 
 def test_live_call_passes_sdk_standard_webhooks_verify(monkeypatch):

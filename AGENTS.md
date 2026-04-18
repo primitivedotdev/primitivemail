@@ -95,7 +95,7 @@ When `WEBHOOK_URL` is set, the milter POSTs each accepted delivery to that URL. 
 - `webhook-timestamp` — Unix seconds. The SDK verifier accepts a 5-minute window by default.
 - `webhook-signature` — Standard Webhooks HMAC: `v1,<base64>`.
 - `primitive-signature` — legacy Stripe-style header for older SDK consumers: `t=<ts>,v1=<hex>`.
-- `Authorization: Bearer <WEBHOOK_SECRET>` — deprecated in v0.4, removed in v0.5.
+- `Authorization: Bearer <WEBHOOK_SECRET>` — opt-in only via `EMIT_LEGACY_BEARER=true`. Off by default in v0.4 because it transmits the HMAC signing secret; any receiver that logs headers would expose the secret and enable signature forgery. Removed in v0.5.
 
 Verify with `@primitivedotdev/sdk/webhook` (Node) or `from primitive import handle_webhook` (Python). Do not reimplement the verification; both signers are tested against shared cross-language fixtures.
 
