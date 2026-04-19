@@ -436,7 +436,28 @@ def cmd_emails_read(args):
         sys.stdout.buffer.flush()
         return
 
-    parsed = event.get("email", {}).get("parsed") or {}
+    # Guard against a malformed `email` field. The canonical schema
+    # requires `email` to be an object and `email.parsed` to be an object
+    # (or absent). Before this check the naive `event.get("email", {})
+    # .get("parsed")` would raise AttributeError on `"email": null`,
+    # leaking a Python traceback instead of the exit-5 contract a caller
+    # expects for a malformed canonical.
+    email_obj = event.get("email")
+    if not isinstance(email_obj, dict):
+        print(
+            f"{canonical_path}: malformed canonical (email is not an object)",
+            file=sys.stderr,
+        )
+        sys.exit(5)
+    parsed = email_obj.get("parsed")
+    if parsed is None:
+        parsed = {}
+    elif not isinstance(parsed, dict):
+        print(
+            f"{canonical_path}: malformed canonical (email.parsed is not an object)",
+            file=sys.stderr,
+        )
+        sys.exit(5)
     if fmt == "text":
         body = parsed.get("body_text")
         if not body:
@@ -489,6 +510,10 @@ def cmd_emails_since(args):
         emitted += 1
 
     # Catch-up phase: scan forward from current EOF.
+    # Exit 5 paths here emit `last_seq=<N>` on stderr before exiting, so a
+    # consumer can resume from the last good entry regardless of which phase
+    # the corruption surfaced in. The follow phase has the same guarantee;
+    # the two shapes match so callers do not need phase-aware parsers.
     try:
         offset = 0
         with open(journal, "rb") as fh:
@@ -500,6 +525,7 @@ def cmd_emails_since(args):
                 try:
                     entry = json.loads(stripped)
                 except json.JSONDecodeError as exc:
+                    print(f"last_seq={last_seq}", file=sys.stderr)
                     print(
                         f"corrupt journal line at offset {offset - len(raw)}: {exc}",
                         file=sys.stderr,
@@ -507,6 +533,7 @@ def cmd_emails_since(args):
                     sys.exit(5)
                 seq = entry.get("seq")
                 if not isinstance(seq, int):
+                    print(f"last_seq={last_seq}", file=sys.stderr)
                     print(
                         f"journal entry missing integer seq at offset {offset - len(raw)}",
                         file=sys.stderr,

@@ -646,6 +646,48 @@ class TestEmailsRead:
         assert code == 5
         assert str(dom / f"{id_}.json") in err
 
+    def test_read_text_with_null_email_exits_5(self, tmp_path, capsys):
+        # Canonical parses as valid JSON but has `"email": null`. The text/html
+        # paths dereference `event["email"]["parsed"]`, so the naive
+        # `event.get("email", {}).get("parsed")` blew up with AttributeError
+        # before the null guard. Expect clean exit 5 with a descriptive msg.
+        id_ = "20260101T000001Z-aaaaaaa1"
+        entries = [(
+            _make_entry(1, id_, "ex.com",
+                        from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+            None,
+        )]
+        maildata = _seed_maildata(tmp_path, entries)
+        dom = maildata / "ex.com"
+        dom.mkdir(parents=True, exist_ok=True)
+        (dom / f"{id_}.json").write_text(json.dumps({"id": id_, "email": None}))
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
+        )
+        assert code == 5
+        assert "email is not an object" in err
+
+    def test_read_text_with_non_dict_parsed_exits_5(self, tmp_path, capsys):
+        # `email.parsed` is a string instead of an object. Should exit 5
+        # with the malformed-canonical message, not raise AttributeError.
+        id_ = "20260101T000001Z-aaaaaaa1"
+        entries = [(
+            _make_entry(1, id_, "ex.com",
+                        from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+            None,
+        )]
+        maildata = _seed_maildata(tmp_path, entries)
+        dom = maildata / "ex.com"
+        dom.mkdir(parents=True, exist_ok=True)
+        (dom / f"{id_}.json").write_text(
+            json.dumps({"id": id_, "email": {"parsed": "not-an-object"}}),
+        )
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
+        )
+        assert code == 5
+        assert "email.parsed" in err
+
 
 # -----------------------------------------------------------------------------
 # `emails since` command
@@ -678,6 +720,45 @@ class TestEmailsSince:
         code, _, err = _run_cli(seeded, ["emails", "since", "abc"], capsys=capsys)
         assert code == 2
         assert "<seq>" in err
+
+    def test_since_catchup_corruption_reports_last_seq(self, tmp_path, capsys):
+        # Catch-up corruption must emit `last_seq=<N>` on stderr before
+        # exiting 5, matching the follow phase's resume-protocol guarantee.
+        # Without this, a consumer that hit corruption during catch-up had
+        # no way to know which entries had already streamed successfully.
+        entries = [
+            (_make_entry(1, "20260101T000001Z-aaaaaaa1", "ex.com",
+                         from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+             None),
+            (_make_entry(2, "20260101T000002Z-aaaaaaa2", "ex.com",
+                         from_addr="b@x.com", received_at="2026-01-01T00:00:02Z"),
+             None),
+        ]
+        maildata = _seed_maildata(tmp_path, entries)
+        # Append a corrupt line after the two valid entries.
+        with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+            fh.write("not-json\n")
+        code, _, err = _run_cli(maildata, ["emails", "since", "0"], capsys=capsys)
+        assert code == 5
+        assert "last_seq=2" in err
+        assert "corrupt" in err.lower()
+
+    def test_since_catchup_missing_seq_reports_last_seq(self, tmp_path, capsys):
+        # Same guarantee for the other catch-up exit-5 path: a journal line
+        # that parses as JSON but lacks an integer seq. The emit()d last_seq
+        # before the bad line must appear on stderr.
+        entries = [
+            (_make_entry(1, "20260101T000001Z-aaaaaaa1", "ex.com",
+                         from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+             None),
+        ]
+        maildata = _seed_maildata(tmp_path, entries)
+        with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": "no-seq"}) + "\n")
+        code, _, err = _run_cli(maildata, ["emails", "since", "0"], capsys=capsys)
+        assert code == 5
+        assert "last_seq=1" in err
+        assert "missing integer seq" in err
 
     def test_since_limit(self, seeded, capsys):
         code, out, _ = _run_cli(
