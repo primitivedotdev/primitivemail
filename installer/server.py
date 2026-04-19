@@ -218,11 +218,14 @@ def start_server(
     first_build = is_first_build()
 
     ui.json_event("step", name="build", status="start")
-    build_and_start(install_dir, verbose, first_build, compose_cmd)
+    with ui.HeartbeatTicker("build"):
+        build_and_start(install_dir, verbose, first_build, compose_cmd)
     ui.json_event("step", name="build", status="ok")
 
     ui.json_event("step", name="wait_container", status="start")
-    if not wait_for_container():
+    with ui.HeartbeatTicker("wait_container"):
+        container_ok = wait_for_container()
+    if not container_ok:
         ui.error("Container failed to start")
         ui.json_event("step", name="wait_container", status="fail")
         print()
@@ -231,7 +234,9 @@ def start_server(
     ui.json_event("step", name="wait_container", status="ok")
 
     ui.json_event("step", name="wait_smtp", status="start")
-    if not wait_for_smtp():
+    with ui.HeartbeatTicker("wait_smtp"):
+        smtp_ok = wait_for_smtp()
+    if not smtp_ok:
         ui.error("PrimitiveMail started but SMTP did not become ready")
         ui.json_event("step", name="wait_smtp", status="fail")
         print()

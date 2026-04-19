@@ -611,6 +611,101 @@ class TestJsonMode:
 
 
 # ===========================================================================
+# HeartbeatTicker
+# ===========================================================================
+
+class TestHeartbeatTicker:
+    """The ticker emits step_progress events so agents consuming --json
+    can tell "progressing" from "hung" during long steps (build, waits)."""
+
+    @staticmethod
+    def _reset_json_mode():
+        import sys
+        from installer import ui
+        ui.JSON_MODE = False
+        if ui._JSON_STDOUT is not None:
+            sys.stdout = ui._JSON_STDOUT
+            ui._JSON_STDOUT = None
+
+    def test_fires_during_long_step(self, capsys):
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            with ui.HeartbeatTicker("build", interval=0.1):
+                _time.sleep(0.35)
+            captured = capsys.readouterr()
+            events = [
+                _json.loads(l) for l in captured.out.strip().split("\n") if l
+            ]
+            progress = [e for e in events if e["event"] == "step_progress"]
+            # Should emit at ~0.1s, ~0.2s, ~0.3s
+            assert len(progress) >= 2, progress
+            for e in progress:
+                assert e["name"] == "build"
+                assert isinstance(e["elapsed_sec"], int)
+                assert e["elapsed_sec"] >= 0
+        finally:
+            self._reset_json_mode()
+
+    def test_silent_on_fast_step(self, capsys):
+        # Step that finishes well before the first interval emits zero events.
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            with ui.HeartbeatTicker("config", interval=5.0):
+                _time.sleep(0.05)
+            captured = capsys.readouterr()
+            assert "step_progress" not in captured.out
+        finally:
+            self._reset_json_mode()
+
+    def test_no_events_after_context_exit(self, capsys):
+        # Contract: no step_progress fires after the with-block exits, even
+        # if a subsequent interval would have been due.
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            with ui.HeartbeatTicker("wait_container", interval=0.1):
+                _time.sleep(0.25)
+            # Wait past multiple intervals — ticker must be stopped.
+            _time.sleep(0.5)
+            captured = capsys.readouterr()
+            events = [
+                _json.loads(l) for l in captured.out.strip().split("\n") if l
+            ]
+            progress = [e for e in events if e["event"] == "step_progress"]
+            # We had ~2 ticks inside the with. After exit, we waited for 5
+            # more intervals — none of them should have emitted.
+            assert len(progress) <= 3, progress
+            # Sanity: every elapsed_sec is from inside the with (~0.25s max).
+            for e in progress:
+                assert e["elapsed_sec"] < 2
+        finally:
+            self._reset_json_mode()
+
+    def test_noop_when_json_mode_off(self, capsys):
+        # Non-JSON mode: ticker spawns no thread, emits nothing.
+        import time as _time
+        from installer import ui
+
+        assert not ui.JSON_MODE  # module default
+        with ui.HeartbeatTicker("build", interval=0.05) as t:
+            _time.sleep(0.15)
+            assert t._thread is None
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+
+# ===========================================================================
 # parse_args behavior
 # ===========================================================================
 
