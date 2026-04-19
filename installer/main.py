@@ -398,6 +398,8 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: boo
     print(f"  {ui.BOLD}Send email to:{ui.NC}")
     print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
     print()
+    print(f"  {ui.MUTED}Or verify end-to-end with:{ui.NC} {ui.BOLD}primitive emails test{ui.NC}")
+    print()
 
     cfg = {
         **cfg,

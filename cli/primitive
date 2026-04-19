@@ -14,6 +14,8 @@ from pathlib import Path
 
 VERSION = "0.1.0"
 
+TEST_EMAIL_API_URL = "https://www.primitive.dev/api/v1/test-email"
+
 # Doc 08's "Implementation sketch" points at doc 00's SDK-adoption rule for
 # canonical-event validation in `emails read`. The public SDK helper
 # `validate_email_received_event` validates the webhook-event shape (with
@@ -722,6 +724,220 @@ def cmd_emails_count(args):
     _tty_stderr(f"{count} match(es){filter_str}")
 
 
+def _post_test_email(url, *, max_time=30):
+    """POST an empty body to `url`, return (status, body_text).
+
+    Forces IPv4 via `curl -4` to match the server-side IP lookup table
+    (same rationale as claim_subdomain in installer/config.py; dual-stack
+    clients can otherwise present a v6 address the server has not seen).
+
+    Raises OSError when curl cannot reach the endpoint (DNS, connect
+    refused, timeout, malformed http_code). Non-2xx responses are
+    returned as a status + body for the caller to inspect.
+    """
+    try:
+        result = subprocess.run(
+            ["curl", "-4", "-s", "-X", "POST", url,
+             "-H", "Content-Type: application/json",
+             "-d", "{}",
+             # Append the status on its own line after the body so the
+             # two can be split cleanly. Use ASCII Record Separator (\x1e)
+             # so a JSON body containing newlines does not confuse us.
+             "-w", "\x1e%{http_code}",
+             "--max-time", str(max_time)],
+            capture_output=True, text=True, timeout=max_time + 5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError(str(exc)) from exc
+    if result.returncode != 0:
+        raise OSError(
+            f"curl exit {result.returncode}: "
+            f"{result.stderr.strip() or 'network error'}",
+        )
+    body, _, status_str = result.stdout.rpartition("\x1e")
+    try:
+        status = int(status_str.strip())
+    except ValueError:
+        raise OSError(f"curl returned malformed http_code: {status_str!r}")
+    return status, body
+
+
+def cmd_emails_test(args):
+    # Doc 08b: --timeout between 5 and 120 inclusive. Reject out-of-range
+    # values before any network call (exit 2 per the shared scheme).
+    if args.timeout < 5 or args.timeout > 120:
+        print("--timeout must be between 5 and 120 seconds", file=sys.stderr)
+        sys.exit(2)
+
+    # Dispatch the POST. A network-layer failure (DNS, connect refused,
+    # malformed http_code) is exit 7 per doc 08b.
+    try:
+        status, body_str = _post_test_email(TEST_EMAIL_API_URL)
+    except OSError as exc:
+        if args.json:
+            print(json.dumps({
+                "ok": False, "error": "transport",
+                "message": f"could not reach primitive.dev: {exc}",
+            }))
+        else:
+            print(f"could not reach primitive.dev: {exc}", file=sys.stderr)
+        sys.exit(7)
+
+    # Parse the response body. A 2xx with unparseable JSON is corruption
+    # at the wire level and still a transport error.
+    try:
+        body = json.loads(body_str) if body_str else {}
+    except json.JSONDecodeError:
+        msg = (f"primitive.dev returned a malformed response "
+               f"(status {status}): {body_str[:512]!r}")
+        if args.json:
+            print(json.dumps({"ok": False, "error": "transport", "message": msg}))
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(7)
+
+    if status == 404 and body.get("error") == "no_subdomain_claimed":
+        msg = body.get("message", "no subdomain claimed from this IP")
+        hint = (msg + " Run `curl -fsSL https://get.primitive.dev | bash -s -- "
+                "--claim-subdomain` from this host, or verify the outbound IP "
+                "matches the one that originally claimed the domain.")
+        if args.json:
+            print(json.dumps({
+                "ok": False, "error": "no_subdomain_claimed", "hint": hint,
+            }))
+        else:
+            print(hint, file=sys.stderr)
+        sys.exit(1)
+
+    if status == 429 and body.get("error") == "rate_limited":
+        msg = body.get("message", "rate limit reached")
+        if args.json:
+            print(json.dumps({
+                "ok": False, "error": "rate_limited", "message": msg,
+                "reset_at": body.get("reset_at"),
+                "limit": body.get("limit"),
+                "window_seconds": body.get("window_seconds"),
+            }))
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(4)
+
+    if status < 200 or status >= 300:
+        msg = (f"primitive.dev returned {status}: {body_str[:512]}")
+        if args.json:
+            print(json.dumps({
+                "ok": False, "error": "transport",
+                "status": status, "message": msg,
+            }))
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(7)
+
+    # 200 but missing any of the fields we need to match on later.
+    tag = body.get("tag")
+    subject = body.get("subject")
+    if not body.get("ok") or not isinstance(tag, str) or not isinstance(subject, str):
+        msg = f"primitive.dev returned a malformed success response: {body_str[:512]}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": "transport", "message": msg}))
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(7)
+
+    dispatched_at = body.get("dispatched_at")
+    to_addr = body.get("to", "")
+
+    if not args.wait:
+        if args.json:
+            print(json.dumps({
+                "ok": True, "tag": tag, "subject": subject,
+                "dispatched_at": dispatched_at, "to": to_addr,
+                "wait": False,
+            }))
+        else:
+            print(f"Dispatched test email to {to_addr} (tag {tag}). "
+                  f"Expect delivery within seconds. Check `primitive emails list`.")
+        return
+
+    # --wait path: poll emails.jsonl for a line whose `subject` field matches
+    # the server-stamped subject verbatim. Seek to current EOF FIRST so a
+    # stale tag in the journal from a prior run can never be picked up.
+    if not args.json:
+        print(f"Dispatching test email from primitive.dev to {to_addr}...")
+
+    maildata = get_maildata_path(args)
+    journal = _journal_path(maildata)
+    try:
+        start_size = journal.stat().st_size if journal.exists() else 0
+    except OSError as exc:
+        print(f"journal unreadable at {journal}: {exc}", file=sys.stderr)
+        sys.exit(5)
+
+    # Dispatch start wall clock for elapsed reporting. Use monotonic for
+    # the timeout budget (it cannot go backward) but wall clock for the
+    # user-facing elapsed figure so it matches "how long did this take".
+    dispatch_start = time.monotonic()
+    deadline = dispatch_start + args.timeout
+
+    matched = None
+    scan_offset = start_size
+    while time.monotonic() < deadline:
+        try:
+            if not journal.exists():
+                time.sleep(0.5)
+                continue
+            with open(journal, "rb") as fh:
+                fh.seek(scan_offset)
+                chunk = fh.read()
+                scan_offset += len(chunk)
+        except OSError as exc:
+            print(f"journal unreadable at {journal}: {exc}", file=sys.stderr)
+            sys.exit(5)
+
+        for raw in chunk.splitlines():
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                # Corrupt line in the journal. Skip; a dedicated `emails
+                # since` session is the surface that exits 5 on corruption.
+                continue
+            if entry.get("subject") == subject:
+                matched = entry
+                break
+        if matched is not None:
+            break
+        time.sleep(0.5)
+
+    if matched is None:
+        hint = (f"dispatched from primitive.dev but not observed locally "
+                f"within {args.timeout}s; check DNS, inbound port 25, "
+                f"and container health")
+        if args.json:
+            print(json.dumps({
+                "ok": False, "error": "timeout", "tag": tag,
+                "dispatched_at": dispatched_at,
+                "timeout_seconds": args.timeout, "hint": hint,
+            }))
+        else:
+            print(hint, file=sys.stderr)
+        sys.exit(6)
+
+    elapsed_ms = int((time.monotonic() - dispatch_start) * 1000)
+    if args.json:
+        print(json.dumps({
+            "ok": True, "tag": tag, "subject": subject,
+            "dispatched_at": dispatched_at,
+            "received_at": matched.get("received_at"),
+            "seq": matched.get("seq"),
+            "elapsed_ms": elapsed_ms,
+        }))
+    else:
+        print(f"Received in {elapsed_ms / 1000:.2f}s (seq {matched.get('seq')}).")
+
+
 def get_install_path():
     """Resolve the primitivemail install directory. Sudo-aware: when
     invoked under `sudo`, resolves against the original user's home
@@ -807,6 +1023,31 @@ def _build_parser():
     p_count.add_argument("--from", dest="from_addr", default=None,
                          help="Substring match on from_address.")
 
+    p_test = emails_sub.add_parser(
+        "test",
+        help="Send a real external test email via primitive.dev to your "
+             "claimed subdomain and wait for it to arrive",
+    )
+    # --wait and --no-wait are mutually exclusive. argparse exits with 2 on
+    # conflict, which is the behavior the spec wants.
+    wait_group = p_test.add_mutually_exclusive_group()
+    wait_group.add_argument(
+        "--wait", action="store_true", dest="wait", default=True,
+        help="Block until the email arrives locally or the timeout elapses (default).",
+    )
+    wait_group.add_argument(
+        "--no-wait", action="store_false", dest="wait",
+        help="Dispatch and exit immediately without polling the journal.",
+    )
+    p_test.add_argument(
+        "--timeout", type=int, default=30,
+        help="Max seconds to wait when --wait is set. Default 30. Range 5 to 120.",
+    )
+    p_test.add_argument(
+        "--json", action="store_true",
+        help="Emit one JSON object on stdout describing the result.",
+    )
+
     # Hidden compatibility alias for the pre-rename command. Omitting `help=`
     # keeps the descriptive row out of `primitive --help` so agents reading the
     # help surface do not pick it up; the name still resolves as a valid
@@ -839,6 +1080,8 @@ def main():
             cmd_emails_since(args)
         elif sub == "count":
             cmd_emails_count(args)
+        elif sub == "test":
+            cmd_emails_test(args)
         else:
             parser.parse_args(["emails", "--help"])
             sys.exit(1)

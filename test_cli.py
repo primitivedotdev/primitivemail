@@ -986,6 +986,181 @@ class TestEmailsCount:
 
 
 # -----------------------------------------------------------------------------
+# `emails test` command
+# -----------------------------------------------------------------------------
+
+
+class TestEmailsTest:
+    """The CLI side of the external test-email flow. Doc 08b is the spec.
+
+    All tests monkey-patch `_post_test_email` so no real network call is
+    made; the helper's (status, body) return is the seam the CLI branches
+    on. Journal writes are done directly via the maildata fixture.
+    """
+
+    def _stub_post(self, status, body, monkeypatch):
+        monkeypatch.setattr(
+            primitive_cli, "_post_test_email",
+            lambda *a, **kw: (status, json.dumps(body) if isinstance(body, dict) else body),
+        )
+
+    def _journal_append_with_subject(self, maildata, subject, *, seq=1, delay=0.0):
+        """Append a journal line with the given subject. Optionally wait
+        `delay` seconds before doing so, so tests can exercise the poll loop."""
+        if delay:
+            time.sleep(delay)
+        entry = _make_entry(seq, f"20260101T00000{seq}Z-aaaaaaa{seq}", "ex.com",
+                            from_addr="postmaster@primitive.dev",
+                            received_at=f"2026-01-01T00:00:0{seq}Z",
+                            subject=subject)
+        with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+
+    def test_bad_timeout_exits_2_without_network(self, tmp_path, capsys, monkeypatch):
+        # Network stub that would fail loudly if called.
+        def boom(*a, **kw):
+            raise AssertionError("must not be called for bad --timeout")
+        monkeypatch.setattr(primitive_cli, "_post_test_email", boom)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(
+            maildata, ["emails", "test", "--timeout", "2"], capsys=capsys,
+        )
+        assert code == 2
+        assert "5 and 120" in err
+
+    def test_404_no_claim_exits_1(self, tmp_path, capsys, monkeypatch):
+        self._stub_post(404, {
+            "ok": False, "error": "no_subdomain_claimed",
+            "message": "This IP has no claimed subdomain.",
+            "docs_url": "https://primitive.dev/docs/claim-subdomain",
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 1
+        assert "no claimed subdomain" in err or "no subdomain" in err.lower()
+
+    def test_429_rate_limited_exits_4(self, tmp_path, capsys, monkeypatch):
+        self._stub_post(429, {
+            "ok": False, "error": "rate_limited",
+            "message": "Test email rate limit reached.",
+            "reset_at": "2026-04-19T22:00:00Z",
+            "limit": 10, "window_seconds": 3600,
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 4
+        assert "rate limit" in err.lower()
+
+    def test_5xx_exits_7_with_body_truncated(self, tmp_path, capsys, monkeypatch):
+        self._stub_post(502, {"ok": False, "error": "mail_send_failed",
+                              "message": "Mail provider returned 500."}, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 7
+        assert "502" in err
+
+    def test_malformed_200_exits_7(self, tmp_path, capsys, monkeypatch):
+        # 200 but missing the required tag/subject fields.
+        self._stub_post(200, {"ok": True}, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 7
+        assert "malformed" in err.lower()
+
+    def test_network_error_exits_7(self, tmp_path, capsys, monkeypatch):
+        def raises(*a, **kw):
+            raise OSError("ECONNREFUSED")
+        monkeypatch.setattr(primitive_cli, "_post_test_email", raises)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 7
+        assert "ECONNREFUSED" in err
+
+    def test_no_wait_exits_0_immediately(self, tmp_path, capsys, monkeypatch):
+        # --no-wait returns as soon as the server ack is received. No
+        # journal interaction required.
+        self._stub_post(200, {
+            "ok": True, "tag": "ab12cd34",
+            "subject": "PrimitiveMail test ab12cd34",
+            "dispatched_at": "2026-04-19T20:30:00Z",
+            "to": "test+ab12cd34@pink-violet.primitive.email",
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, out, _ = _run_cli(
+            maildata, ["emails", "test", "--no-wait"], capsys=capsys,
+        )
+        assert code == 0
+        assert "ab12cd34" in out
+        assert "Dispatched" in out
+
+    def test_wait_matches_journal_entry_by_subject(self, tmp_path, capsys, monkeypatch):
+        # Seed one pre-existing entry that happens to share the server
+        # subject (stale state from a prior run). The CLI MUST ignore it
+        # because we seek to EOF before matching; otherwise the polling
+        # would false-positive before the real delivery lands.
+        subject = "PrimitiveMail test ab12cd34"
+        entries = [(_make_entry(1, "20260101T000001Z-aaaaaaa1", "ex.com",
+                                from_addr="old@x.com",
+                                received_at="2026-01-01T00:00:01Z",
+                                subject=subject), None)]
+        maildata = _seed_maildata(tmp_path, entries)
+
+        self._stub_post(200, {
+            "ok": True, "tag": "ab12cd34", "subject": subject,
+            "dispatched_at": "2026-04-19T20:30:00Z",
+            "to": "test+ab12cd34@pink-violet.primitive.email",
+        }, monkeypatch)
+
+        # Append the real delivery shortly after dispatch begins. Use a
+        # threading.Timer so we do not block the main test loop.
+        import threading
+        t = threading.Timer(
+            0.6, self._journal_append_with_subject, args=(maildata, subject),
+            kwargs={"seq": 2},
+        )
+        t.start()
+        try:
+            code, out, _ = _run_cli(
+                maildata, ["emails", "test", "--timeout", "5", "--json"],
+                capsys=capsys,
+            )
+        finally:
+            t.join()
+
+        assert code == 0
+        body = json.loads(out.strip())
+        assert body["ok"] is True
+        assert body["seq"] == 2  # seq 1 is the stale entry the CLI ignored
+        assert body["tag"] == "ab12cd34"
+
+    def test_wait_timeout_exits_6(self, tmp_path, capsys, monkeypatch):
+        # No journal append within the timeout; expect exit 6 + timeout hint.
+        self._stub_post(200, {
+            "ok": True, "tag": "ab12cd34",
+            "subject": "PrimitiveMail test ab12cd34",
+            "dispatched_at": "2026-04-19T20:30:00Z",
+            "to": "test+ab12cd34@pink-violet.primitive.email",
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(
+            maildata, ["emails", "test", "--timeout", "5"], capsys=capsys,
+        )
+        assert code == 6
+        assert "not observed locally" in err
+
+    def test_conflicting_wait_flags_exits_2(self, tmp_path, capsys, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("must not be called for flag conflict")
+        monkeypatch.setattr(primitive_cli, "_post_test_email", boom)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, _ = _run_cli(
+            maildata, ["emails", "test", "--wait", "--no-wait"], capsys=capsys,
+        )
+        assert code == 2
+
+
+# -----------------------------------------------------------------------------
 # `emails status` canonical + alias
 # -----------------------------------------------------------------------------
 
