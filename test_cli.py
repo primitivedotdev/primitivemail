@@ -174,17 +174,18 @@ def _make_entry(seq, id_, domain, *, from_addr, received_at, subject="hi", extra
 
 
 def _make_canonical(id_, received_at, *, body_text="body", body_html=None):
-    """Minimal canonical event shape. When the SDK is present, it validates
-    schema fields and will reject obvious garbage; the fixture matches the
-    watcher's canonical event shape sufficiently for `--format text|html`
-    to exercise body access without invoking full schema validation."""
+    """Flat canonical shape: the watcher writes top-level keys (id,
+    received_at, smtp, headers, auth, parsed, content) with NO `email`
+    wrapper. The webhook-delivery shape has an `email` envelope; the
+    on-disk canonical does not. This fixture matches the on-disk shape
+    so `--format text|html` exercises real body access."""
     parsed = {"body_text": body_text}
     if body_html is not None:
         parsed["body_html"] = body_html
     return {
         "id": id_,
         "received_at": received_at,
-        "email": {"parsed": parsed},
+        "parsed": parsed,
     }
 
 
@@ -646,11 +647,11 @@ class TestEmailsRead:
         assert code == 5
         assert str(dom / f"{id_}.json") in err
 
-    def test_read_text_with_null_email_exits_5(self, tmp_path, capsys):
-        # Canonical parses as valid JSON but has `"email": null`. The text/html
-        # paths dereference `event["email"]["parsed"]`, so the naive
-        # `event.get("email", {}).get("parsed")` blew up with AttributeError
-        # before the null guard. Expect clean exit 5 with a descriptive msg.
+    def test_read_text_with_missing_parsed_exits_1(self, tmp_path, capsys):
+        # Canonical parses as a valid object but has no `parsed` key at
+        # all. This is NOT malformed (canonicals may legitimately lack a
+        # body during parse-fail recovery). Expect exit 1 ("no body_text
+        # on this email"), not a crash.
         id_ = "20260101T000001Z-aaaaaaa1"
         entries = [(
             _make_entry(1, id_, "ex.com",
@@ -660,16 +661,16 @@ class TestEmailsRead:
         maildata = _seed_maildata(tmp_path, entries)
         dom = maildata / "ex.com"
         dom.mkdir(parents=True, exist_ok=True)
-        (dom / f"{id_}.json").write_text(json.dumps({"id": id_, "email": None}))
+        (dom / f"{id_}.json").write_text(json.dumps({"id": id_}))
         code, _, err = _run_cli(
             maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
         )
-        assert code == 5
-        assert "email is not an object" in err
+        assert code == 1
+        assert "no body_text" in err
 
     def test_read_text_with_non_dict_parsed_exits_5(self, tmp_path, capsys):
-        # `email.parsed` is a string instead of an object. Should exit 5
-        # with the malformed-canonical message, not raise AttributeError.
+        # `parsed` is a string instead of an object. Should exit 5 with
+        # the malformed-canonical message, not raise AttributeError.
         id_ = "20260101T000001Z-aaaaaaa1"
         entries = [(
             _make_entry(1, id_, "ex.com",
@@ -680,13 +681,44 @@ class TestEmailsRead:
         dom = maildata / "ex.com"
         dom.mkdir(parents=True, exist_ok=True)
         (dom / f"{id_}.json").write_text(
-            json.dumps({"id": id_, "email": {"parsed": "not-an-object"}}),
+            json.dumps({"id": id_, "parsed": "not-an-object"}),
         )
         code, _, err = _run_cli(
             maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
         )
         assert code == 5
-        assert "email.parsed" in err
+        assert "parsed is not an object" in err
+
+    def test_read_text_real_watcher_shape(self, tmp_path, capsys):
+        # Regression guard: the real on-disk canonical is flat, NOT wrapped
+        # in an `email` envelope. The original code used event["email"]["parsed"]
+        # which made text/html broken on every real install even though the
+        # test fixtures passed. Fixture now matches the watcher; this test
+        # drops a fixture-shape file directly and confirms body extraction.
+        id_ = "20260101T000001Z-aaaaaaa1"
+        entries = [(
+            _make_entry(1, id_, "ex.com",
+                        from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+            None,
+        )]
+        maildata = _seed_maildata(tmp_path, entries)
+        dom = maildata / "ex.com"
+        dom.mkdir(parents=True, exist_ok=True)
+        # Shape sampled from a real watcher-produced canonical.
+        (dom / f"{id_}.json").write_text(json.dumps({
+            "id": id_,
+            "received_at": "2026-01-01T00:00:01Z",
+            "smtp": {"mail_from": "a@x.com"},
+            "headers": {"subject": "hi"},
+            "auth": {"spf": "none"},
+            "parsed": {"body_text": "hello world"},
+            "content": {},
+        }))
+        code, out, _ = _run_cli(
+            maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
+        )
+        assert code == 0
+        assert "hello world" in out
 
 
 # -----------------------------------------------------------------------------
@@ -1106,27 +1138,40 @@ class TestEmailsTest:
                                 subject=subject), None)]
         maildata = _seed_maildata(tmp_path, entries)
 
-        self._stub_post(200, {
-            "ok": True, "tag": "ab12cd34", "subject": subject,
-            "dispatched_at": "2026-04-19T20:30:00Z",
-            "to": "test+ab12cd34@pink-violet.primitive.email",
-        }, monkeypatch)
-
-        # Append the real delivery shortly after dispatch begins. Use a
-        # threading.Timer so we do not block the main test loop.
+        # Schedule the real-delivery append FROM inside the stub. Starting
+        # the timer here instead of before _run_cli anchors the 0.3s
+        # countdown to the CLI's own clock (after dispatch returns, before
+        # it records start_size). That removes the race where the test
+        # setup's pre-CLI timer could fire while the CLI was still
+        # spinning up, causing start_size to already include seq=2 and
+        # the match to be missed.
         import threading
-        t = threading.Timer(
-            0.6, self._journal_append_with_subject, args=(maildata, subject),
-            kwargs={"seq": 2},
-        )
-        t.start()
+        pending_timer = {}
+
+        def stub_post_and_schedule_append(*a, **kw):
+            t = threading.Timer(
+                0.3, self._journal_append_with_subject,
+                args=(maildata, subject), kwargs={"seq": 2},
+            )
+            pending_timer["t"] = t
+            t.start()
+            return (200, json.dumps({
+                "ok": True, "tag": "ab12cd34", "subject": subject,
+                "dispatched_at": "2026-04-19T20:30:00Z",
+                "to": "test+ab12cd34@pink-violet.primitive.email",
+            }))
+
+        monkeypatch.setattr(primitive_cli, "_post_test_email",
+                            stub_post_and_schedule_append)
+
         try:
             code, out, _ = _run_cli(
                 maildata, ["emails", "test", "--timeout", "5", "--json"],
                 capsys=capsys,
             )
         finally:
-            t.join()
+            if "t" in pending_timer:
+                pending_timer["t"].join()
 
         assert code == 0
         body = json.loads(out.strip())
@@ -1136,12 +1181,26 @@ class TestEmailsTest:
 
     def test_wait_timeout_exits_6(self, tmp_path, capsys, monkeypatch):
         # No journal append within the timeout; expect exit 6 + timeout hint.
+        # Fast-forward time so the test does not actually sleep --timeout
+        # seconds. First monotonic() call records poll_start; subsequent
+        # calls jump past the deadline so the while loop exits immediately.
         self._stub_post(200, {
             "ok": True, "tag": "ab12cd34",
             "subject": "PrimitiveMail test ab12cd34",
             "dispatched_at": "2026-04-19T20:30:00Z",
             "to": "test+ab12cd34@pink-violet.primitive.email",
         }, monkeypatch)
+        counter = {"n": 0}
+
+        def fake_monotonic():
+            counter["n"] += 1
+            # 1st: poll_start = 0. 2nd: first while check at 0 (< deadline
+            # 5, enters loop body once). 3rd+: 100 (past deadline, exits).
+            return 0.0 if counter["n"] <= 2 else 100.0
+
+        monkeypatch.setattr(primitive_cli.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(primitive_cli.time, "sleep", lambda s: None)
+
         maildata = _seed_maildata(tmp_path, [])
         code, _, err = _run_cli(
             maildata, ["emails", "test", "--timeout", "5"], capsys=capsys,

@@ -173,7 +173,7 @@ primitive emails test --no-wait         # dispatches and exits immediately
 primitive emails test --timeout 60 --json
 ```
 
-Exit codes: `0` received, `1` no subdomain claimed from this IP, `4` rate-limited (10/hour per IP), `6` dispatched but not observed within the timeout (check DNS / port 25 / container health), `7` could not reach primitive.dev.
+Exit codes: `0` received, `1` no subdomain claimed from this IP, `2` invalid CLI usage (conflicting flags or out-of-range `--timeout`), `4` rate-limited (10/hour per IP), `5` local journal unreadable while waiting, `6` dispatched but not observed within the timeout (check DNS / port 25 / container health), `7` could not reach primitive.dev.
 
 ## Configuration
 

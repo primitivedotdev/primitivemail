@@ -438,25 +438,18 @@ def cmd_emails_read(args):
         sys.stdout.buffer.flush()
         return
 
-    # Guard against a malformed `email` field. The canonical schema
-    # requires `email` to be an object and `email.parsed` to be an object
-    # (or absent). Before this check the naive `event.get("email", {})
-    # .get("parsed")` would raise AttributeError on `"email": null`,
-    # leaking a Python traceback instead of the exit-5 contract a caller
-    # expects for a malformed canonical.
-    email_obj = event.get("email")
-    if not isinstance(email_obj, dict):
-        print(
-            f"{canonical_path}: malformed canonical (email is not an object)",
-            file=sys.stderr,
-        )
-        sys.exit(5)
-    parsed = email_obj.get("parsed")
+    # The on-disk canonical is a flat object (keys: id, received_at, smtp,
+    # headers, auth, parsed, content), NOT wrapped in an `email` envelope.
+    # That wrapper only appears in the SDK's webhook-delivery shape, not
+    # in what the watcher writes to disk. `parsed` lives directly on the
+    # canonical. Validate its shape so a malformed canonical exits 5
+    # instead of raising AttributeError.
+    parsed = event.get("parsed")
     if parsed is None:
         parsed = {}
     elif not isinstance(parsed, dict):
         print(
-            f"{canonical_path}: malformed canonical (email.parsed is not an object)",
+            f"{canonical_path}: malformed canonical (parsed is not an object)",
             file=sys.stderr,
         )
         sys.exit(5)
@@ -873,11 +866,13 @@ def cmd_emails_test(args):
         print(f"journal unreadable at {journal}: {exc}", file=sys.stderr)
         sys.exit(5)
 
-    # Dispatch start wall clock for elapsed reporting. Use monotonic for
-    # the timeout budget (it cannot go backward) but wall clock for the
-    # user-facing elapsed figure so it matches "how long did this take".
-    dispatch_start = time.monotonic()
-    deadline = dispatch_start + args.timeout
+    # Use monotonic for both the timeout budget and the elapsed figure so
+    # they share a source that cannot jump under clock drift. elapsed_ms
+    # measures the wait from the start of the poll phase (after the server
+    # ack is in) until the matching journal entry lands. That is what the
+    # operator cares about: "how long from dispatch to local receipt".
+    poll_start = time.monotonic()
+    deadline = poll_start + args.timeout
 
     matched = None
     scan_offset = start_size
@@ -889,20 +884,30 @@ def cmd_emails_test(args):
             with open(journal, "rb") as fh:
                 fh.seek(scan_offset)
                 chunk = fh.read()
-                scan_offset += len(chunk)
         except OSError as exc:
             print(f"journal unreadable at {journal}: {exc}", file=sys.stderr)
             sys.exit(5)
 
-        for raw in chunk.splitlines():
+        # Only consume complete (\n-terminated) lines. A chunk can end on
+        # a partial write: the writer flushed bytes but not the terminator
+        # yet. If we advanced scan_offset past the fragment, we would
+        # emit that fragment as a "line", fail to parse it, and on the
+        # next read pick up only the remainder (also unparseable), missing
+        # the real match. Matches _emit_complete_lines in emails since
+        # --follow.
+        lines = chunk.split(b"\n")
+        complete, tail = lines[:-1], lines[-1]
+        scan_offset += len(chunk) - len(tail)
+
+        for raw in complete:
             stripped = raw.strip()
             if not stripped:
                 continue
             try:
                 entry = json.loads(stripped)
             except json.JSONDecodeError:
-                # Corrupt line in the journal. Skip; a dedicated `emails
-                # since` session is the surface that exits 5 on corruption.
+                # Corrupt line in the journal. Skip; `emails since` is
+                # the surface that exits 5 on corruption.
                 continue
             if entry.get("subject") == subject:
                 matched = entry
@@ -925,7 +930,7 @@ def cmd_emails_test(args):
             print(hint, file=sys.stderr)
         sys.exit(6)
 
-    elapsed_ms = int((time.monotonic() - dispatch_start) * 1000)
+    elapsed_ms = int((time.monotonic() - poll_start) * 1000)
     if args.json:
         print(json.dumps({
             "ok": True, "tag": tag, "subject": subject,
