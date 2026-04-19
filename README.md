@@ -19,6 +19,14 @@ One-liner on a fresh Linux VPS with a public IPv4 and inbound TCP 25 reachable:
 curl -fsSL https://get.primitive.dev | bash
 ```
 
+Prefer to read the script before running it? Download, inspect, then execute:
+
+```bash
+curl -fsSL https://get.primitive.dev -o install.sh
+less install.sh
+bash install.sh
+```
+
 ### Scripted install
 
 For agents driving the install in a single pass:
