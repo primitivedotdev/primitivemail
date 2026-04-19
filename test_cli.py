@@ -835,6 +835,23 @@ class TestEmailsCount:
         assert code == 0
         assert out.strip() == "3"
 
+    def test_count_with_domain_filter(self, tmp_path, capsys):
+        # 4 entries on ex.com, 6 on ex.net. --domain restricts the count.
+        entries = []
+        for i in range(1, 11):
+            domain = "ex.com" if i <= 4 else "ex.net"
+            entries.append((
+                _make_entry(i, f"20260101T0000{i:02d}Z-aaaaaaa{i:02d}", domain,
+                            from_addr="a@x.com",
+                            received_at=f"2026-01-01T00:00:{i:02d}Z"), None,
+            ))
+        maildata = _seed_maildata(tmp_path, entries)
+        code, out, _ = _run_cli(
+            maildata, ["emails", "count", "--domain", "ex.com"], capsys=capsys,
+        )
+        assert code == 0
+        assert out.strip() == "4"
+
     def test_count_since_wall_clock(self, tmp_path, capsys):
         entries = []
         # 5 entries on 2026-04-16, 5 on 2026-04-17.

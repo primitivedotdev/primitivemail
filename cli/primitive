@@ -379,18 +379,6 @@ def _print_list_human(rows):
         )
 
 
-def _load_canonical(path: Path):
-    """Load the canonical event at `path`. Raises ValueError on parse
-    failure or unreadable file; callers map that to exit 5."""
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: canonical event is not a JSON object")
-    return data
-
-
 def cmd_emails_read(args):
     maildata = get_maildata_path(args)
     if not maildata.exists():
@@ -427,16 +415,21 @@ def cmd_emails_read(args):
         print(f"canonical json not found: {canonical_path}", file=sys.stderr)
         sys.exit(1)
 
+    # Read the canonical exactly once and parse it once. --format json
+    # emits the raw bytes verbatim (preserving key order and whitespace);
+    # --format text/html reads fields off the parsed dict. Splitting the
+    # read between `read_text()` inside a helper and a follow-up
+    # `read_bytes()` doubled the I/O and introduced a TOCTOU window.
     try:
-        event = _load_canonical(canonical_path)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+        content = canonical_path.read_bytes()
+        event = json.loads(content)
+        if not isinstance(event, dict):
+            raise ValueError("canonical event is not a JSON object")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"{canonical_path}: {exc}", file=sys.stderr)
         sys.exit(5)
 
     if fmt == "json":
-        # Emit stored bytes verbatim (the SDK was a validator, not a
-        # re-serializer). This preserves key order and whitespace.
-        content = canonical_path.read_bytes()
         sys.stdout.buffer.write(content)
         if not content.endswith(b"\n"):
             sys.stdout.buffer.write(b"\n")
