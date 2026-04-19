@@ -151,10 +151,16 @@ Without this, TLS failures appear in `deliveries.jsonl` as `fetch failed: self-s
 ## CLI Commands
 
 ```bash
-primitive version          # Show version
-primitive emails-status    # Count emails, show latest sender/time
-primitive restart          # Reload config (only restarts changed containers)
+primitive version                  # Show version
+primitive emails status            # Count emails, show latest sender/time
+primitive emails list [opts]       # List recent emails from the journal
+primitive emails read <id> [opts]  # Read one email in json, raw, text, or html
+primitive emails since <seq>       # Stream journal entries with seq > <seq>
+primitive emails count [opts]      # Count matching emails
+primitive restart                  # Reload config (only restarts changed containers)
 ```
+
+`primitive emails-status` is kept as a hidden alias of `primitive emails status` for one release. It prints a deprecation notice and forwards. Migrate scripts to the `noun verb` form.
 
 ## Configuration
 
@@ -184,6 +190,9 @@ The Prometheus exporter (`postfix-exporter`) and log forwarder (Grafana Alloy) a
       <id>.meta.json                      # SMTP envelope + auth data
       <id>.json                           # canonical parsed email
       <id>.attachments.tar.gz             # attachment bundle (if any)
+      <id>.meta.json.failed               # watcher poison marker (errored during parse)
   .env                                    # configuration
   docker-compose.yml                      # service definitions
 ```
+
+`<id>.meta.json.failed` is a watcher-internal poison marker. Agents MUST NOT match it in their own globs and MUST NOT touch it. The journal is the source of truth for which ids exist; a file whose presence the journal does not announce should be treated as watcher state and left alone.
