@@ -23,6 +23,7 @@ import {
 	type StartedDownloadServer,
 	startDownloadServer,
 } from "./download-server.js";
+import { buildJournalEntry } from "./journal.js";
 
 const MAIL_DIR = process.env.MAIL_DIR ?? "/mail/incoming";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? "1000");
@@ -42,16 +43,6 @@ let nextSeq = 1;
 const inFlightDeliveries = new Set<Promise<void>>();
 let deliveryConfig: LoadedDeliveryConfig = { enabled: false };
 let downloadServer: StartedDownloadServer | null = null;
-
-/**
- * Extract bare email address from RFC 5322 format.
- * "Jane Doe" <jane@example.com> → jane@example.com
- */
-function extractAddress(from: string | null): string | null {
-	if (!from) return null;
-	const match = from.match(/<([^>]+)>/);
-	return match ? match[1] : from;
-}
 
 /**
  * Recover the next sequence number from the last line of the journal.
@@ -301,19 +292,15 @@ async function processEmail(metaPath: string): Promise<void> {
 	await writeFile(tmpPath, JSON.stringify(canonical, null, 2));
 	await rename(tmpPath, jsonPath);
 
-	// Append to journal
-	const journalEntry = {
+	// Append to journal. Built via the exported pure helper so its shape
+	// is unit-testable without spinning a full watcher.
+	const journalEntry = buildJournalEntry({
 		seq: nextSeq++,
-		id: canonical.id,
-		received_at: canonical.received_at,
-		domain: domainDir,
-		from: canonical.headers.from,
-		from_address: extractAddress(canonical.headers.from),
-		to: canonical.headers.to,
-		subject: canonical.headers.subject,
-		path: `${domainDir}/${base}.json`,
-		attachment_count: parsed.attachments.filter((a) => a.isDownloadable).length,
-	};
+		canonical,
+		attachments: parsed.attachments,
+		domainDir,
+		base,
+	});
 	await appendFile(JOURNAL_PATH, `${JSON.stringify(journalEntry)}\n`);
 
 	console.log(`  Wrote ${jsonPath}`);

@@ -15,12 +15,13 @@ Emails are stored as JSON files. A journal file tracks all incoming email.
 Each line is a JSON object:
 
 ```json
-{"seq":1,"id":"20260312T203149Z-14f065f1","received_at":"2026-03-12T20:31:49Z","domain":"[203.0.113.10]","from":"\"Jane\" <jane@example.com>","from_address":"jane@example.com","to":"inbox@example.com","subject":"Hello","path":"[203.0.113.10]/20260312T203149Z-14f065f1.json","attachment_count":0}
+{"seq":1,"id":"20260312T203149Z-14f065f1","received_at":"2026-03-12T20:31:49Z","domain":"[203.0.113.10]","from":"\"Jane\" <jane@example.com>","from_address":"jane@example.com","to":"inbox@example.com","subject":"Hello","path":"[203.0.113.10]/20260312T203149Z-14f065f1.json","attachment_count":1,"attachment_names":["report.pdf"]}
 ```
 
-- `seq` — monotonically increasing integer. Use this to resume after a crash.
-- `from_address` — bare email address (no display name parsing needed).
-- `path` — relative to `~/primitivemail/maildata/`. Read this file for full email content.
+- `seq` is a monotonically increasing integer. Use this to resume after a crash.
+- `from_address` is the bare email address (no display name parsing needed).
+- `path` is relative to `~/primitivemail/maildata/`. Read this file for full email content.
+- `attachment_names` is a flat list, one slot per downloadable attachment, in MIME tree order. Lets routers decide whether to fetch the full per-email JSON without a second read. Empty array when `attachment_count` is 0. A slot may be `null` if the MIME part lacked a filename; fall back to the full JSON for `content_type` or `id` in that case.
 
 ### Full Email JSON
 
