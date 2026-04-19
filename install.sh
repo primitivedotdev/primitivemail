@@ -237,7 +237,7 @@ check_docker() {
     # users down a restart-docker rabbit hole. Now: try without sudo,
     # fall back to sudo. Export DOCKER_CMD so the Python installer
     # inherits the same decision.
-    if docker info &> /dev/null 2>&1; then
+    if docker info &>/dev/null; then
         DOCKER_CMD="docker"
     else
         DOCKER_CMD="sudo docker"
@@ -255,7 +255,7 @@ check_docker() {
     # docker compose build requires buildx >= 0.17.0; Amazon Linux ships 0.12.1
     ensure_buildx
 
-    if ! $DOCKER_CMD info &> /dev/null 2>&1; then
+    if ! $DOCKER_CMD info &>/dev/null; then
         error "Docker daemon is not running"
         detail "Start Docker and try again."
         exit 1

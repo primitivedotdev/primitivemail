@@ -12,6 +12,16 @@ from installer import ui
 from installer.config import detect_public_ip
 
 
+# Docker privilege state doesn't change over the life of a process, so
+# cache the first resolution. Without this, the auto-detect fallback
+# re-spawns `docker info` on every call — up to 35+ times across the
+# wait_for_container (15) + wait_for_smtp (20) polling loops. In the
+# normal install.sh flow DOCKER_CMD is pre-set by install.sh and the
+# detection branch is never hit, so the cache is cheap insurance for
+# direct-Python callers (tests, manual runs).
+_DOCKER_CMD_CACHED: "list[str] | None" = None
+
+
 def _docker_cmd() -> list:
     """Return the `docker` invocation prefix, e.g. ['docker'] or ['sudo', 'docker'].
 
@@ -22,18 +32,21 @@ def _docker_cmd() -> list:
     is already in the group, it's 'docker'. Fall back to auto-detection if
     the env var isn't set (e.g. Python invoked directly during tests).
     """
+    global _DOCKER_CMD_CACHED
+    if _DOCKER_CMD_CACHED is not None:
+        return list(_DOCKER_CMD_CACHED)  # defensive copy so callers can .append
     env = os.environ.get("DOCKER_CMD")
     if env:
-        return env.split()
-    try:
-        r = subprocess.run(
-            ["docker", "info"], capture_output=True, timeout=5,
-        )
-        if r.returncode == 0:
-            return ["docker"]
-    except Exception:
-        pass
-    return ["sudo", "docker"]
+        _DOCKER_CMD_CACHED = env.split()
+    else:
+        try:
+            r = subprocess.run(
+                ["docker", "info"], capture_output=True, timeout=5,
+            )
+            _DOCKER_CMD_CACHED = ["docker"] if r.returncode == 0 else ["sudo", "docker"]
+        except Exception:
+            _DOCKER_CMD_CACHED = ["sudo", "docker"]
+    return list(_DOCKER_CMD_CACHED)
 
 
 def get_compose_cmd() -> list:

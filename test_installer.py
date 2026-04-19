@@ -2,6 +2,7 @@
 """Tests for installer/config.py pure functions."""
 
 import os
+import sys
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -947,6 +948,14 @@ class TestDockerCmd:
     and in the Python layer (auto-detect fallback). These tests pin that
     contract so a future refactor doesn't accidentally drop the sudo path."""
 
+    def setup_method(self):
+        # _docker_cmd caches its first resolution. Reset per-test so each
+        # test sees a clean detect path — without this, test ordering
+        # would silently affect outcomes (whichever test ran first would
+        # poison the cache for the rest).
+        from installer import server
+        server._DOCKER_CMD_CACHED = None
+
     def test_env_var_parsed_and_split(self, monkeypatch):
         from installer import server
         monkeypatch.setenv("DOCKER_CMD", "sudo docker")
@@ -993,3 +1002,107 @@ class TestDockerCmd:
 
         monkeypatch.setattr(server.subprocess, "run", boom)
         assert server._docker_cmd() == ["sudo", "docker"]
+
+    def test_result_is_cached_after_first_call(self, monkeypatch):
+        # wait_for_container/smtp call _docker_cmd up to 35 times during
+        # their polling loops. Without caching, each call re-spawns
+        # `docker info` when DOCKER_CMD isn't set — 35 extra subprocesses
+        # on every install. Cache ensures one detect, one subprocess.
+        from installer import server
+        monkeypatch.delenv("DOCKER_CMD", raising=False)
+        call_count = {"n": 0}
+
+        class FakeResult:
+            returncode = 0
+
+        def counting_run(*a, **kw):
+            call_count["n"] += 1
+            return FakeResult()
+
+        monkeypatch.setattr(server.subprocess, "run", counting_run)
+        # Call many times; subprocess.run must fire only once.
+        for _ in range(10):
+            assert server._docker_cmd() == ["docker"]
+        assert call_count["n"] == 1, f"expected 1 subprocess.run, got {call_count['n']}"
+
+    def test_returned_list_is_defensive_copy(self, monkeypatch):
+        # Callers do `_docker_cmd() + ["subcmd", ...]` — if they ever
+        # mutated the return value instead, a cached reference would get
+        # polluted. Return a fresh list each call to prevent that.
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "sudo docker")
+        a = server._docker_cmd()
+        b = server._docker_cmd()
+        assert a == b
+        assert a is not b  # different instances
+        a.append("x")
+        assert server._docker_cmd() == ["sudo", "docker"]  # still clean
+
+
+# ===========================================================================
+# run_with_progress non-TTY spinner bypass
+# ===========================================================================
+
+class TestRunWithProgressNonTty:
+    """When stderr isn't a TTY, the braille spinner can't redraw in place
+    via \\r — each frame becomes a new line and fills install logs with
+    thousands of "Building (Ns)" frames (the naive agent saw ~1100 in
+    ~62 KB). The non-TTY path emits a single start + complete line pair
+    instead. These tests lock that contract in."""
+
+    def test_non_tty_success_emits_start_and_complete(self, capsys, monkeypatch):
+        from installer import ui
+
+        # Fake stderr as non-TTY for this test only.
+        class FakeStderr:
+            def __init__(self, real):
+                self._real = real
+            def isatty(self):
+                return False
+            def write(self, s):
+                return self._real.write(s)
+            def flush(self):
+                return self._real.flush()
+
+        monkeypatch.setattr(ui.sys, "stderr", FakeStderr(sys.stderr))
+        ui.run_with_progress(["sh", "-c", "exit 0"], "Building")
+        captured = capsys.readouterr()
+        # _human_out + print go to stdout in non-JSON mode (the sys.stdout
+        # swap only happens when JSON_MODE is enabled).
+        combined = captured.out + captured.err
+        assert "Building..." in combined
+        assert "Building complete" in combined
+        # No braille spinner characters anywhere.
+        for frame_char in "\u280b\u2819\u2839\u283c\u2834":
+            assert frame_char not in combined, (
+                f"spinner frame {frame_char!r} leaked in non-TTY mode"
+            )
+
+    def test_non_tty_failure_prints_tail_and_exits(self, capsys, monkeypatch):
+        from installer import ui
+
+        class FakeStderr:
+            def __init__(self, real):
+                self._real = real
+            def isatty(self):
+                return False
+            def write(self, s):
+                return self._real.write(s)
+            def flush(self):
+                return self._real.flush()
+
+        monkeypatch.setattr(ui.sys, "stderr", FakeStderr(sys.stderr))
+        with pytest.raises(SystemExit) as exc:
+            ui.run_with_progress(
+                ["sh", "-c", "echo tail_line_one; echo tail_line_two; exit 2"],
+                "Building",
+            )
+        assert exc.value.code == 1  # run_with_progress normalizes non-zero to 1
+
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        # Failure marker + subprocess tail both written; both go to stdout
+        # here (JSON-mode sys.stdout swap isn't active outside JSON mode).
+        assert "Building failed" in combined
+        assert "tail_line_one" in combined
+        assert "tail_line_two" in combined
