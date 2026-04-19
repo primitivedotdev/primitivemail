@@ -66,14 +66,21 @@ def build_and_start(
             sys.exit(1)
     elif verbose:
         ui.step("Starting PrimitiveMail")
+        # JSON mode trumps --verbose: fd 1 must stay clean for NDJSON.
+        # Subprocesses inherit the OS-level stdout regardless of Python's
+        # sys.stdout swap, so we capture here when JSON_MODE is on.
+        # Non-JSON verbose still inherits so the operator sees build output.
         result = subprocess.run(
             compose_cmd + ["up", "-d", "--build"],
             cwd=install_dir,
+            capture_output=ui.JSON_MODE,
         )
         if result.returncode != 0:
             ui.json_event("step", name="build", status="fail")
             ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
+            if result.stderr:
+                print(result.stderr.decode("utf-8", errors="replace"))
             sys.exit(1)
     else:
         ui.step("Starting PrimitiveMail")
