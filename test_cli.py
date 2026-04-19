@@ -759,6 +759,48 @@ class TestEmailsSince:
                 proc.kill()
                 proc.wait()
 
+    def test_since_follow_corruption_reports_last_seq(self, tmp_path):
+        # Follow-mode corruption must emit `last_seq=<N>` before exiting 5,
+        # matching the exit-4 paths (rotation / truncation / disappearance).
+        # Without this, consumers parsing stderr cannot resume after a bad
+        # line and are forced to re-scan from seq=0.
+        entries = [
+            (_make_entry(1, "20260101T000001Z-aaaaaaa1", "ex.com",
+                         from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"), None),
+        ]
+        maildata = _seed_maildata(tmp_path, entries)
+        cli_path = Path(__file__).parent / "cli" / "primitive"
+        proc = subprocess.Popen(
+            [sys.executable, str(cli_path), "--path", str(maildata),
+             "emails", "since", "0", "--follow"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            # Drain the catch-up line (seq=1) so last_seq is known to be 1
+            # when the corrupt line lands.
+            ready, _, _ = select.select([proc.stdout], [], [], 3.0)
+            assert ready
+            first = proc.stdout.readline()
+            assert b'"seq": 1' in first or b'"seq":1' in first
+            # Append a corrupt line. The follow loop will read it on the
+            # next stat tick and should exit 5 with last_seq=1 on stderr.
+            with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+                fh.write("not-json\n")
+                fh.flush()
+            rc = proc.wait(timeout=5)
+            assert rc == 5
+            err = proc.stderr.read().decode("utf-8", errors="replace")
+            assert "last_seq=1" in err
+            assert "corrupt" in err.lower()
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
 
 # -----------------------------------------------------------------------------
 # `emails count` command
@@ -768,8 +810,8 @@ class TestEmailsSince:
 class TestEmailsCount:
     def test_count_happy_path(self, tmp_path, capsys):
         entries = [
-            (_make_entry(i, f"20260101T00000{i}Z-aaaaaaa{i}", "ex.com",
-                         from_addr="a@x.com", received_at=f"2026-01-01T00:00:0{i}Z"), None)
+            (_make_entry(i, f"20260101T0000{i:02d}Z-aaaaaaa{i:02d}", "ex.com",
+                         from_addr="a@x.com", received_at=f"2026-01-01T00:00:{i:02d}Z"), None)
             for i in range(1, 11)
         ]
         maildata = _seed_maildata(tmp_path, entries)
@@ -782,9 +824,9 @@ class TestEmailsCount:
         for i in range(1, 11):
             sender = "billing@stripe.com" if i <= 3 else f"u{i}@x.com"
             entries.append((
-                _make_entry(i, f"20260101T00000{i}Z-aaaaaaa{i}", "ex.com",
+                _make_entry(i, f"20260101T0000{i:02d}Z-aaaaaaa{i:02d}", "ex.com",
                             from_addr=sender,
-                            received_at=f"2026-01-01T00:00:0{i}Z"), None,
+                            received_at=f"2026-01-01T00:00:{i:02d}Z"), None,
             ))
         maildata = _seed_maildata(tmp_path, entries)
         code, out, _ = _run_cli(
@@ -796,12 +838,15 @@ class TestEmailsCount:
     def test_count_since_wall_clock(self, tmp_path, capsys):
         entries = []
         # 5 entries on 2026-04-16, 5 on 2026-04-17.
+        # Zero-pad seconds to 2 digits: `0{i}` produced 3-digit seconds for
+        # i=10 (`...:00:010Z`) which Python 3.11+ silently tolerates via the
+        # relaxed fromisoformat but older runtimes miscount or reject.
         for i in range(1, 11):
             day = "16" if i <= 5 else "17"
             entries.append((
-                _make_entry(i, f"20260417T00000{i}Z-aaaaaaa{i}", "ex.com",
+                _make_entry(i, f"20260417T0000{i:02d}Z-aaaaaaa{i:02d}", "ex.com",
                             from_addr="a@x.com",
-                            received_at=f"2026-04-{day}T12:00:0{i}Z"), None,
+                            received_at=f"2026-04-{day}T12:00:{i:02d}Z"), None,
             ))
         maildata = _seed_maildata(tmp_path, entries)
         code, out, _ = _run_cli(

@@ -551,6 +551,10 @@ def cmd_emails_since(args):
     except OSError as exc:
         print(f"follow read failed: {exc}", file=sys.stderr)
         sys.exit(4)
+    except _FollowCorruption as exc:
+        print(f"last_seq={last_seq}", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        sys.exit(5)
 
     # Per doc 07: --limit caps catch-up only; follow-mode streaming runs
     # uncapped once catch-up is complete.
@@ -578,7 +582,12 @@ def cmd_emails_since(args):
                 except OSError as exc:
                     print(f"follow read failed: {exc}", file=sys.stderr)
                     sys.exit(4)
-                size += _emit_complete_lines(chunk, _emit)
+                try:
+                    size += _emit_complete_lines(chunk, _emit)
+                except _FollowCorruption as exc:
+                    print(f"last_seq={last_seq}", file=sys.stderr)
+                    print(str(exc), file=sys.stderr)
+                    sys.exit(5)
                 if size < st.st_size:
                     # Writer appended a partial (non-\n-terminated) line.
                     # Sleep before the next stat so we don't busy-spin on
@@ -593,11 +602,25 @@ def cmd_emails_since(args):
         sys.exit(0)
 
 
+class _FollowCorruption(Exception):
+    """Corruption detected mid-follow.
+
+    Raised by `_emit_complete_lines` instead of calling sys.exit directly so
+    the caller can emit `last_seq=<N>` to stderr before exiting 5, matching
+    the convention every exit-4 path in the follow loop already uses. Without
+    this, consumers parsing `last_seq=` from stderr cannot resume after a
+    corruption event.
+    """
+
+
 def _emit_complete_lines(buf: bytes, emit):
     """Emit complete lines from buf using the given emit callable.
 
     Returns the number of bytes consumed (the offset of the last newline).
     A trailing partial line is not emitted, matching `tail -f` semantics.
+
+    Raises `_FollowCorruption` on bad JSON or a missing integer seq. The
+    caller is expected to report `last_seq` and exit 5.
     """
     consumed = 0
     lines = buf.split(b"\n")
@@ -612,12 +635,10 @@ def _emit_complete_lines(buf: bytes, emit):
         try:
             entry = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            print(f"corrupt journal line during follow: {exc}", file=sys.stderr)
-            sys.exit(5)
+            raise _FollowCorruption(f"corrupt journal line during follow: {exc}") from exc
         seq = entry.get("seq")
         if not isinstance(seq, int):
-            print("journal entry missing integer seq during follow", file=sys.stderr)
-            sys.exit(5)
+            raise _FollowCorruption("journal entry missing integer seq during follow")
         emit(raw, entry)
     return consumed
 
