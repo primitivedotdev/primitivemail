@@ -57,8 +57,9 @@ class TestInvokingUserHomeSudoAware:
         assert result == Path.home()
 
     def test_sudo_user_equals_root_does_not_self_resolve(self, monkeypatch):
-        # Edge case: someone ran `sudo -u root primitive ...`. No point
-        # re-resolving; fall through to Path.home().
+        # Edge case: root itself ran `sudo primitive` (root elevating to
+        # root via sudo, effectively a no-op). SUDO_USER=root, euid=0. No
+        # point re-resolving; fall through to Path.home().
         monkeypatch.setenv("SUDO_USER", "root")
         monkeypatch.setattr(primitive_cli.os, "geteuid", lambda: 0)
         # Even if pwd.getpwnam would succeed, we should not call it.
