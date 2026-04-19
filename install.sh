@@ -244,7 +244,13 @@ check_docker() {
     fi
     export DOCKER_CMD
 
-    if ! $DOCKER_CMD compose version &> /dev/null; then
+    # Prefer the v2 plugin (`docker compose ...`); fall back to the v1
+    # legacy binary (`docker-compose ...`) on boxes where it's still the
+    # only option. server.py's get_compose_cmd does the same fallback, so
+    # keep them in sync. Modern get.docker.com installs ship the v2
+    # plugin, so the fallback only kicks in on pre-existing installs
+    # from distro packages (e.g. Ubuntu's `apt-get install docker-compose`).
+    if ! $DOCKER_CMD compose version &>/dev/null && ! ${DOCKER_CMD}-compose version &>/dev/null; then
         error "Docker Compose is not available"
         detail "This usually means Docker installed without the compose plugin."
         detail "Try: sudo apt-get install docker-compose-plugin"
