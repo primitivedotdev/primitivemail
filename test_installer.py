@@ -483,6 +483,52 @@ class TestConfigSummaryEventWebhook:
 
 
 # ===========================================================================
+# Observability disclosure in config summary
+# ===========================================================================
+
+class TestConfigSummaryObservability:
+    """Naive-agent feedback: an Alloy/postfix-exporter telemetry stack used
+    to start unconditionally on every install with no opt-out flag and no
+    mention in the install summary. Phase 1 of the fix gates those services
+    behind a compose profile AND surfaces the state in the install summary.
+    These tests pin the disclosure lines so a refactor cannot silently drop
+    the remediation text."""
+
+    def test_disclosure_disabled_by_default(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        text = "\n".join(lines)
+        assert "Observability:" in text
+        assert "disabled (default)" in text
+        # Remediation hint is the whole point of the disclosure.
+        assert "COMPOSE_PROFILES=observability" in text
+        assert "primitive restart" in text
+        # And we must not claim it's enabled.
+        assert "enabled (Alloy + postfix-exporter)" not in text
+
+    def test_disclosure_enabled_when_profile_active(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            observability_enabled=True,
+        )
+        text = "\n".join(lines)
+        assert "Observability:" in text
+        assert "enabled (Alloy + postfix-exporter)" in text
+        # When enabled, the remediation block is silenced.
+        assert "disabled (default)" not in text
+        assert "COMPOSE_PROFILES=observability" not in text
+
+
+# ===========================================================================
 # JSON output mode
 # ===========================================================================
 
@@ -863,6 +909,52 @@ class TestParseArgsImplications:
         assert args.no_prompt is False
         assert args.claim_subdomain is False
         assert args.json_output is False
+
+
+# ===========================================================================
+# _observability_is_enabled helper
+# ===========================================================================
+
+class TestObservabilityEnabledDetection:
+    """The installer picks up pre-set COMPOSE_PROFILES from the environment
+    so a user who set it before running install.sh gets truthful summary
+    output. Phase 1 installs never write COMPOSE_PROFILES from the cfg,
+    so fresh installs always resolve to False."""
+
+    def test_fresh_install_is_disabled(self, monkeypatch):
+        from installer.main import _observability_is_enabled
+        monkeypatch.delenv("COMPOSE_PROFILES", raising=False)
+        assert _observability_is_enabled({}) is False
+
+    def test_env_profiles_including_observability_is_enabled(self, monkeypatch):
+        from installer.main import _observability_is_enabled
+        monkeypatch.setenv("COMPOSE_PROFILES", "observability")
+        assert _observability_is_enabled({}) is True
+
+    def test_env_profiles_comma_separated_is_parsed(self, monkeypatch):
+        # Users can stack profiles. Ours must survive alongside custom ones.
+        from installer.main import _observability_is_enabled
+        monkeypatch.setenv("COMPOSE_PROFILES", "my-custom,observability,another")
+        assert _observability_is_enabled({}) is True
+
+    def test_env_profiles_without_observability_is_disabled(self, monkeypatch):
+        from installer.main import _observability_is_enabled
+        monkeypatch.setenv("COMPOSE_PROFILES", "my-custom,another")
+        assert _observability_is_enabled({}) is False
+
+    def test_env_profile_whitespace_tolerated(self, monkeypatch):
+        # Operator-edited .env often has stray spaces. Be tolerant.
+        from installer.main import _observability_is_enabled
+        monkeypatch.setenv("COMPOSE_PROFILES", "  observability  ,  extra  ")
+        assert _observability_is_enabled({}) is True
+
+    def test_cfg_value_overrides_env(self, monkeypatch):
+        # When the cfg dict carries an explicit value (Phase 2 territory),
+        # prefer it over the env so the installer can surface what it
+        # just wrote even if an ambient env var says otherwise.
+        from installer.main import _observability_is_enabled
+        monkeypatch.setenv("COMPOSE_PROFILES", "observability")
+        assert _observability_is_enabled({"compose_profiles": "my-custom"}) is False
 
 
 # ===========================================================================
