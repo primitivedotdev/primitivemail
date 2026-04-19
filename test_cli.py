@@ -846,22 +846,25 @@ class TestEmailsRead:
         assert "ambiguous" in err.lower()
 
     def test_read_prefix_wins_over_digits_as_seq(self, seeded, capsys):
-        # Canonical ids start with a date, so a digit-only selector can
-        # legitimately mean "prefix-match on the timestamp". --prefix is an
-        # explicit opt-in; it MUST take precedence over the digits-as-seq
-        # shortcut, otherwise `--prefix 20260417` silently becomes a seq
-        # lookup for 20 million and the flag appears dropped. id_a is
-        # "20260417T101201Z-aaaaaaaa"; the prefix "20260417T101201" is
-        # unique.
-        maildata, id_a, _ = seeded
-        code, out, _ = _run_cli(
-            maildata,
-            ["emails", "read", "--prefix", "20260417T101201", "--format", "json"],
-            capsys=capsys,
+        # --prefix is an explicit opt-in. It MUST take precedence over the
+        # digits-as-seq shortcut, or `emails read --prefix 20260417`
+        # silently becomes a seq lookup for 20,260,417. The earlier
+        # version of this test used "20260417T101201" which contains a
+        # T, so isdigit() was already false and the test would have
+        # passed even with the bug still present.
+        #
+        # Use a pure-digit selector. Both seeded ids start with the date
+        # "20260417", so --prefix 20260417 hits the ambiguous path and
+        # exits 3. A regression that routes digits to _resolve_seq would
+        # instead return exit 1 ("seq not found") because 20,260,417
+        # does not exist as a seq. Exit 3 vs exit 1 directly proves the
+        # precedence.
+        maildata, _, _ = seeded
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", "--prefix", "20260417"], capsys=capsys,
         )
-        assert code == 0
-        event = json.loads(out)
-        assert event["id"] == id_a
+        assert code == 3, f"expected exit 3 (ambiguous prefix), got {code}: {err}"
+        assert "ambiguous" in err.lower()
 
 
 # -----------------------------------------------------------------------------
