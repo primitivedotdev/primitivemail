@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
+import type { EmailAuth } from "@primitivedotdev/sdk/contract";
 import {
 	bundleAttachments,
 	parseEmailWithAttachments,
@@ -16,15 +17,31 @@ import {
 	toParsedDataComplete,
 } from "@primitivedotdev/sdk/parser";
 
+import { type LoadedDeliveryConfig, loadDeliveryConfig } from "./config.js";
+import { deliverEvent } from "./delivery.js";
+import {
+	type StartedDownloadServer,
+	startDownloadServer,
+} from "./download-server.js";
+
 const MAIL_DIR = process.env.MAIL_DIR ?? "/mail/incoming";
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? "1000");
 const HEARTBEAT_PATH = "/tmp/watcher-heartbeat";
 const BATCH_LIMIT = Number(process.env.BATCH_LIMIT ?? "50");
 const JOURNAL_PATH = join(MAIL_DIR, "emails.jsonl");
+const DELIVERIES_PATH = join(MAIL_DIR, "deliveries.jsonl");
+// Time to let in-flight deliveries finish naturally on SIGTERM before we
+// exit. One-shot deliveries typically complete well under this; this is
+// just politeness.
+const SHUTDOWN_GRACE_MS = Number(process.env.SHUTDOWN_GRACE_MS ?? "3000");
 
 let shuttingDown = false;
 let processing = false;
 let nextSeq = 1;
+
+const inFlightDeliveries = new Set<Promise<void>>();
+let deliveryConfig: LoadedDeliveryConfig = { enabled: false };
+let downloadServer: StartedDownloadServer | null = null;
 
 /**
  * Extract bare email address from RFC 5322 format.
@@ -70,34 +87,125 @@ interface MetaJson {
 	};
 }
 
+/** Valid SPF results per the schema. Unknown values coerce to "none". */
+const SPF_RESULTS = new Set([
+	"pass",
+	"fail",
+	"softfail",
+	"neutral",
+	"none",
+	"temperror",
+	"permerror",
+] as const);
+type SpfResult = EmailAuth["spf"];
+
+const DMARC_RESULTS = new Set([
+	"pass",
+	"fail",
+	"none",
+	"temperror",
+	"permerror",
+] as const);
+type DmarcResult = EmailAuth["dmarc"];
+
+const DMARC_POLICIES = new Set(["reject", "quarantine", "none"] as const);
+type DmarcPolicy = NonNullable<EmailAuth["dmarcPolicy"]>;
+
+const DKIM_RESULTS = new Set([
+	"pass",
+	"fail",
+	"temperror",
+	"permerror",
+] as const);
+type DkimResult = EmailAuth["dkimSignatures"][number]["result"];
+
 /**
- * Build the canonical auth object from .meta.json auth data.
- * Maps the milter's flat dkim/dkim_domains into the richer dkim_signatures array.
+ * Map the milter's flat `.meta.json` auth fields into the SDK's `EmailAuth`
+ * shape in a single pass. This is the one and only auth adapter — the
+ * canonical JSON on disk stores a snake_case serialization of the SAME
+ * `EmailAuth` object (written at `processEmail` time), not a separate
+ * representation, so there's nothing downstream to re-translate.
+ *
+ * `dmarcSpfAligned` and the `Strict` flags require milter-side data that
+ * isn't exposed today; they default to `false`. `dmarcDkimAligned` is
+ * derived from the per-signature `aligned` flags (DMARC passes iff at
+ * least one DKIM signature is aligned with the RFC5322.From domain).
  */
-function buildAuth(auth: MetaJson["auth"]) {
-	const result: Record<string, unknown> = {
-		spf: auth.spf,
+export function emailAuthFromMilter(auth: MetaJson["auth"]): EmailAuth {
+	const spfRaw = typeof auth.spf === "string" ? auth.spf.toLowerCase() : "none";
+	const spf: SpfResult = (SPF_RESULTS as Set<string>).has(spfRaw)
+		? (spfRaw as SpfResult)
+		: "none";
+
+	const dmarcRaw =
+		typeof auth.dmarc === "string" ? auth.dmarc.toLowerCase() : "none";
+	const dmarc: DmarcResult = (DMARC_RESULTS as Set<string>).has(dmarcRaw)
+		? (dmarcRaw as DmarcResult)
+		: "none";
+
+	const policyRaw = auth.dmarc_policy?.toLowerCase() ?? null;
+	const dmarcPolicy: DmarcPolicy | null =
+		policyRaw && (DMARC_POLICIES as Set<string>).has(policyRaw)
+			? (policyRaw as DmarcPolicy)
+			: null;
+
+	const dmarcFromDomain = auth.dmarc_from_domain ?? null;
+
+	const dkimRaw = auth.dkim?.toLowerCase();
+	const dkimResult: DkimResult =
+		dkimRaw && (DKIM_RESULTS as Set<string>).has(dkimRaw)
+			? (dkimRaw as DkimResult)
+			: "permerror";
+
+	const dkimSignatures = (auth.dkim_domains ?? []).map((domain) => ({
+		domain,
+		selector: null,
+		result: dkimResult,
+		// DMARC DKIM alignment requires BOTH (a) the signing domain matches
+		// the RFC5322.From domain AND (b) the signature itself verified.
+		// A failed or erroring signature from an aligned domain MUST NOT be
+		// reported as aligned — a receiver gating security decisions on
+		// `dmarcDkimAligned` would otherwise see a false positive.
+		aligned:
+			dkimResult === "pass" &&
+			!!dmarcFromDomain &&
+			domain.toLowerCase() === dmarcFromDomain.toLowerCase(),
+		keyBits: null,
+		algo: null,
+	}));
+
+	return {
+		spf,
+		dmarc,
+		dmarcPolicy,
+		dmarcFromDomain,
+		dmarcSpfAligned: false,
+		dmarcDkimAligned: dkimSignatures.some((s) => s.aligned),
+		dmarcSpfStrict: false,
+		dmarcDkimStrict: false,
+		dkimSignatures,
 	};
+}
 
-	// Build dkim_signatures array from milter's flat data
-	if (auth.dkim !== undefined && auth.dkim_domains) {
-		result.dkim_signatures = auth.dkim_domains.map((domain) => ({
-			domain,
-			result: auth.dkim,
-			// Aligned if the DKIM domain matches the DMARC from_domain
-			aligned: auth.dmarc_from_domain
-				? domain.toLowerCase() === auth.dmarc_from_domain.toLowerCase()
-				: false,
-		}));
-	}
-
-	if (auth.dmarc !== undefined) {
-		result.dmarc = auth.dmarc;
-		result.dmarc_policy = auth.dmarc_policy ?? null;
-		result.dmarc_from_domain = auth.dmarc_from_domain ?? null;
-	}
-
-	return result;
+/**
+ * Serialize an `EmailAuth` object into the snake_case subset we write to
+ * canonical JSON on disk. Kept minimal (only fields the milter populates)
+ * so the on-disk shape is a stable debug-readable view, not a duplicate
+ * of the full SDK type. External readers of `<id>.json` should continue
+ * to rely on the managed webhook payload for the canonical auth shape.
+ */
+function canonicalAuth(auth: EmailAuth): Record<string, unknown> {
+	return {
+		spf: auth.spf,
+		dmarc: auth.dmarc,
+		dmarc_policy: auth.dmarcPolicy,
+		dmarc_from_domain: auth.dmarcFromDomain,
+		dkim_signatures: auth.dkimSignatures.map((s) => ({
+			domain: s.domain,
+			result: s.result,
+			aligned: s.aligned,
+		})),
+	};
 }
 
 /**
@@ -139,24 +247,29 @@ async function processEmail(metaPath: string): Promise<void> {
 	// Parse the email using the SDK
 	const parsed = await parseEmailWithAttachments(emlBuffer);
 
-	// Bundle attachments if any are downloadable
+	// Bundle attachments if any are downloadable. The canonical JSON's
+	// `attachments_download_url` is null on disk — the real URL is minted
+	// at delivery time by the watcher's download server with a signed
+	// token, and isn't knowable at canonical-write time. The tar.gz path
+	// is determined entirely by the filename convention
+	// (<domain>/<id>.attachments.tar.gz) if any external reader needs it.
 	const downloadable = parsed.attachments.filter((a) => a.isDownloadable);
-	let attachmentsDownloadUrl: string | null = null;
+	const hasAttachments = downloadable.length > 0;
 
-	if (downloadable.length > 0) {
+	if (hasAttachments) {
 		const bundle = await bundleAttachments(downloadable);
 		if (!bundle) throw new Error("Failed to bundle attachments");
 		// Atomic write: tmp then rename
 		const tarTmpPath = `${tarGzPath}.tmp`;
 		await writeFile(tarTmpPath, bundle.tarGzBuffer);
 		await rename(tarTmpPath, tarGzPath);
-		attachmentsDownloadUrl = `${domainDir}/${base}.attachments.tar.gz`;
 		console.log(`  Bundled ${downloadable.length} attachments -> ${tarGzPath}`);
 	}
 
 	// Map parser output to canonical format using SDK mapping functions
 	const headers = toCanonicalHeaders(parsed);
-	const parsedData = toParsedDataComplete(parsed, attachmentsDownloadUrl);
+	const parsedData = toParsedDataComplete(parsed, null);
+	const auth = emailAuthFromMilter(meta.auth);
 
 	// Compute content metadata
 	const emlSha256 = createHash("sha256").update(emlBuffer).digest("hex");
@@ -180,7 +293,7 @@ async function processEmail(metaPath: string): Promise<void> {
 			size_bytes: emlBuffer.length,
 			sha256: emlSha256,
 		},
-		auth: buildAuth(meta.auth),
+		auth: canonicalAuth(auth),
 	};
 
 	// Atomic write: .tmp then rename
@@ -204,6 +317,30 @@ async function processEmail(metaPath: string): Promise<void> {
 	await appendFile(JOURNAL_PATH, `${JSON.stringify(journalEntry)}\n`);
 
 	console.log(`  Wrote ${jsonPath}`);
+
+	// Fire and forget — delivery runs outside the scan loop. Tombstone
+	// entries (future `type` field) are skipped preemptively; none exist yet.
+	if (deliveryConfig.enabled) {
+		const config = deliveryConfig;
+		const promise = deliverEvent({
+			config,
+			canonicalJsonPath: jsonPath,
+			emlPath,
+			auth,
+			id: canonical.id,
+			seq: journalEntry.seq,
+			domain: domainDir,
+			deliveriesJsonlPath: DELIVERIES_PATH,
+		})
+			.catch((err) => {
+				console.error(`  delivery error for ${canonical.id}: ${err}`);
+			})
+			.then(() => undefined);
+		inFlightDeliveries.add(promise);
+		promise.finally(() => {
+			inFlightDeliveries.delete(promise);
+		});
+	}
 }
 
 /**
@@ -266,19 +403,96 @@ console.log(`  Mail dir: ${MAIL_DIR}`);
 console.log(`  Poll interval: ${POLL_INTERVAL_MS}ms`);
 console.log(`  Journal seq: ${nextSeq}`);
 
-// Graceful shutdown: let current processing finish, then exit
+try {
+	deliveryConfig = loadDeliveryConfig(process.env);
+} catch (err) {
+	console.error(
+		`Invalid delivery configuration: ${err instanceof Error ? err.message : String(err)}`,
+	);
+	process.exit(1);
+}
+
+if (deliveryConfig.enabled) {
+	console.log(
+		`  Delivery enabled: endpointId=${deliveryConfig.endpointId} timeoutMs=${deliveryConfig.timeoutMs}`,
+	);
+	console.log(
+		`  Download server: port=${deliveryConfig.downloadServerPort} baseUrl=${deliveryConfig.downloadBaseUrl}`,
+	);
+	downloadServer = await startDownloadServer({
+		port: deliveryConfig.downloadServerPort,
+		secret: deliveryConfig.webhookSecret,
+		mailDir: MAIL_DIR,
+	});
+
+	// Cross-check: the configured base URL's port should match the port
+	// the server actually listens on. Mismatches are a silent misconfig —
+	// the watcher binds one port and embeds URLs pointing at another, so
+	// every download URL 404s at the receiver. Warn loudly at startup;
+	// don't fail, since an operator may intentionally route via proxy.
+	try {
+		const parsedBase = new URL(deliveryConfig.downloadBaseUrl);
+		// `URL.port` is empty string when the URL uses the protocol's default
+		// port (80 for http, 443 for https). Resolve the effective port so an
+		// operator who set `DOWNLOAD_BASE_URL=http://host` (implicit port 80)
+		// with `DOWNLOAD_SERVER_PORT=4001` still gets warned about the mismatch.
+		const basePort =
+			parsedBase.port || (parsedBase.protocol === "https:" ? "443" : "80");
+		const expectedPort = String(deliveryConfig.downloadServerPort);
+		if (basePort !== expectedPort) {
+			console.warn(
+				`  WARNING: DOWNLOAD_BASE_URL port (${basePort}) differs from DOWNLOAD_SERVER_PORT (${expectedPort}). If no reverse proxy is rewriting, download URLs in webhooks will be unreachable.`,
+			);
+		}
+	} catch {
+		// URL already validated at config load; swallow.
+	}
+} else {
+	console.log("  Delivery disabled (EVENT_WEBHOOK_URL not set)");
+}
+
+let shutdownStarted = false;
+async function shutdownAndExit(code: number): Promise<never> {
+	// Re-entry guard: SIGTERM + SIGINT arriving together, or the poll loop
+	// detecting `shuttingDown` at the same moment a signal handler fires,
+	// could otherwise invoke this twice. Second caller hangs until the
+	// first one's `process.exit` tears the event loop down.
+	if (shutdownStarted) {
+		await new Promise<never>(() => {});
+		throw new Error("unreachable");
+	}
+	shutdownStarted = true;
+
+	// One-shot deliveries usually finish in well under SHUTDOWN_GRACE_MS.
+	// If any are still in-flight after the grace period we exit anyway —
+	// the journal entry persists, so the operator can re-post manually.
+	if (inFlightDeliveries.size > 0) {
+		await Promise.race([
+			Promise.all(inFlightDeliveries),
+			new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS)),
+		]);
+	}
+	if (downloadServer) {
+		await downloadServer.close().catch(() => {});
+	}
+	process.exit(code);
+}
+
+// Graceful shutdown: let current processing finish, drain deliveries, then exit.
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
 	process.on(signal, () => {
 		console.log(`Received ${signal}, shutting down gracefully...`);
 		shuttingDown = true;
-		if (!processing) process.exit(0);
+		if (!processing) {
+			void shutdownAndExit(0);
+		}
 	});
 }
 
 // Poll loop using setTimeout to prevent overlapping cycles
 async function loop() {
 	if (shuttingDown) {
-		process.exit(0);
+		await shutdownAndExit(0);
 		return;
 	}
 	processing = true;
@@ -290,7 +504,7 @@ async function loop() {
 	await writeFile(HEARTBEAT_PATH, Date.now().toString()).catch(() => {});
 	processing = false;
 	if (shuttingDown) {
-		process.exit(0);
+		await shutdownAndExit(0);
 		return;
 	}
 	setTimeout(loop, POLL_INTERVAL_MS);

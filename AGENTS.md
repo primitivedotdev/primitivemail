@@ -67,6 +67,86 @@ done
 cat ~/primitivemail/maildata/<path from journal line>
 ```
 
+## Receiving webhooks
+
+Two consumption models, pick one.
+
+**Pull** (`tail -f emails.jsonl`, above) is the default and works with zero config.
+
+**Push** — new email triggers a signed HTTP POST to a URL you control. Set two env vars in your `~/primitivemail/.env` and `primitive restart`:
+
+```
+EVENT_WEBHOOK_URL=http://host.docker.internal:3000/hook   # dev: receiver runs on host
+EVENT_WEBHOOK_SECRET=<random-64-hex>                       # HMAC signing key
+```
+
+The watcher signs each payload with HMAC-SHA256 and POSTs it to your URL. The payload is byte-identical to what managed Primitive produces — verify it with `@primitivedotdev/sdk`'s `handleWebhook`. The **raw request body** is what's signed; use `express.raw({ type: "application/json" })`, NOT `express.json()`, or the signature won't verify.
+
+Minimal Express receiver:
+
+```js
+const express = require("express");
+const { handleWebhook, PrimitiveWebhookError } = require("@primitivedotdev/sdk");
+
+const app = express();
+app.post("/hook", express.raw({ type: "application/json" }), (req, res) => {
+	try {
+		const event = handleWebhook({
+			body: req.body,
+			headers: req.headers,
+			secret: process.env.EVENT_WEBHOOK_SECRET,
+		});
+		console.log("received:", event.email.headers.from, event.email.headers.subject);
+		res.status(200).send();
+	} catch (err) {
+		if (err instanceof PrimitiveWebhookError) return res.status(400).send(err.code);
+		res.status(500).send();
+	}
+});
+
+app.listen(3000);
+```
+
+Response contract: plain 2xx on success. Any non-2xx (or network failure) is logged as a failed delivery in `deliveries.jsonl` — **no retries**. Redirects (3xx) are never followed; point `EVENT_WEBHOOK_URL` at the final destination.
+
+**What the journal preserves (and what it doesn't).** `emails.jsonl` is the source of truth for the **email** — envelope, headers, body, attachments. It's not a record of the signed wire payload we POSTed. If you want to re-deliver a failed event, don't copy the failure line and expect to replay the exact same bytes — signatures are timestamped, download URLs carry 15-minute tokens that have long since expired. Instead: look up the email by `id` in the journal, regenerate the event with a tool that calls `buildEventFromParsedData` from `@primitivedotdev/sdk/contract`, sign it with your `EVENT_WEBHOOK_SECRET`, POST it. A `primitive replay <id>` CLI that does exactly this is on the roadmap.
+
+Large emails (>256 KB) are not embedded inline. The payload's `email.content.download.url` points at the watcher's local download server (exposed on `DOWNLOAD_SERVER_PORT`, default 4001) and carries a 15-minute signed token. Fetching the URL is just `await fetch(event.email.content.download.url)` — no extra auth plumbing needed.
+
+Backlog behavior: turning on `EVENT_WEBHOOK_URL` does NOT replay historical emails. Deliveries fire only for emails processed after the watcher restarts. To replay history, iterate `emails.jsonl` yourself.
+
+Every completed delivery is logged to `~/primitivemail/maildata/deliveries.jsonl`. Rotate it yourself (logrotate / scripts) if your volume warrants it.
+
+**Shutdown gap.** If the watcher receives SIGTERM while a delivery is in flight, it has a 3-second grace window to finish; anything still running after that is abandoned without a log line. A journal entry in `emails.jsonl` without a corresponding row in `deliveries.jsonl` therefore means "status unknown" — either the delivery is still in-progress (check back in a moment) or it was cut short by a restart. The journal is authoritative; re-post from the journal if you need guaranteed delivery.
+
+**Endpoint ID rotation.** Each event carries `delivery.endpoint_id` derived from `sha256(EVENT_WEBHOOK_URL + EVENT_WEBHOOK_SECRET)`. Changing either value changes the ID — receivers doing idempotency keyed on `endpoint_id` will see a rotated deployment as a new endpoint. Plan secret rotations accordingly.
+
+**Migrating between self-host and managed Primitive.** Receiver code that verifies with `handleWebhook({ body, headers, secret })` works identically against both — zero changes. Three gotchas if your receiver does anything beyond that:
+
+1. If you hardcoded the download-URL origin (e.g. in a CSP, allowlist, or link-rewriter), the origin flips from `http://localhost:4001/...` (self-host) to an HTTPS managed origin. Use `event.email.content.download.url` verbatim instead.
+2. If you use `delivery.endpoint_id` as an idempotency key, expect every event to look like a new endpoint after cutover — same root cause as rotation above.
+3. If you're verifying download URLs off-band with `verifyDownloadToken`, the audience is `"primitive:raw-download"` / `"primitive:attachments-download"` on both products as of SDK 0.5.1.
+
+**TLS for self-signed or internal CAs.** The watcher's outbound fetch uses Node's default TLS. If your receiver is behind a corporate/internal CA that Node doesn't trust out of the box, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` in the watcher container's environment and mount the CA bundle in. Example addition to `docker-compose.yml`:
+
+```yaml
+watcher:
+  environment:
+    NODE_EXTRA_CA_CERTS: /etc/ssl/certs/my-ca.pem
+  volumes:
+    - ./my-ca.pem:/etc/ssl/certs/my-ca.pem:ro
+```
+
+Without this, TLS failures appear in `deliveries.jsonl` as `fetch failed: self-signed certificate in certificate chain` / `unable to verify the first certificate`. No in-app escape hatch is provided — this is the right lever.
+
+### Optional env vars
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EVENT_WEBHOOK_TIMEOUT_MS` | `10000` | Per-request timeout |
+| `DOWNLOAD_SERVER_PORT` | `4001` | Port the watcher binds its download server to |
+| `DOWNLOAD_BASE_URL` | `http://localhost:4001` | Base URL embedded in `download.url`. Override in sibling-container topologies to e.g. `http://watcher:4001` |
+
 ## CLI Commands
 
 ```bash
@@ -93,6 +173,7 @@ After editing `.env`, run `primitive restart` to apply changes.
 ~/primitivemail/
   maildata/
     emails.jsonl                          # journal (append-only)
+    deliveries.jsonl                      # webhook delivery outcomes (only when push is enabled)
     <domain>/
       <id>.eml                            # raw email
       <id>.meta.json                      # SMTP envelope + auth data
