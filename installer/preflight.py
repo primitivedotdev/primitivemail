@@ -62,9 +62,13 @@ def check_ram() -> dict:
 
 def check_disk(target: "str | None" = None) -> dict:
     target = target or os.environ.get("PRIMITIVEMAIL_DIR", "/")
+    # Normalize first — a bare relative name like "primitivemail" would
+    # otherwise dirname() to "" and fall through to the "/" fallback,
+    # checking the root filesystem instead of the intended target.
+    target = os.path.abspath(target)
     # Walk up to an ancestor that exists — install dir may not be created yet.
     probe = target
-    while probe and probe != "/" and not os.path.exists(probe):
+    while probe != "/" and not os.path.exists(probe):
         probe = os.path.dirname(probe)
     if not os.path.exists(probe):
         probe = "/"
@@ -121,6 +125,10 @@ def check_port_25() -> dict:
 
 def check_outbound_https() -> dict:
     # Hosts the installer needs to reach during build + run.
+    # We care about connectivity, not endpoint behavior — a 403 on
+    # api.cloudflare.com means TCP+TLS worked and the host is reachable.
+    # Treat HTTPError (non-2xx response) as reachable; only transport-level
+    # failures (DNS, connect, TLS, timeout) count as unreachable.
     targets = [
         "https://github.com",
         "https://primitive.dev",
@@ -128,7 +136,15 @@ def check_outbound_https() -> dict:
     ]
     unreachable = []
     for url in targets:
-        if _http_get(url, timeout=5.0) is None:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "primitivemail-preflight/1"}
+            )
+            urllib.request.urlopen(req, timeout=5.0).close()
+        except urllib.error.HTTPError:
+            # Server answered us — non-2xx doesn't mean unreachable.
+            pass
+        except Exception:
             unreachable.append(url)
     return {
         "status": "ok" if not unreachable else "fail",

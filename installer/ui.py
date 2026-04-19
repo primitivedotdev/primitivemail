@@ -21,6 +21,12 @@ NC = "\033[0m"
 # NDJSON events go through the saved original stdout in json_event().
 JSON_MODE = False
 _JSON_STDOUT = None  # original sys.stdout, captured at enable time
+# Serializes concurrent writes to _JSON_STDOUT. CPython's io.TextIOWrapper +
+# BufferedWriter + GIL happen to make short single-line writes atomic today,
+# but that's implementation detail. This lock makes thread-safety explicit
+# for the ticker thread / main thread pair and survives future runtime
+# changes (free-threaded Python etc).
+_JSON_LOCK = threading.Lock()
 
 
 def enable_json_mode() -> None:
@@ -47,8 +53,10 @@ def json_event(event: str, **fields) -> None:
     if not JSON_MODE or _JSON_STDOUT is None:
         return
     payload = {"event": event, **fields}
-    _JSON_STDOUT.write(_json.dumps(payload, separators=(",", ":")) + "\n")
-    _JSON_STDOUT.flush()
+    line = _json.dumps(payload, separators=(",", ":")) + "\n"
+    with _JSON_LOCK:
+        _JSON_STDOUT.write(line)
+        _JSON_STDOUT.flush()
 
 
 class HeartbeatTicker:
@@ -188,10 +196,12 @@ def run_with_progress(
         else:
             lines = output.decode("utf-8", errors="replace").splitlines()
             tail = "\n".join(lines[-20:])
-            # Close the outer step-start event first so agents consuming the
-            # NDJSON stream see a terminal fail before the error detail.
+            # step/fail is emitted by the caller AFTER any surrounding
+            # HeartbeatTicker has been joined — doing it here would race a
+            # trailing heartbeat, and in build_and_start's case would also
+            # duplicate the event since start_server catches SystemExit and
+            # emits step/fail itself. Emit the error detail only.
             fail_step = step_name or label.lower()
-            json_event("step", name=fail_step, status="fail")
             json_event("error", step=fail_step, message=f"{label} failed", tail=tail)
             error(f"{label} failed")
             sys.exit(1)

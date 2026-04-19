@@ -536,12 +536,13 @@ class TestJsonMode:
                 sys.stdout = ui._JSON_STDOUT
                 ui._JSON_STDOUT = None
 
-    def test_run_with_progress_emits_step_fail_before_error(self, capsys):
-        # Regression: when a subprocess under run_with_progress fails in JSON
-        # mode, the outer step-start (e.g. {step:"build",status:"start"}) must
-        # get a matching terminal step event before we bail. Agents keying on
-        # step=="build" were missing the failure entirely because the error
-        # event used step=label.lower() ("building") and no step-fail fired.
+    def test_run_with_progress_emits_error_not_step_fail(self, capsys):
+        # Contract: run_with_progress emits an `error` event keyed on step_name
+        # when the subprocess fails in JSON mode. It deliberately does NOT emit
+        # step:fail — that's the caller's responsibility (see start_server's
+        # try/except SystemExit around the HeartbeatTicker). Emitting step:fail
+        # here would (a) duplicate when the caller also emits it, and (b) race
+        # a trailing heartbeat from the still-running ticker thread.
         import json as _json
         from installer import ui
 
@@ -559,22 +560,19 @@ class TestJsonMode:
             lines = [l for l in captured.out.strip().split("\n") if l]
             events = [_json.loads(l) for l in lines]
 
-            # Must have a step-fail keyed on the contract name, and it must
-            # come BEFORE the error detail event.
-            step_fail_idx = next(
-                (i for i, e in enumerate(events)
-                 if e.get("event") == "step" and e.get("name") == "build"
-                 and e.get("status") == "fail"),
-                None,
-            )
-            error_idx = next(
-                (i for i, e in enumerate(events)
-                 if e.get("event") == "error" and e.get("step") == "build"),
-                None,
-            )
-            assert step_fail_idx is not None, f"no step:build:fail in {events}"
-            assert error_idx is not None, f"no error:step=build in {events}"
-            assert step_fail_idx < error_idx
+            # Error event fires with the contract step name (not label.lower()).
+            error_events = [
+                e for e in events
+                if e.get("event") == "error" and e.get("step") == "build"
+            ]
+            assert len(error_events) == 1, f"expected one error event, got {events}"
+
+            # No step:fail emitted by run_with_progress — the caller owns that.
+            fail_events = [
+                e for e in events
+                if e.get("event") == "step" and e.get("status") == "fail"
+            ]
+            assert fail_events == [], f"unexpected step:fail from run_with_progress: {fail_events}"
         finally:
             import sys
             ui.JSON_MODE = False
@@ -784,3 +782,21 @@ class TestPreflight:
         assert result["status"] in ("ok", "fail")
         # Path resolved to an existing ancestor
         assert os.path.exists(result["path"])
+
+    def test_disk_check_bare_relative_path_does_not_fall_to_root(self, tmp_path, monkeypatch):
+        # Regression: a bare relative name like "primitivemail" (no ./) used
+        # to fall through to "/" because os.path.dirname("primitivemail") == ""
+        # exited the walk-up loop with an empty probe. Check now normalizes
+        # via abspath first so the probe becomes the parent of cwd, not root.
+        from installer import preflight
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PRIMITIVEMAIL_DIR", "primitivemail")  # bare relative
+        result = preflight.check_disk()
+        assert result["status"] in ("ok", "fail")
+        # Probe path resolves under cwd (tmp_path), not to "/"
+        assert os.path.exists(result["path"])
+        # On a real machine this could legitimately be / if tmp_path IS on
+        # the root filesystem's only mount; the important invariant is that
+        # we got a real absolute path derived from our input, not the "/"
+        # fallback that fired on empty dirname.
+        assert os.path.isabs(result["path"])

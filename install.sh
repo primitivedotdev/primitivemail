@@ -368,13 +368,17 @@ run_preflight() {
     # curl|bash path: no checkout available — fetch the module directly.
     local tmp_preflight
     tmp_preflight=$(mktemp)
+    # Plain `exit` triggers the trap; `exec` would replace the shell before
+    # EXIT fires, leaving the tempfile behind. So run python non-exec and
+    # propagate its exit code explicitly.
     trap 'rm -f "$tmp_preflight"' EXIT
     local raw_url="https://raw.githubusercontent.com/primitivedotdev/primitivemail/main/installer/preflight.py"
     if ! curl -fsSL --max-time 10 "$raw_url" -o "$tmp_preflight"; then
         printf '{"event":"preflight","overall":"fail","failed":["fetch"],"checks":{"fetch":{"status":"fail","message":"could not fetch preflight module from %s"}}}\n' "$raw_url"
         exit 1
     fi
-    exec python3 -u "$tmp_preflight"
+    python3 -u "$tmp_preflight"
+    exit $?
 }
 
 # --- Main ----------------------------------------------------------------

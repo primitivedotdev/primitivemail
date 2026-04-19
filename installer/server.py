@@ -58,7 +58,11 @@ def build_and_start(
             capture_output=True,
         )
         if result.returncode != 0:
-            ui.json_event("step", name="build", status="fail")
+            # step/fail is emitted by start_server AFTER the HeartbeatTicker's
+            # with-block exits (and its thread is joined). Emitting it here
+            # would race — the ticker could fire one more step_progress
+            # between this line and the with-exit, landing a heartbeat after
+            # the contracted terminal event.
             ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
@@ -76,7 +80,11 @@ def build_and_start(
             capture_output=ui.JSON_MODE,
         )
         if result.returncode != 0:
-            ui.json_event("step", name="build", status="fail")
+            # step/fail is emitted by start_server AFTER the HeartbeatTicker's
+            # with-block exits (and its thread is joined). Emitting it here
+            # would race — the ticker could fire one more step_progress
+            # between this line and the with-exit, landing a heartbeat after
+            # the contracted terminal event.
             ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
@@ -90,7 +98,11 @@ def build_and_start(
             capture_output=True,
         )
         if result.returncode != 0:
-            ui.json_event("step", name="build", status="fail")
+            # step/fail is emitted by start_server AFTER the HeartbeatTicker's
+            # with-block exits (and its thread is joined). Emitting it here
+            # would race — the ticker could fire one more step_progress
+            # between this line and the with-exit, landing a heartbeat after
+            # the contracted terminal event.
             ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
@@ -218,8 +230,15 @@ def start_server(
     first_build = is_first_build()
 
     ui.json_event("step", name="build", status="start")
-    with ui.HeartbeatTicker("build"):
-        build_and_start(install_dir, verbose, first_build, compose_cmd)
+    # build_and_start may sys.exit() on docker failures — wrap the with-block
+    # in try/except SystemExit so step/fail is emitted only after the ticker
+    # thread has been joined, never racing a trailing heartbeat.
+    try:
+        with ui.HeartbeatTicker("build"):
+            build_and_start(install_dir, verbose, first_build, compose_cmd)
+    except SystemExit:
+        ui.json_event("step", name="build", status="fail")
+        raise
     ui.json_event("step", name="build", status="ok")
 
     ui.json_event("step", name="wait_container", status="start")
