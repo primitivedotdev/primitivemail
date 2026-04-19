@@ -116,8 +116,20 @@ def prompt_choice(prompt_text: str, max_val: int, default: int, no_prompt: bool)
     return default
 
 
-def run_with_progress(cmd: list, label: str, verbose: bool = False, cwd: str = None) -> None:
-    """Run a command with a braille spinner. On failure, print last 20 lines and exit."""
+def run_with_progress(
+    cmd: list,
+    label: str,
+    verbose: bool = False,
+    cwd: str = None,
+    step_name: str = "",
+) -> None:
+    """Run a command with a braille spinner. On failure, print last 20 lines and exit.
+
+    `label` is human-readable (e.g. "Building"). `step_name` is the JSON-mode
+    event name (e.g. "build") that matches the public contract used by the
+    enclosing step-start/step-ok pair; pass it so the fail event is keyed
+    consistently and agents filtering on step="build" don't miss it.
+    """
     # JSON mode takes precedence over --verbose: we need a clean NDJSON stdout,
     # and subprocesses inherit fd 1 regardless of Python's sys.stdout swap — so
     # letting subprocess.run() run unrestricted would write docker build output
@@ -130,9 +142,11 @@ def run_with_progress(cmd: list, label: str, verbose: bool = False, cwd: str = N
         else:
             lines = output.decode("utf-8", errors="replace").splitlines()
             tail = "\n".join(lines[-20:])
-            # Emit the structured error and let the caller's step-fail path
-            # (if any) run; exit with non-zero so the outer shell sees failure.
-            json_event("error", step=label.lower(), message=f"{label} failed", tail=tail)
+            # Close the outer step-start event first so agents consuming the
+            # NDJSON stream see a terminal fail before the error detail.
+            fail_step = step_name or label.lower()
+            json_event("step", name=fail_step, status="fail")
+            json_event("error", step=fail_step, message=f"{label} failed", tail=tail)
             error(f"{label} failed")
             sys.exit(1)
         return

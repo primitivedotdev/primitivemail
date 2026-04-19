@@ -535,6 +535,52 @@ class TestJsonMode:
                 sys.stdout = ui._JSON_STDOUT
                 ui._JSON_STDOUT = None
 
+    def test_run_with_progress_emits_step_fail_before_error(self, capsys):
+        # Regression: when a subprocess under run_with_progress fails in JSON
+        # mode, the outer step-start (e.g. {step:"build",status:"start"}) must
+        # get a matching terminal step event before we bail. Agents keying on
+        # step=="build" were missing the failure entirely because the error
+        # event used step=label.lower() ("building") and no step-fail fired.
+        import json as _json
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            # `sh -c 'exit 1'` is portable across macOS and Linux CI
+            # (macOS has /usr/bin/false, not /bin/false).
+            with pytest.raises(SystemExit) as exc:
+                ui.run_with_progress(
+                    ["sh", "-c", "exit 1"], "Building", step_name="build",
+                )
+            assert exc.value.code == 1
+
+            captured = capsys.readouterr()
+            lines = [l for l in captured.out.strip().split("\n") if l]
+            events = [_json.loads(l) for l in lines]
+
+            # Must have a step-fail keyed on the contract name, and it must
+            # come BEFORE the error detail event.
+            step_fail_idx = next(
+                (i for i, e in enumerate(events)
+                 if e.get("event") == "step" and e.get("name") == "build"
+                 and e.get("status") == "fail"),
+                None,
+            )
+            error_idx = next(
+                (i for i, e in enumerate(events)
+                 if e.get("event") == "error" and e.get("step") == "build"),
+                None,
+            )
+            assert step_fail_idx is not None, f"no step:build:fail in {events}"
+            assert error_idx is not None, f"no error:step=build in {events}"
+            assert step_fail_idx < error_idx
+        finally:
+            import sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
     def test_error_does_not_auto_emit_json_event(self, capsys):
         # Regression: ui.error() used to auto-emit `event: error` on every
         # call, which polluted successful runs where a recoverable error

@@ -48,6 +48,7 @@ def build_and_start(
             "Building",
             verbose=verbose,
             cwd=install_dir,
+            step_name="build",
         )
         print()
         ui.step("Starting PrimitiveMail")
