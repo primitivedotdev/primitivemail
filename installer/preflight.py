@@ -87,12 +87,19 @@ def check_disk(target: "str | None" = None) -> dict:
 
 def check_port_25() -> dict:
     # Resolve public IPv4 first (mx-tools only probes IPv4).
+    # The `if p` filter in the old validator would accept trailing-dot
+    # malformed IPs like "1.2.3." — split gives ['1','2','3',''], the
+    # filter drops the empty, every surviving octet is a digit, and
+    # count('.') == 3 passes. Require 4 non-empty octets instead.
     ip = None
     for probe_url in ("https://ifconfig.me", "https://api.ipify.org", "https://icanhazip.com"):
-        ip = _http_get(probe_url, timeout=5.0)
-        if ip and all(p.isdigit() and 0 <= int(p) <= 255 for p in ip.split(".") if p) and ip.count(".") == 3:
+        candidate = _http_get(probe_url, timeout=5.0)
+        if not candidate:
+            continue
+        parts = candidate.split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            ip = candidate
             break
-        ip = None
     if not ip:
         return {"status": "skip", "reason": "could not determine public IPv4"}
 
