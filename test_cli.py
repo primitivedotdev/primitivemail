@@ -845,6 +845,24 @@ class TestEmailsRead:
         assert code == 3
         assert "ambiguous" in err.lower()
 
+    def test_read_prefix_wins_over_digits_as_seq(self, seeded, capsys):
+        # Canonical ids start with a date, so a digit-only selector can
+        # legitimately mean "prefix-match on the timestamp". --prefix is an
+        # explicit opt-in; it MUST take precedence over the digits-as-seq
+        # shortcut, otherwise `--prefix 20260417` silently becomes a seq
+        # lookup for 20 million and the flag appears dropped. id_a is
+        # "20260417T101201Z-aaaaaaaa"; the prefix "20260417T101201" is
+        # unique.
+        maildata, id_a, _ = seeded
+        code, out, _ = _run_cli(
+            maildata,
+            ["emails", "read", "--prefix", "20260417T101201", "--format", "json"],
+            capsys=capsys,
+        )
+        assert code == 0
+        event = json.loads(out)
+        assert event["id"] == id_a
+
 
 # -----------------------------------------------------------------------------
 # `emails since` command

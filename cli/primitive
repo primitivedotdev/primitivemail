@@ -474,12 +474,21 @@ def cmd_emails_read(args):
     try:
         if args.latest:
             domain, resolved_id = _resolve_latest(maildata)
+        elif args.prefix:
+            # --prefix is an explicit opt-in to prefix matching. It must
+            # take precedence over the digits-as-seq shortcut, otherwise
+            # `emails read --prefix 20260417` silently becomes a seq
+            # lookup for 20,260,417 and the flag appears dropped.
+            domain, resolved_id = _resolve_id(
+                maildata, args.selector,
+                domain=args.domain, allow_prefix=True,
+            )
         elif args.selector.isdigit():
             domain, resolved_id = _resolve_seq(maildata, int(args.selector))
         else:
             domain, resolved_id = _resolve_id(
                 maildata, args.selector,
-                domain=args.domain, allow_prefix=args.prefix,
+                domain=args.domain, allow_prefix=False,
             )
     except ResolveError as exc:
         print(exc.message, file=sys.stderr)
