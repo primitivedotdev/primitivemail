@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import pwd
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -12,14 +13,34 @@ from pathlib import Path
 VERSION = "0.1.0"
 
 
+def _invoking_user_home() -> Path:
+    """Return the invoking user's home directory, not root's under sudo.
+
+    When a user runs `sudo primitive restart`, sudo sets HOME=/root, so
+    Path.home() returns /root and the CLI looks for /root/primitivemail
+    which does not exist. Prefer SUDO_USER's pw_dir when we are root via
+    sudo. Non-sudo invocations (and direct-root invocations without
+    SUDO_USER set) fall through to Path.home() unchanged.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root" and os.geteuid() == 0:
+        try:
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            # SUDO_USER present but not in /etc/passwd; fall through.
+            pass
+    return Path.home()
+
+
 def get_maildata_path(args):
     """Resolve maildata path from --path flag, env var, or default."""
     if args.path:
         return Path(args.path)
     if os.environ.get("PRIMITIVEMAIL_MAILDATA"):
         return Path(os.environ["PRIMITIVEMAIL_MAILDATA"])
-    # Default: ~/primitivemail/maildata
-    return Path.home() / "primitivemail" / "maildata"
+    # Default: ~/primitivemail/maildata (resolved against the invoking
+    # user's home, not /root under sudo).
+    return _invoking_user_home() / "primitivemail" / "maildata"
 
 
 def parse_filename_timestamp(filename):
@@ -73,10 +94,12 @@ def cmd_emails_status(args):
 
 
 def get_install_path():
-    """Resolve the primitivemail install directory."""
+    """Resolve the primitivemail install directory. Sudo-aware: when
+    invoked under `sudo`, resolves against the original user's home
+    rather than /root (where the install does not live)."""
     if os.environ.get("PRIMITIVEMAIL_DIR"):
         return Path(os.environ["PRIMITIVEMAIL_DIR"])
-    return Path.home() / "primitivemail"
+    return _invoking_user_home() / "primitivemail"
 
 
 def cmd_restart(args):
