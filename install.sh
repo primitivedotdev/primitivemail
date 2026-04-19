@@ -44,6 +44,11 @@ detail()  { _ui_out "  $*"; }
 # --- Parse --dir and --help before forwarding to Python ------------------
 
 INSTALL_DIR="${PRIMITIVEMAIL_DIR:-./primitivemail}"
+# Branch to clone. The get.primitive.dev Worker prepends an override
+# when serving install.sh from a non-main URL path (e.g. /my-branch), so
+# `curl https://get.primitive.dev/my-branch | bash` installs from that
+# branch end-to-end. Direct invocations can also set this env var.
+PRIMITIVEMAIL_BRANCH="${PRIMITIVEMAIL_BRANCH:-main}"
 PREFLIGHT_MODE=0
 FORWARD_ARGS=()
 
@@ -330,7 +335,11 @@ clone_repo() {
     fi
 
     if command -v git &> /dev/null; then
-        git clone --quiet https://github.com/primitivedotdev/primitivemail.git "$INSTALL_DIR"
+        if [[ "$PRIMITIVEMAIL_BRANCH" != "main" ]]; then
+            info "Cloning branch: $PRIMITIVEMAIL_BRANCH"
+        fi
+        git clone --quiet --branch "$PRIMITIVEMAIL_BRANCH" \
+            https://github.com/primitivedotdev/primitivemail.git "$INSTALL_DIR"
         success "Cloned to $INSTALL_DIR"
     else
         error "Git is not installed"
