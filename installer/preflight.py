@@ -164,14 +164,39 @@ def check_docker() -> dict:
     if not shutil.which("docker"):
         # Not a fail — install.sh installs Docker automatically. Informational.
         return {"status": "skip", "installed": False, "message": "docker not installed (install.sh will install it)"}
+
+    # Try direct access first. On fresh VPS installs the invoking user
+    # isn't in the `docker` group, so this fails with EACCES on the
+    # socket — but `sudo docker info` works, which is the path install.sh
+    # takes. Report the nuance via a `needs_sudo` field so agents know
+    # the install will still succeed.
     try:
-        info = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
-        daemon_ok = info.returncode == 0
+        direct = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10,
+        )
+        daemon_ok = direct.returncode == 0
+        needs_sudo = False
+        if not daemon_ok:
+            # Retry under passwordless sudo; if it works, daemon is fine,
+            # user just lacks docker-group membership.
+            try:
+                sudo_try = subprocess.run(
+                    ["sudo", "-n", "docker", "info"],
+                    capture_output=True, timeout=10,
+                )
+                if sudo_try.returncode == 0:
+                    daemon_ok = True
+                    needs_sudo = True
+            except Exception:
+                pass
     except Exception as e:
         return {"status": "fail", "installed": True, "daemon_running": False, "error": str(e)}
+
     version = None
     try:
-        v = subprocess.run(["docker", "--version"], capture_output=True, text=True, timeout=5)
+        v = subprocess.run(
+            ["docker", "--version"], capture_output=True, text=True, timeout=5,
+        )
         if v.returncode == 0:
             version = v.stdout.strip()
     except Exception:
@@ -180,6 +205,7 @@ def check_docker() -> dict:
         "status": "ok" if daemon_ok else "fail",
         "installed": True,
         "daemon_running": daemon_ok,
+        "needs_sudo": needs_sudo,
         "version": version,
     }
 
