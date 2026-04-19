@@ -318,7 +318,22 @@ clone_repo() {
 
     if [[ -d "$INSTALL_DIR" ]]; then
         if [[ -d "$INSTALL_DIR/.git" ]]; then
-            info "Directory exists, pulling latest"
+            # Respect PRIMITIVEMAIL_BRANCH on the update path too. Without
+            # this, re-running the installer on a VM that previously cloned
+            # main would silently pull main even when the one-liner came
+            # from a branch URL. The dogfooding flow for testing a branch
+            # on an existing VM is exactly this case.
+            local current_branch
+            current_branch="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+            if [[ -n "$current_branch" && "$current_branch" != "$PRIMITIVEMAIL_BRANCH" ]]; then
+                info "Switching branch: $current_branch -> $PRIMITIVEMAIL_BRANCH"
+                if ! git -C "$INSTALL_DIR" fetch --quiet origin "$PRIMITIVEMAIL_BRANCH" 2>/dev/null \
+                    || ! git -C "$INSTALL_DIR" checkout --quiet "$PRIMITIVEMAIL_BRANCH" 2>/dev/null; then
+                    warn "Could not switch to $PRIMITIVEMAIL_BRANCH; staying on $current_branch"
+                fi
+            else
+                info "Directory exists, pulling latest"
+            fi
             if git -C "$INSTALL_DIR" pull --quiet 2>/dev/null; then
                 success "Updated $INSTALL_DIR"
             else
@@ -411,7 +426,7 @@ run_preflight() {
     # variable" after every curl-bash preflight run.
     local tmp_preflight
     tmp_preflight=$(mktemp)
-    local raw_url="https://raw.githubusercontent.com/primitivedotdev/primitivemail/main/installer/preflight.py"
+    local raw_url="https://raw.githubusercontent.com/primitivedotdev/primitivemail/${PRIMITIVEMAIL_BRANCH}/installer/preflight.py"
     if ! curl -fsSL --max-time 10 "$raw_url" -o "$tmp_preflight"; then
         rm -f "$tmp_preflight"
         printf '{"event":"preflight","overall":"fail","failed":["fetch"],"checks":{"fetch":{"status":"fail","message":"could not fetch preflight module from %s"}}}\n' "$raw_url"
