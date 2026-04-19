@@ -30,7 +30,7 @@ curl -fsSL https://get.primitive.dev | bash -s -- \
   --event-webhook-url=https://your-endpoint
 ```
 
-`--no-prompt` runs non-interactively. `--json` streams NDJSON progress events. `--claim-subdomain` grabs a free `*.primitive.email` name. `--event-webhook-url` wires push delivery. Run `./install.sh --preflight` first to check RAM, disk, inbound 25, and outbound HTTPS.
+`--no-prompt` runs non-interactively. `--json` streams NDJSON progress events. `--claim-subdomain` grabs a free `*.primitive.email` name. `--event-webhook-url` wires push delivery. Run `curl -fsSL https://get.primitive.dev | bash -s -- --preflight` first to check RAM, disk, inbound 25, and outbound HTTPS.
 
 ## Agent integration
 
