@@ -174,17 +174,18 @@ def _make_entry(seq, id_, domain, *, from_addr, received_at, subject="hi", extra
 
 
 def _make_canonical(id_, received_at, *, body_text="body", body_html=None):
-    """Minimal canonical event shape. When the SDK is present, it validates
-    schema fields and will reject obvious garbage; the fixture matches the
-    watcher's canonical event shape sufficiently for `--format text|html`
-    to exercise body access without invoking full schema validation."""
+    """Flat canonical shape: the watcher writes top-level keys (id,
+    received_at, smtp, headers, auth, parsed, content) with NO `email`
+    wrapper. The webhook-delivery shape has an `email` envelope; the
+    on-disk canonical does not. This fixture matches the on-disk shape
+    so `--format text|html` exercises real body access."""
     parsed = {"body_text": body_text}
     if body_html is not None:
         parsed["body_html"] = body_html
     return {
         "id": id_,
         "received_at": received_at,
-        "email": {"parsed": parsed},
+        "parsed": parsed,
     }
 
 
@@ -646,11 +647,11 @@ class TestEmailsRead:
         assert code == 5
         assert str(dom / f"{id_}.json") in err
 
-    def test_read_text_with_null_email_exits_5(self, tmp_path, capsys):
-        # Canonical parses as valid JSON but has `"email": null`. The text/html
-        # paths dereference `event["email"]["parsed"]`, so the naive
-        # `event.get("email", {}).get("parsed")` blew up with AttributeError
-        # before the null guard. Expect clean exit 5 with a descriptive msg.
+    def test_read_text_with_missing_parsed_exits_1(self, tmp_path, capsys):
+        # Canonical parses as a valid object but has no `parsed` key at
+        # all. This is NOT malformed (canonicals may legitimately lack a
+        # body during parse-fail recovery). Expect exit 1 ("no body_text
+        # on this email"), not a crash.
         id_ = "20260101T000001Z-aaaaaaa1"
         entries = [(
             _make_entry(1, id_, "ex.com",
@@ -660,16 +661,16 @@ class TestEmailsRead:
         maildata = _seed_maildata(tmp_path, entries)
         dom = maildata / "ex.com"
         dom.mkdir(parents=True, exist_ok=True)
-        (dom / f"{id_}.json").write_text(json.dumps({"id": id_, "email": None}))
+        (dom / f"{id_}.json").write_text(json.dumps({"id": id_}))
         code, _, err = _run_cli(
             maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
         )
-        assert code == 5
-        assert "email is not an object" in err
+        assert code == 1
+        assert "no body_text" in err
 
     def test_read_text_with_non_dict_parsed_exits_5(self, tmp_path, capsys):
-        # `email.parsed` is a string instead of an object. Should exit 5
-        # with the malformed-canonical message, not raise AttributeError.
+        # `parsed` is a string instead of an object. Should exit 5 with
+        # the malformed-canonical message, not raise AttributeError.
         id_ = "20260101T000001Z-aaaaaaa1"
         entries = [(
             _make_entry(1, id_, "ex.com",
@@ -680,13 +681,44 @@ class TestEmailsRead:
         dom = maildata / "ex.com"
         dom.mkdir(parents=True, exist_ok=True)
         (dom / f"{id_}.json").write_text(
-            json.dumps({"id": id_, "email": {"parsed": "not-an-object"}}),
+            json.dumps({"id": id_, "parsed": "not-an-object"}),
         )
         code, _, err = _run_cli(
             maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
         )
         assert code == 5
-        assert "email.parsed" in err
+        assert "parsed is not an object" in err
+
+    def test_read_text_real_watcher_shape(self, tmp_path, capsys):
+        # Regression guard: the real on-disk canonical is flat, NOT wrapped
+        # in an `email` envelope. The original code used event["email"]["parsed"]
+        # which made text/html broken on every real install even though the
+        # test fixtures passed. Fixture now matches the watcher; this test
+        # drops a fixture-shape file directly and confirms body extraction.
+        id_ = "20260101T000001Z-aaaaaaa1"
+        entries = [(
+            _make_entry(1, id_, "ex.com",
+                        from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+            None,
+        )]
+        maildata = _seed_maildata(tmp_path, entries)
+        dom = maildata / "ex.com"
+        dom.mkdir(parents=True, exist_ok=True)
+        # Shape sampled from a real watcher-produced canonical.
+        (dom / f"{id_}.json").write_text(json.dumps({
+            "id": id_,
+            "received_at": "2026-01-01T00:00:01Z",
+            "smtp": {"mail_from": "a@x.com"},
+            "headers": {"subject": "hi"},
+            "auth": {"spf": "none"},
+            "parsed": {"body_text": "hello world"},
+            "content": {},
+        }))
+        code, out, _ = _run_cli(
+            maildata, ["emails", "read", id_, "--format", "text"], capsys=capsys,
+        )
+        assert code == 0
+        assert "hello world" in out
 
 
 # -----------------------------------------------------------------------------
@@ -983,6 +1015,208 @@ class TestEmailsCount:
         code, out, _ = _run_cli(maildata, ["emails", "count"], capsys=capsys)
         assert code == 0
         assert out.strip() == "3"
+
+
+# -----------------------------------------------------------------------------
+# `emails test` command
+# -----------------------------------------------------------------------------
+
+
+class TestEmailsTest:
+    """The CLI side of the external test-email flow. Doc 08b is the spec.
+
+    All tests monkey-patch `_post_test_email` so no real network call is
+    made; the helper's (status, body) return is the seam the CLI branches
+    on. Journal writes are done directly via the maildata fixture.
+    """
+
+    def _stub_post(self, status, body, monkeypatch):
+        monkeypatch.setattr(
+            primitive_cli, "_post_test_email",
+            lambda *a, **kw: (status, json.dumps(body) if isinstance(body, dict) else body),
+        )
+
+    def _journal_append_with_subject(self, maildata, subject, *, seq=1, delay=0.0):
+        """Append a journal line with the given subject. Optionally wait
+        `delay` seconds before doing so, so tests can exercise the poll loop."""
+        if delay:
+            time.sleep(delay)
+        entry = _make_entry(seq, f"20260101T00000{seq}Z-aaaaaaa{seq}", "ex.com",
+                            from_addr="postmaster@primitive.dev",
+                            received_at=f"2026-01-01T00:00:0{seq}Z",
+                            subject=subject)
+        with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+
+    def test_bad_timeout_exits_2_without_network(self, tmp_path, capsys, monkeypatch):
+        # Network stub that would fail loudly if called.
+        def boom(*a, **kw):
+            raise AssertionError("must not be called for bad --timeout")
+        monkeypatch.setattr(primitive_cli, "_post_test_email", boom)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(
+            maildata, ["emails", "test", "--timeout", "2"], capsys=capsys,
+        )
+        assert code == 2
+        assert "5 and 120" in err
+
+    def test_404_no_claim_exits_1(self, tmp_path, capsys, monkeypatch):
+        self._stub_post(404, {
+            "ok": False, "error": "no_subdomain_claimed",
+            "message": "This IP has no claimed subdomain.",
+            "docs_url": "https://primitive.dev/docs/claim-subdomain",
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 1
+        assert "no claimed subdomain" in err or "no subdomain" in err.lower()
+
+    def test_429_rate_limited_exits_4(self, tmp_path, capsys, monkeypatch):
+        self._stub_post(429, {
+            "ok": False, "error": "rate_limited",
+            "message": "Test email rate limit reached.",
+            "reset_at": "2026-04-19T22:00:00Z",
+            "limit": 10, "window_seconds": 3600,
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 4
+        assert "rate limit" in err.lower()
+
+    def test_5xx_exits_7_with_body_truncated(self, tmp_path, capsys, monkeypatch):
+        self._stub_post(502, {"ok": False, "error": "mail_send_failed",
+                              "message": "Mail provider returned 500."}, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 7
+        assert "502" in err
+
+    def test_malformed_200_exits_7(self, tmp_path, capsys, monkeypatch):
+        # 200 but missing the required tag/subject fields.
+        self._stub_post(200, {"ok": True}, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 7
+        assert "malformed" in err.lower()
+
+    def test_network_error_exits_7(self, tmp_path, capsys, monkeypatch):
+        def raises(*a, **kw):
+            raise OSError("ECONNREFUSED")
+        monkeypatch.setattr(primitive_cli, "_post_test_email", raises)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(maildata, ["emails", "test"], capsys=capsys)
+        assert code == 7
+        assert "ECONNREFUSED" in err
+
+    def test_no_wait_exits_0_immediately(self, tmp_path, capsys, monkeypatch):
+        # --no-wait returns as soon as the server ack is received. No
+        # journal interaction required.
+        self._stub_post(200, {
+            "ok": True, "tag": "ab12cd34",
+            "subject": "PrimitiveMail test ab12cd34",
+            "dispatched_at": "2026-04-19T20:30:00Z",
+            "to": "test+ab12cd34@pink-violet.primitive.email",
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, out, _ = _run_cli(
+            maildata, ["emails", "test", "--no-wait"], capsys=capsys,
+        )
+        assert code == 0
+        assert "ab12cd34" in out
+        assert "Dispatched" in out
+
+    def test_wait_matches_journal_entry_by_subject(self, tmp_path, capsys, monkeypatch):
+        # Seed one pre-existing entry that happens to share the server
+        # subject (stale state from a prior run). The CLI MUST ignore it
+        # because we seek to EOF before matching; otherwise the polling
+        # would false-positive before the real delivery lands.
+        subject = "PrimitiveMail test ab12cd34"
+        entries = [(_make_entry(1, "20260101T000001Z-aaaaaaa1", "ex.com",
+                                from_addr="old@x.com",
+                                received_at="2026-01-01T00:00:01Z",
+                                subject=subject), None)]
+        maildata = _seed_maildata(tmp_path, entries)
+
+        # Schedule the real-delivery append FROM inside the stub. Starting
+        # the timer here instead of before _run_cli anchors the 0.3s
+        # countdown to the CLI's own clock (after dispatch returns, before
+        # it records start_size). That removes the race where the test
+        # setup's pre-CLI timer could fire while the CLI was still
+        # spinning up, causing start_size to already include seq=2 and
+        # the match to be missed.
+        import threading
+        pending_timer = {}
+
+        def stub_post_and_schedule_append(*a, **kw):
+            t = threading.Timer(
+                0.3, self._journal_append_with_subject,
+                args=(maildata, subject), kwargs={"seq": 2},
+            )
+            pending_timer["t"] = t
+            t.start()
+            return (200, json.dumps({
+                "ok": True, "tag": "ab12cd34", "subject": subject,
+                "dispatched_at": "2026-04-19T20:30:00Z",
+                "to": "test+ab12cd34@pink-violet.primitive.email",
+            }))
+
+        monkeypatch.setattr(primitive_cli, "_post_test_email",
+                            stub_post_and_schedule_append)
+
+        try:
+            code, out, _ = _run_cli(
+                maildata, ["emails", "test", "--timeout", "5", "--json"],
+                capsys=capsys,
+            )
+        finally:
+            if "t" in pending_timer:
+                pending_timer["t"].join()
+
+        assert code == 0
+        body = json.loads(out.strip())
+        assert body["ok"] is True
+        assert body["seq"] == 2  # seq 1 is the stale entry the CLI ignored
+        assert body["tag"] == "ab12cd34"
+
+    def test_wait_timeout_exits_6(self, tmp_path, capsys, monkeypatch):
+        # No journal append within the timeout; expect exit 6 + timeout hint.
+        # Fast-forward time so the test does not actually sleep --timeout
+        # seconds. First monotonic() call records poll_start; subsequent
+        # calls jump past the deadline so the while loop exits immediately.
+        self._stub_post(200, {
+            "ok": True, "tag": "ab12cd34",
+            "subject": "PrimitiveMail test ab12cd34",
+            "dispatched_at": "2026-04-19T20:30:00Z",
+            "to": "test+ab12cd34@pink-violet.primitive.email",
+        }, monkeypatch)
+        counter = {"n": 0}
+
+        def fake_monotonic():
+            counter["n"] += 1
+            # 1st: poll_start = 0. 2nd: first while check at 0 (< deadline
+            # 5, enters loop body once). 3rd+: 100 (past deadline, exits).
+            return 0.0 if counter["n"] <= 2 else 100.0
+
+        monkeypatch.setattr(primitive_cli.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(primitive_cli.time, "sleep", lambda s: None)
+
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(
+            maildata, ["emails", "test", "--timeout", "5"], capsys=capsys,
+        )
+        assert code == 6
+        assert "not observed locally" in err
+
+    def test_conflicting_wait_flags_exits_2(self, tmp_path, capsys, monkeypatch):
+        def boom(*a, **kw):
+            raise AssertionError("must not be called for flag conflict")
+        monkeypatch.setattr(primitive_cli, "_post_test_email", boom)
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, _ = _run_cli(
+            maildata, ["emails", "test", "--wait", "--no-wait"], capsys=capsys,
+        )
+        assert code == 2
 
 
 # -----------------------------------------------------------------------------

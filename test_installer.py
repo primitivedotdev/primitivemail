@@ -409,9 +409,21 @@ class TestBuildNextSteps:
     def test_useful_commands(self):
         lines = build_next_steps(ip_literal="", has_domain=True, install_dir="/home/user/pm")
         text = "\n".join(lines)
-        assert "primitive emails-status" in text
+        assert "primitive emails status" in text
+        assert "primitive emails list" in text
+        assert "primitive emails test" in text
         assert "docker logs" in text
         assert "primitive restart" in text
+
+    def test_useful_commands_omits_emails_test_when_no_domain(self):
+        # emails test requires a claimed subdomain; suggest it only when the
+        # install actually has one (has_domain=True). Otherwise the command
+        # is still available but would 404 until a claim happens, so skip it
+        # in the post-install summary to avoid operator confusion.
+        lines = build_next_steps(ip_literal="1.2.3.4", has_domain=False, install_dir="/home/user/pm")
+        text = "\n".join(lines)
+        assert "primitive emails test" not in text
+        assert "primitive emails status" in text
 
     def test_agent_integration_hint(self):
         lines = build_next_steps(ip_literal="", has_domain=True, install_dir="/home/user/pm")

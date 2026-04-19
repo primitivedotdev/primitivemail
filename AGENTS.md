@@ -157,10 +157,23 @@ primitive emails list [opts]       # List recent emails from the journal
 primitive emails read <id> [opts]  # Read one email in json, raw, text, or html
 primitive emails since <seq>       # Stream journal entries with seq > <seq>
 primitive emails count [opts]      # Count matching emails
+primitive emails test [opts]       # Send a real external test email and wait for it to arrive
 primitive restart                  # Reload config (only restarts changed containers)
 ```
 
 `primitive emails-status` is kept as a hidden alias of `primitive emails status` for one release. It prints a deprecation notice and forwards. Migrate scripts to the `noun verb` form.
+
+### Verifying the install end-to-end
+
+Once you have claimed a subdomain (via `--claim-subdomain` during install), `primitive emails test` asks `primitive.dev` to send a real external email to your claimed address and waits for it to land in the journal. A successful run exercises the full pipeline: DNS, inbound port 25, postfix, the milter, the watcher, and the journal writer. Identity is the caller's source IP, matching the claim endpoint; there is no way to redirect the test to a third-party address.
+
+```bash
+primitive emails test                   # dispatches + waits up to 30s
+primitive emails test --no-wait         # dispatches and exits immediately
+primitive emails test --timeout 60 --json
+```
+
+Exit codes: `0` received, `1` no subdomain claimed from this IP, `2` invalid CLI usage (conflicting flags or out-of-range `--timeout`), `4` rate-limited (10/hour per IP), `5` local journal unreadable while waiting, `6` dispatched but not observed within the timeout (check DNS / port 25 / container health), `7` could not reach primitive.dev.
 
 ## Configuration
 

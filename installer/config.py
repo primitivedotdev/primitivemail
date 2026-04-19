@@ -196,7 +196,10 @@ def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> lis
         lines.append("")
 
     lines.append("Useful commands:")
-    lines.append("primitive emails-status           # check inbox status")
+    if has_domain:
+        lines.append("primitive emails test             # send a real test email end-to-end")
+    lines.append("primitive emails status           # check inbox status")
+    lines.append("primitive emails list             # list recent emails")
     lines.append("docker logs primitivemail -f     # watch logs")
     lines.append("primitive restart                # reload after config changes")
     lines.append(f"cat {install_dir}/.env            # view config")
