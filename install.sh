@@ -110,6 +110,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Absolutize INSTALL_DIR before export. run_preflight `cd`s to the
+# installer module's directory before `exec`-ing Python, so a relative
+# PRIMITIVEMAIL_DIR would get abspath()'d against the WRONG cwd and the
+# disk check would probe the install.sh directory instead of the user's
+# intended target. Using `$(pwd)/$INSTALL_DIR` instead of `cd && pwd`
+# because the directory may not exist yet on first install.
+if [[ "$INSTALL_DIR" != /* ]]; then
+    INSTALL_DIR="$(pwd)/$INSTALL_DIR"
+fi
 export PRIMITIVEMAIL_DIR="$INSTALL_DIR"
 
 # --- Banner --------------------------------------------------------------
