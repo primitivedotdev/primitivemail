@@ -12,22 +12,52 @@ from installer import ui
 from installer.config import detect_public_ip
 
 
+def _docker_cmd() -> list:
+    """Return the `docker` invocation prefix, e.g. ['docker'] or ['sudo', 'docker'].
+
+    install.sh detects whether the invoking user has direct access to the
+    docker socket and exports DOCKER_CMD accordingly. On a fresh VPS where
+    get.docker.com just installed Docker but didn't add the caller to the
+    docker group, that value is 'sudo docker'. On dev boxes where the user
+    is already in the group, it's 'docker'. Fall back to auto-detection if
+    the env var isn't set (e.g. Python invoked directly during tests).
+    """
+    env = os.environ.get("DOCKER_CMD")
+    if env:
+        return env.split()
+    try:
+        r = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return ["docker"]
+    except Exception:
+        pass
+    return ["sudo", "docker"]
+
+
 def get_compose_cmd() -> list:
-    """Return the docker compose command as a list."""
+    """Return the docker compose command as a list (with sudo if needed)."""
+    base = _docker_cmd()
     try:
         subprocess.run(
-            ["docker", "compose", "version"],
+            base + ["compose", "version"],
             capture_output=True, check=True,
         )
-        return ["docker", "compose"]
+        return base + ["compose"]
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return ["docker-compose"]
+        # docker-compose (v1 legacy) almost certainly doesn't need sudo
+        # semantics different from docker itself; keep it simple and just
+        # return the legacy binary with the same privilege prefix if sudo.
+        return (["sudo", "docker-compose"]
+                if base[0] == "sudo"
+                else ["docker-compose"])
 
 
 def is_first_build() -> bool:
     """True if no primitivemail docker image exists yet."""
     result = subprocess.run(
-        ["docker", "images", "--format", "{{.Repository}}"],
+        _docker_cmd() + ["images", "--format", "{{.Repository}}"],
         capture_output=True, text=True,
     )
     return "primitivemail" not in result.stdout
@@ -113,7 +143,7 @@ def build_and_start(
 def wait_for_container(timeout: int = 15) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            ["docker", "ps", "--format", "{{.Names}}"],
+            _docker_cmd() + ["ps", "--format", "{{.Names}}"],
             capture_output=True, text=True,
         )
         if "primitivemail" in result.stdout:
@@ -125,7 +155,7 @@ def wait_for_container(timeout: int = 15) -> bool:
 def wait_for_smtp(timeout: int = 20) -> bool:
     for _ in range(timeout):
         result = subprocess.run(
-            ["docker", "exec", "primitivemail", "sh", "-c", "ss -tln | grep -q ':25 '"],
+            _docker_cmd() + ["exec", "primitivemail", "sh", "-c", "ss -tln | grep -q ':25 '"],
             capture_output=True,
         )
         if result.returncode == 0:

@@ -188,7 +188,7 @@ install_docker() {
 ensure_buildx() {
     local required_major=0 required_minor=17
     local buildx_version
-    buildx_version="$(docker buildx version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1 || true)"
+    buildx_version="$($DOCKER_CMD buildx version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1 || true)"
 
     if [[ -z "$buildx_version" ]]; then
         warn "docker buildx not found — installing..."
@@ -230,7 +230,21 @@ check_docker() {
     fi
     success "Docker found"
 
-    if ! docker compose version &> /dev/null && ! docker-compose version &> /dev/null; then
+    # Decide whether docker commands need `sudo`. `get.docker.com` doesn't
+    # add the invoking user to the `docker` group, so on fresh-VPS installs
+    # as a non-root user, `docker info` fails with EACCES on the socket.
+    # Prior behavior misreported that as "daemon not running" and sent
+    # users down a restart-docker rabbit hole. Now: try without sudo,
+    # fall back to sudo. Export DOCKER_CMD so the Python installer
+    # inherits the same decision.
+    if docker info &> /dev/null 2>&1; then
+        DOCKER_CMD="docker"
+    else
+        DOCKER_CMD="sudo docker"
+    fi
+    export DOCKER_CMD
+
+    if ! $DOCKER_CMD compose version &> /dev/null; then
         error "Docker Compose is not available"
         detail "This usually means Docker installed without the compose plugin."
         detail "Try: sudo apt-get install docker-compose-plugin"
@@ -241,7 +255,7 @@ check_docker() {
     # docker compose build requires buildx >= 0.17.0; Amazon Linux ships 0.12.1
     ensure_buildx
 
-    if ! docker info &> /dev/null 2>&1; then
+    if ! $DOCKER_CMD info &> /dev/null 2>&1; then
         error "Docker daemon is not running"
         detail "Start Docker and try again."
         exit 1
@@ -375,19 +389,23 @@ run_preflight() {
     fi
 
     # curl|bash path: no checkout available — fetch the module directly.
+    # Explicit cleanup rather than `trap ... EXIT` because bash's `set -u`
+    # (nounset) treats the trap's `$tmp_preflight` expansion as an unbound
+    # variable once the function's `local` has gone out of scope at
+    # script-exit time — which printed "line 1: tmp_preflight: unbound
+    # variable" after every curl-bash preflight run.
     local tmp_preflight
     tmp_preflight=$(mktemp)
-    # Plain `exit` triggers the trap; `exec` would replace the shell before
-    # EXIT fires, leaving the tempfile behind. So run python non-exec and
-    # propagate its exit code explicitly.
-    trap 'rm -f "$tmp_preflight"' EXIT
     local raw_url="https://raw.githubusercontent.com/primitivedotdev/primitivemail/main/installer/preflight.py"
     if ! curl -fsSL --max-time 10 "$raw_url" -o "$tmp_preflight"; then
+        rm -f "$tmp_preflight"
         printf '{"event":"preflight","overall":"fail","failed":["fetch"],"checks":{"fetch":{"status":"fail","message":"could not fetch preflight module from %s"}}}\n' "$raw_url"
         exit 1
     fi
     python3 -u "$tmp_preflight"
-    exit $?
+    local rc=$?
+    rm -f "$tmp_preflight"
+    exit $rc
 }
 
 # --- Main ----------------------------------------------------------------

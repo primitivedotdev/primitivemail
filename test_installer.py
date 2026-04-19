@@ -934,3 +934,62 @@ class TestPreflight:
             f"bare relative resolved to {probe!r}, expected {tmp_path.resolve()!r} "
             f"— regression: root fallback likely fired"
         )
+
+
+# ===========================================================================
+# _docker_cmd: sudo detection for docker calls from the Python installer
+# ===========================================================================
+
+class TestDockerCmd:
+    """`get.docker.com` doesn't add the invoking user to the docker group,
+    so on fresh VPS installs `docker info` hits EACCES on the socket. The
+    installer now detects this at the install.sh layer (sets DOCKER_CMD env)
+    and in the Python layer (auto-detect fallback). These tests pin that
+    contract so a future refactor doesn't accidentally drop the sudo path."""
+
+    def test_env_var_parsed_and_split(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "sudo docker")
+        assert server._docker_cmd() == ["sudo", "docker"]
+
+    def test_env_var_plain_docker(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+        assert server._docker_cmd() == ["docker"]
+
+    def test_auto_detect_direct_access(self, monkeypatch):
+        # No DOCKER_CMD env → auto-detect. When `docker info` returns 0,
+        # use plain docker.
+        from installer import server
+        monkeypatch.delenv("DOCKER_CMD", raising=False)
+
+        class FakeResult:
+            returncode = 0
+
+        monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw: FakeResult())
+        assert server._docker_cmd() == ["docker"]
+
+    def test_auto_detect_falls_back_to_sudo(self, monkeypatch):
+        # When `docker info` returns non-zero (EACCES on the socket), fall
+        # back to `sudo docker` — exactly the naive-agent VPS scenario.
+        from installer import server
+        monkeypatch.delenv("DOCKER_CMD", raising=False)
+
+        class FakeResult:
+            returncode = 1
+
+        monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw: FakeResult())
+        assert server._docker_cmd() == ["sudo", "docker"]
+
+    def test_auto_detect_handles_subprocess_exception(self, monkeypatch):
+        # subprocess.run can throw (e.g. FileNotFoundError if docker isn't
+        # in PATH, which shouldn't happen after check_docker but let's be
+        # defensive). Fall back to sudo docker.
+        from installer import server
+        monkeypatch.delenv("DOCKER_CMD", raising=False)
+
+        def boom(*a, **kw):
+            raise FileNotFoundError("docker not found")
+
+        monkeypatch.setattr(server.subprocess, "run", boom)
+        assert server._docker_cmd() == ["sudo", "docker"]
