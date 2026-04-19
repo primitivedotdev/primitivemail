@@ -1,5 +1,6 @@
 """Terminal UI helpers for PrimitiveMail installer."""
 
+import json as _json
 import sys
 import subprocess
 import threading
@@ -13,25 +14,65 @@ BLUE = "\033[38;2;96;165;250m"
 MUTED = "\033[38;2;113;113;122m"
 NC = "\033[0m"
 
+# JSON mode: stdout is reserved for NDJSON events. Human-readable output
+# (info, success, warn, error, step, and any bare print() from display
+# helpers) gets redirected to stderr by swapping sys.stdout at enable time.
+# NDJSON events go through the saved original stdout in json_event().
+JSON_MODE = False
+_JSON_STDOUT = None  # original sys.stdout, captured at enable time
+
+
+def enable_json_mode() -> None:
+    """Flip to JSON output mode. Redirects sys.stdout to sys.stderr so every
+    existing print() call (including ones we don't control) goes to stderr;
+    NDJSON events are written directly to the preserved original stdout."""
+    global JSON_MODE, _JSON_STDOUT
+    JSON_MODE = True
+    _JSON_STDOUT = sys.stdout
+    sys.stdout = sys.stderr
+
+
+def _human_out(msg: str) -> None:
+    print(msg)
+
+
+def line(msg: str = "") -> None:
+    """Emit a decorative line. Goes to stderr in JSON mode via the stdout swap."""
+    print(msg)
+
+
+def json_event(event: str, **fields) -> None:
+    """Emit a single NDJSON event to the preserved stdout when JSON_MODE is on."""
+    if not JSON_MODE or _JSON_STDOUT is None:
+        return
+    payload = {"event": event, **fields}
+    _JSON_STDOUT.write(_json.dumps(payload, separators=(",", ":")) + "\n")
+    _JSON_STDOUT.flush()
+
 
 def info(msg: str) -> None:
-    print(f"{MUTED}.{NC} {msg}")
+    _human_out(f"{MUTED}.{NC} {msg}")
 
 
 def success(msg: str) -> None:
-    print(f"{GREEN}+{NC} {msg}")
+    _human_out(f"{GREEN}+{NC} {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"{YELLOW}!{NC} {msg}")
+    _human_out(f"{YELLOW}!{NC} {msg}")
 
 
 def error(msg: str) -> None:
-    print(f"{RED}x{NC} {msg}")
+    # No automatic json_event here — callers decide whether an error is
+    # terminal-with-a-JSON-event or recoverable. Terminal exit sites should
+    # emit `json_event("step", ..., status="fail")` and/or `json_event("error", ...)`
+    # explicitly before calling sys.exit(). Keeping this human-only avoids
+    # stray `event: error` lines in successful runs.
+    _human_out(f"{RED}x{NC} {msg}")
 
 
 def step(msg: str) -> None:
-    print(f"{BLUE}>{NC} {BOLD}{msg}{NC}")
+    _human_out(f"{BLUE}>{NC} {BOLD}{msg}{NC}")
 
 
 def _get_tty_input(prompt_text: str) -> str:
@@ -75,8 +116,41 @@ def prompt_choice(prompt_text: str, max_val: int, default: int, no_prompt: bool)
     return default
 
 
-def run_with_progress(cmd: list, label: str, verbose: bool = False, cwd: str = None) -> None:
-    """Run a command with a braille spinner. On failure, print last 20 lines and exit."""
+def run_with_progress(
+    cmd: list,
+    label: str,
+    verbose: bool = False,
+    cwd: str = None,
+    step_name: str = "",
+) -> None:
+    """Run a command with a braille spinner. On failure, print last 20 lines and exit.
+
+    `label` is human-readable (e.g. "Building"). `step_name` is the JSON-mode
+    event name (e.g. "build") that matches the public contract used by the
+    enclosing step-start/step-ok pair; pass it so the fail event is keyed
+    consistently and agents filtering on step="build" don't miss it.
+    """
+    # JSON mode takes precedence over --verbose: we need a clean NDJSON stdout,
+    # and subprocesses inherit fd 1 regardless of Python's sys.stdout swap — so
+    # letting subprocess.run() run unrestricted would write docker build output
+    # straight to the real stdout and corrupt the event stream.
+    if JSON_MODE:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd)
+        output, _ = process.communicate()
+        if process.returncode == 0:
+            success(f"{label} complete")
+        else:
+            lines = output.decode("utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-20:])
+            # Close the outer step-start event first so agents consuming the
+            # NDJSON stream see a terminal fail before the error detail.
+            fail_step = step_name or label.lower()
+            json_event("step", name=fail_step, status="fail")
+            json_event("error", step=fail_step, message=f"{label} failed", tail=tail)
+            error(f"{label} failed")
+            sys.exit(1)
+        return
+
     if verbose:
         result = subprocess.run(cmd, cwd=cwd)
         if result.returncode != 0:

@@ -4,6 +4,7 @@ import ipaddress
 import json
 import secrets
 import subprocess
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -57,12 +58,14 @@ def generate_env_content(
     ip_literal: str,
     webhook_url: str,
     webhook_secret: str,
+    event_webhook_url: str,
+    event_webhook_secret: str,
     allowed_sender_domains: str,
     allowed_senders: str,
     allowed_recipients: str,
     spoof_protection: str,
 ) -> str:
-    """Generate .env file content. 11 lines, unquoted values."""
+    """Generate .env file content. Unquoted values, one key per line."""
     enable = "true" if enable_ip_literal else "false"
     lines = [
         f"MYHOSTNAME={hostname}",
@@ -71,6 +74,8 @@ def generate_env_content(
         f"IP_LITERAL={ip_literal}",
         f"WEBHOOK_URL={webhook_url}",
         f"WEBHOOK_SECRET={webhook_secret}",
+        f"EVENT_WEBHOOK_URL={event_webhook_url}",
+        f"EVENT_WEBHOOK_SECRET={event_webhook_secret}",
         f"ALLOWED_SENDER_DOMAINS={allowed_sender_domains}",
         f"ALLOWED_SENDERS={allowed_senders}",
         f"ALLOWED_RECIPIENTS={allowed_recipients}",
@@ -80,12 +85,26 @@ def generate_env_content(
     return "\n".join(lines) + "\n"
 
 
+def validate_event_webhook_url(url: str) -> bool:
+    """Minimal sanity check: http/https scheme and a host present."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if not parsed.netloc:
+        return False
+    return True
+
+
 def build_config_summary(
     hostname: str,
     domain: str,
     ip_literal: str,
     has_domain: bool,
     webhook_url: str,
+    event_webhook_url: str,
     allowed_sender_domains: str,
     allowed_senders: str,
     allowed_recipients: str,
@@ -105,6 +124,9 @@ def build_config_summary(
     else:
         lines.append("Mode:              Webhook")
         lines.append(f"Webhook URL:       {webhook_url}")
+
+    if event_webhook_url:
+        lines.append(f"Event webhook:     {event_webhook_url}")
 
     if allowed_sender_domains or allowed_senders:
         parts = []

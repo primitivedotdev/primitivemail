@@ -48,6 +48,7 @@ def build_and_start(
             "Building",
             verbose=verbose,
             cwd=install_dir,
+            step_name="build",
         )
         print()
         ui.step("Starting PrimitiveMail")
@@ -57,18 +58,29 @@ def build_and_start(
             capture_output=True,
         )
         if result.returncode != 0:
+            ui.json_event("step", name="build", status="fail")
+            ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
                 print(result.stderr.decode("utf-8", errors="replace"))
             sys.exit(1)
     elif verbose:
         ui.step("Starting PrimitiveMail")
+        # JSON mode trumps --verbose: fd 1 must stay clean for NDJSON.
+        # Subprocesses inherit the OS-level stdout regardless of Python's
+        # sys.stdout swap, so we capture here when JSON_MODE is on.
+        # Non-JSON verbose still inherits so the operator sees build output.
         result = subprocess.run(
             compose_cmd + ["up", "-d", "--build"],
             cwd=install_dir,
+            capture_output=ui.JSON_MODE,
         )
         if result.returncode != 0:
+            ui.json_event("step", name="build", status="fail")
+            ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
+            if result.stderr:
+                print(result.stderr.decode("utf-8", errors="replace"))
             sys.exit(1)
     else:
         ui.step("Starting PrimitiveMail")
@@ -78,6 +90,8 @@ def build_and_start(
             capture_output=True,
         )
         if result.returncode != 0:
+            ui.json_event("step", name="build", status="fail")
+            ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
                 print(result.stderr.decode("utf-8", errors="replace"))
@@ -197,24 +211,33 @@ def start_server(
     """Full server start orchestration."""
     if no_start:
         ui.info("Skipping start (--no-start)")
+        ui.json_event("step", name="start", status="skipped", reason="no_start")
         return
 
     compose_cmd = get_compose_cmd()
     first_build = is_first_build()
 
+    ui.json_event("step", name="build", status="start")
     build_and_start(install_dir, verbose, first_build, compose_cmd)
+    ui.json_event("step", name="build", status="ok")
 
+    ui.json_event("step", name="wait_container", status="start")
     if not wait_for_container():
         ui.error("Container failed to start")
+        ui.json_event("step", name="wait_container", status="fail")
         print()
         print("  Check logs: docker logs primitivemail")
         raise SystemExit(1)
+    ui.json_event("step", name="wait_container", status="ok")
 
+    ui.json_event("step", name="wait_smtp", status="start")
     if not wait_for_smtp():
         ui.error("PrimitiveMail started but SMTP did not become ready")
+        ui.json_event("step", name="wait_smtp", status="fail")
         print()
         print("  Check logs: docker logs primitivemail")
         raise SystemExit(1)
+    ui.json_event("step", name="wait_smtp", status="ok")
 
     ui.success("PrimitiveMail is running on port 25")
 
@@ -224,10 +247,15 @@ def start_server(
         return
 
     ui.info(f"Checking port 25 reachability on {check_ip}...")
+    ui.json_event("step", name="port25_check", status="start")
     status = check_port_25_reachable(check_ip)
 
+    # "open"  -> ok     (all good)
+    # "closed"/"blocked"/"error" -> warn  (install succeeded; user has remediation)
+    # None    -> fall through to local nc fallback before emitting the event
     if status == "open":
         ui.success("Port 25 is reachable from the outside")
+        ui.json_event("step", name="port25_check", status="ok", reachability="open")
     elif status == "closed":
         print()
         ui.warn(f"Port 25 is not accepting connections on {check_ip}")
@@ -236,6 +264,7 @@ def start_server(
         print("    docker ps | grep primitivemail")
         print("    docker logs primitivemail")
         print()
+        ui.json_event("step", name="port25_check", status="warn", reachability="closed")
     elif status == "blocked":
         print()
         ui.warn(f"Port 25 appears blocked by a firewall on {check_ip}")
@@ -246,27 +275,34 @@ def start_server(
         for line in get_firewall_help(cloud):
             print(f"  {line}")
         print()
+        ui.json_event("step", name="port25_check", status="warn", reachability="blocked")
     elif status == "error":
         print()
         ui.warn(f"Port 25 check failed -- host unreachable at {check_ip}")
         print("  Verify that this is the correct public IP for your server.")
         print(f"  You can check manually at: {ui.BOLD}https://mx-tools.primitive.dev{ui.NC}")
         print()
+        ui.json_event("step", name="port25_check", status="warn", reachability="error")
     else:
-        # API unreachable — local fallback
+        # External API unreachable — fall back to a local nc probe before
+        # committing to a JSON event, so we don't report "unknown" when the
+        # fallback actually has a concrete answer.
         ui.warn("Could not reach port check service -- falling back to local check")
         fallback = check_port_25_local_fallback(check_ip)
         if fallback is None:
             ui.info("Public IP is on a local interface -- cannot verify port 25 from here")
             print(f"  Check manually at: {ui.BOLD}https://mx-tools.primitive.dev{ui.NC}")
+            ui.json_event("step", name="port25_check", status="warn", reachability="unknown")
         elif fallback:
             ui.success("Port 25 is reachable from this host")
+            ui.json_event("step", name="port25_check", status="ok", reachability="open_local")
         else:
             print()
             ui.warn(f"Port 25 does not appear reachable on {check_ip}")
             print("  PrimitiveMail is running, but external mail may not be able to reach it.")
             print(f"  You can verify manually at: {ui.BOLD}https://mx-tools.primitive.dev{ui.NC}")
             print()
+            ui.json_event("step", name="port25_check", status="warn", reachability="closed_local")
 
 
 def _ensure_local_bin_on_path() -> None:

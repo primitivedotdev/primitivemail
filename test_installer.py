@@ -8,6 +8,7 @@ from installer.config import (
     detect_public_ip,
     generate_env_content,
     generate_webhook_secret,
+    validate_event_webhook_url,
     validate_spoof_protection,
     map_spoof_choice,
     should_warn_sender_filtering,
@@ -29,6 +30,7 @@ class TestGenerateEnvContent:
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
             webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
@@ -43,6 +45,7 @@ class TestGenerateEnvContent:
             hostname="localhost", domain="localhost",
             enable_ip_literal=True, ip_literal="203.0.113.10",
             webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
@@ -54,6 +57,7 @@ class TestGenerateEnvContent:
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
             webhook_url="https://api.example.com/email", webhook_secret="secret123",
+            event_webhook_url="", event_webhook_secret="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
@@ -65,6 +69,7 @@ class TestGenerateEnvContent:
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
             webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
             allowed_sender_domains="trusted.org,example.net",
             allowed_senders="alerts@github.com",
             allowed_recipients="inbox@example.com",
@@ -75,21 +80,54 @@ class TestGenerateEnvContent:
         assert "ALLOWED_RECIPIENTS=inbox@example.com" in result
         assert "SPOOF_PROTECTION=standard" in result
 
-    def test_exactly_11_lines(self):
+    def test_line_count_stable(self):
+        # Pin the line count so reorderings or accidental extra keys get caught.
         result = generate_env_content(
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
             webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
-        assert len(result.strip().split("\n")) == 11
+        assert len(result.strip().split("\n")) == 13
+
+    def test_event_webhook_written(self):
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="https://ingest.example.com/hook",
+            event_webhook_secret="e1b2c3",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        assert "EVENT_WEBHOOK_URL=https://ingest.example.com/hook" in result
+        assert "EVENT_WEBHOOK_SECRET=e1b2c3" in result
+
+    def test_event_webhook_absent_by_default(self):
+        # When no event webhook is configured, the keys should still appear in
+        # .env (so grep shows every tunable) but with empty values — not
+        # missing, not with stale data leaking through.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        lines = result.strip().split("\n")
+        env = dict(line.split("=", 1) for line in lines)
+        assert env["EVENT_WEBHOOK_URL"] == ""
+        assert env["EVENT_WEBHOOK_SECRET"] == ""
 
     def test_no_quoting(self):
         result = generate_env_content(
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
             webhook_url="https://example.com/hook", webhook_secret="s3cret",
+            event_webhook_url="", event_webhook_secret="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
@@ -107,7 +145,8 @@ class TestBuildConfigSummary:
         lines = build_config_summary(
             hostname="localhost", domain="localhost",
             ip_literal="1.2.3.4", has_domain=False,
-            webhook_url="", allowed_sender_domains="",
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
             allowed_senders="", allowed_recipients="",
             spoof_protection="off",
         )
@@ -119,7 +158,8 @@ class TestBuildConfigSummary:
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
-            webhook_url="", allowed_sender_domains="",
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
             allowed_senders="", allowed_recipients="",
             spoof_protection="off",
         )
@@ -132,6 +172,7 @@ class TestBuildConfigSummary:
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
             webhook_url="https://api.example.com/email",
+            event_webhook_url="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
@@ -142,7 +183,7 @@ class TestBuildConfigSummary:
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
-            webhook_url="",
+            webhook_url="", event_webhook_url="",
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
@@ -159,7 +200,8 @@ class TestBuildConfigSummary:
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
-            webhook_url="", allowed_sender_domains="",
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
             allowed_senders="", allowed_recipients="",
             spoof_protection=level,
         )
@@ -170,7 +212,8 @@ class TestBuildConfigSummary:
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
-            webhook_url="", allowed_sender_domains="trusted.org",
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="trusted.org",
             allowed_senders="ceo@big.com", allowed_recipients="",
             spoof_protection="off",
         )
@@ -182,7 +225,8 @@ class TestBuildConfigSummary:
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
-            webhook_url="", allowed_sender_domains="",
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
             allowed_senders="", allowed_recipients="",
             spoof_protection="off",
         )
@@ -376,3 +420,223 @@ class TestBuildNextSteps:
         lines = build_next_steps(ip_literal="", has_domain=True, install_dir="/home/user/pm")
         text = "\n".join(lines)
         assert "port 25" in text.lower() or "Port 25" in text
+
+
+# ===========================================================================
+# Event webhook URL validation
+# ===========================================================================
+
+class TestValidateEventWebhookUrl:
+
+    @pytest.mark.parametrize("url", [
+        "http://localhost:3000/hook",
+        "http://127.0.0.1/hook",
+        "https://ingest.example.com/webhooks/primitive",
+        "http://host.docker.internal:4000/",
+    ])
+    def test_valid_urls(self, url):
+        assert validate_event_webhook_url(url) is True
+
+    @pytest.mark.parametrize("url", [
+        "",
+        "not a url",
+        "ftp://example.com/hook",
+        "example.com/hook",        # no scheme
+        "https://",                 # scheme but no host
+        "file:///etc/passwd",
+    ])
+    def test_invalid_urls(self, url):
+        assert validate_event_webhook_url(url) is False
+
+
+# ===========================================================================
+# Event webhook surfaces in config summary
+# ===========================================================================
+
+class TestConfigSummaryEventWebhook:
+
+    def test_event_webhook_line_shown_when_set(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="",
+            event_webhook_url="https://ingest.example.com/hook",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        text = "\n".join(lines)
+        assert "Event webhook" in text
+        assert "https://ingest.example.com/hook" in text
+
+    def test_event_webhook_hidden_when_empty(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        text = "\n".join(lines)
+        assert "Event webhook" not in text
+
+
+# ===========================================================================
+# JSON output mode
+# ===========================================================================
+
+class TestJsonMode:
+
+    def test_json_event_noop_when_disabled(self, capsys):
+        from installer import ui
+        # Ensure mode is off (module default)
+        if ui.JSON_MODE:
+            pytest.skip("test requires JSON_MODE off; earlier test leaked state")
+        ui.json_event("step", name="config", status="ok")
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_json_event_writes_ndjson(self, capsys):
+        import json as _json
+        from installer import ui
+        ui.enable_json_mode()
+        try:
+            ui.json_event("step", name="config", status="ok")
+            ui.json_event("done", install_dir="/tmp/x")
+            captured = capsys.readouterr()
+            lines = [l for l in captured.out.strip().split("\n") if l]
+            assert len(lines) == 2
+            first = _json.loads(lines[0])
+            assert first == {"event": "step", "name": "config", "status": "ok"}
+            second = _json.loads(lines[1])
+            assert second == {"event": "done", "install_dir": "/tmp/x"}
+        finally:
+            # Reset module-level state so later tests see a clean slate.
+            import sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
+    def test_human_helpers_go_to_stderr_in_json_mode(self, capsys):
+        from installer import ui
+        ui.enable_json_mode()
+        try:
+            ui.info("a note")
+            ui.success("good")
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "a note" in captured.err
+            assert "good" in captured.err
+        finally:
+            import sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
+    def test_run_with_progress_emits_step_fail_before_error(self, capsys):
+        # Regression: when a subprocess under run_with_progress fails in JSON
+        # mode, the outer step-start (e.g. {step:"build",status:"start"}) must
+        # get a matching terminal step event before we bail. Agents keying on
+        # step=="build" were missing the failure entirely because the error
+        # event used step=label.lower() ("building") and no step-fail fired.
+        import json as _json
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            # `sh -c 'exit 1'` is portable across macOS and Linux CI
+            # (macOS has /usr/bin/false, not /bin/false).
+            with pytest.raises(SystemExit) as exc:
+                ui.run_with_progress(
+                    ["sh", "-c", "exit 1"], "Building", step_name="build",
+                )
+            assert exc.value.code == 1
+
+            captured = capsys.readouterr()
+            lines = [l for l in captured.out.strip().split("\n") if l]
+            events = [_json.loads(l) for l in lines]
+
+            # Must have a step-fail keyed on the contract name, and it must
+            # come BEFORE the error detail event.
+            step_fail_idx = next(
+                (i for i, e in enumerate(events)
+                 if e.get("event") == "step" and e.get("name") == "build"
+                 and e.get("status") == "fail"),
+                None,
+            )
+            error_idx = next(
+                (i for i, e in enumerate(events)
+                 if e.get("event") == "error" and e.get("step") == "build"),
+                None,
+            )
+            assert step_fail_idx is not None, f"no step:build:fail in {events}"
+            assert error_idx is not None, f"no error:step=build in {events}"
+            assert step_fail_idx < error_idx
+        finally:
+            import sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
+    def test_error_does_not_auto_emit_json_event(self, capsys):
+        # Regression: ui.error() used to auto-emit `event: error` on every
+        # call, which polluted successful runs where a recoverable error
+        # path called ui.error() without exiting. Callers must now emit
+        # json_event("error", ...) explicitly at terminal-exit sites.
+        import json as _json
+        from installer import ui
+        ui.enable_json_mode()
+        try:
+            ui.error("something went wrong but we recovered")
+            captured = capsys.readouterr()
+            # Nothing on stdout — no stray NDJSON
+            assert captured.out == ""
+            # Human-readable line went to stderr
+            assert "something went wrong" in captured.err
+            # Explicit call DOES emit
+            ui.json_event("error", step="config", message="explicit")
+            captured = capsys.readouterr()
+            line = captured.out.strip()
+            parsed = _json.loads(line)
+            assert parsed == {"event": "error", "step": "config", "message": "explicit"}
+        finally:
+            import sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
+
+# ===========================================================================
+# parse_args behavior
+# ===========================================================================
+
+class TestParseArgsImplications:
+
+    def test_claim_subdomain_implies_no_prompt(self, monkeypatch):
+        # --claim-subdomain is a "the agent wants us to assign a domain" signal;
+        # going through the interactive flow would let the user set a real
+        # domain which would then be clobbered by the post-start claim step.
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer", "--claim-subdomain"])
+        args = parse_args()
+        assert args.claim_subdomain is True
+        assert args.no_prompt is True
+
+    def test_json_implies_no_prompt(self, monkeypatch):
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer", "--json"])
+        args = parse_args()
+        assert args.json_output is True
+        assert args.no_prompt is True
+
+    def test_bare_invocation_stays_interactive(self, monkeypatch):
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer"])
+        args = parse_args()
+        assert args.no_prompt is False
+        assert args.claim_subdomain is False
+        assert args.json_output is False
