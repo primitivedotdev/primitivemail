@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for installer/config.py pure functions."""
 
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -735,3 +736,51 @@ class TestParseArgsImplications:
         assert args.no_prompt is False
         assert args.claim_subdomain is False
         assert args.json_output is False
+
+
+# ===========================================================================
+# Preflight
+# ===========================================================================
+
+class TestPreflight:
+    """Preflight emits a single JSON object with a stable shape. The check
+    bodies are integration-tested against real infra (they hit /proc, network,
+    docker) — these tests pin the wrapper's schema."""
+
+    def test_run_all_has_expected_shape(self):
+        from installer import preflight
+        result = preflight.run_all()
+        assert result["event"] == "preflight"
+        assert result["overall"] in ("ok", "fail")
+        assert isinstance(result["failed"], list)
+        assert set(result["checks"].keys()) == {
+            "ram", "disk", "port_25_inbound", "outbound_https", "docker",
+        }
+        # Every check must have a status
+        for name, check in result["checks"].items():
+            assert "status" in check, f"{name} missing status"
+            assert check["status"] in ("ok", "fail", "skip"), (
+                f"{name} has unexpected status {check['status']}"
+            )
+
+    def test_overall_fail_iff_any_check_fails(self):
+        from installer import preflight
+        result = preflight.run_all()
+        has_fail = any(c.get("status") == "fail" for c in result["checks"].values())
+        if has_fail:
+            assert result["overall"] == "fail"
+            assert len(result["failed"]) > 0
+        else:
+            assert result["overall"] == "ok"
+            assert result["failed"] == []
+
+    def test_disk_check_respects_install_dir_parent(self, tmp_path, monkeypatch):
+        # Install dir doesn't exist yet — check should walk up to an ancestor
+        # that does, not error out.
+        from installer import preflight
+        fake_dir = tmp_path / "does" / "not" / "exist"
+        monkeypatch.setenv("PRIMITIVEMAIL_DIR", str(fake_dir))
+        result = preflight.check_disk()
+        assert result["status"] in ("ok", "fail")
+        # Path resolved to an existing ancestor
+        assert os.path.exists(result["path"])
