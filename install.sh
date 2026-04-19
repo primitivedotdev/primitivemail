@@ -18,12 +18,28 @@ MUTED='\033[38;2;113;113;122m'
 NC='\033[0m'
 
 # --- UI helpers ----------------------------------------------------------
+#
+# In --json mode, stdout is reserved for the NDJSON stream emitted by the
+# Python installer. Everything that bash writes (banner, prerequisite steps,
+# Docker install output) goes to stderr so agents can parse stdout cleanly
+# while operators watching the terminal still see progress.
 
-info()    { echo -e "${MUTED}.${NC} $*"; }
-success() { echo -e "${GREEN}+${NC} $*"; }
-warn()    { echo -e "${YELLOW}!${NC} $*"; }
-error()   { echo -e "${RED}x${NC} $*"; }
-step()    { echo -e "${BLUE}>${NC} ${BOLD}$*${NC}"; }
+JSON_MODE=0
+_ui_out() {
+    if [[ "$JSON_MODE" == "1" ]]; then
+        echo -e "$1" 1>&2
+    else
+        echo -e "$1"
+    fi
+}
+
+info()    { _ui_out "${MUTED}.${NC} $*"; }
+success() { _ui_out "${GREEN}+${NC} $*"; }
+warn()    { _ui_out "${YELLOW}!${NC} $*"; }
+error()   { _ui_out "${RED}x${NC} $*"; }
+step()    { _ui_out "${BLUE}>${NC} ${BOLD}$*${NC}"; }
+spacer()  { _ui_out ""; }
+detail()  { _ui_out "  $*"; }
 
 # --- Parse --dir and --help before forwarding to Python ------------------
 
@@ -40,23 +56,41 @@ while [[ $# -gt 0 ]]; do
             INSTALL_DIR="${1#--dir=}"
             shift
             ;;
+        --json)
+            JSON_MODE=1
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
         --help|-h)
             echo "PrimitiveMail Installer"
             echo ""
             echo "Usage: curl -fsSL https://get.primitive.dev | bash"
             echo "   or: ./install.sh [OPTIONS]"
             echo ""
-            echo "Common options:"
-            echo "  --hostname HOST          Mail server hostname (e.g. mx.example.com)"
-            echo "  --domain DOMAIN          Domain to receive mail for (e.g. example.com)"
-            echo "  --webhook-url URL        Webhook endpoint for email processing"
-            echo "  --webhook-secret SECRET  Secret for webhook authentication"
-            echo "  --dir PATH               Install directory (default: ./primitivemail)"
-            echo "  --ip-literal IP          Enable IP literal mail for this IP"
-            echo "  --spoof-protection LEVEL off|monitor|standard|strict (default: off)"
-            echo "  --no-prompt, -y          Non-interactive mode"
-            echo "  --verbose                Show detailed output"
-            echo "  --help, -h               Show this help"
+            echo "Domain:"
+            echo "  --hostname HOST           Mail server hostname (e.g. mx.example.com)"
+            echo "  --domain DOMAIN           Domain to receive mail for (e.g. example.com)"
+            echo "  --claim-subdomain         Claim a free *.primitive.email subdomain after install"
+            echo "                            (mutually exclusive with --hostname/--domain)"
+            echo "  --ip-literal IP           Enable IP literal mail for this IP"
+            echo ""
+            echo "Webhooks:"
+            echo "  --webhook-url URL         Legacy (milter) webhook endpoint"
+            echo "  --webhook-secret SECRET   Legacy webhook secret"
+            echo "  --event-webhook-url URL   Watcher push-delivery target (SDK-signed)"
+            echo "  --event-webhook-secret S  Watcher HMAC signing key (auto-generated if omitted)"
+            echo ""
+            echo "Security:"
+            echo "  --spoof-protection LEVEL  off|monitor|standard|strict (default: off)"
+            echo ""
+            echo "Output:"
+            echo "  --json                    Emit NDJSON progress events on stdout (implies --no-prompt)"
+            echo "  --verbose                 Show detailed output"
+            echo "  --no-prompt, -y           Non-interactive mode"
+            echo ""
+            echo "Other:"
+            echo "  --dir PATH                Install directory (default: ./primitivemail)"
+            echo "  --help, -h                Show this help"
             exit 0
             ;;
         *)
@@ -94,6 +128,11 @@ TEXT_LOGO='⢀⣀⣀⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠈⠉⠀⠀⠀⠀⠀⠈⠉ ⠀⠀⠀⠉⠉⠀⠉⠁⠀⠈⠉⠀⠈⠉⠁⠈⠉⠀⠀⠀⠈⠉⠉⠀⠉⠁⠀⠀⠀⠉⠁⠀⠀⠀⠀⠉⠉⠉⠉⠀'
 
 print_banner() {
+    # JSON mode: no banner on stdout (it would break the NDJSON stream).
+    # Keep stderr clean too; agents don't need decoration.
+    if [[ "$JSON_MODE" == "1" ]]; then
+        return
+    fi
     local PGREEN='\033[38;2;90;247;142m'
     echo ""
     echo -e "${PGREEN}${LOGO}${NC}"
@@ -106,18 +145,25 @@ print_banner() {
 # --- Docker --------------------------------------------------------------
 
 install_docker() {
-    echo ""
+    spacer
     info "Installing Docker via get.docker.com..."
-    if ! curl -fsSL https://get.docker.com | sh; then
-        error "Docker installation failed"
-        exit 1
+    if [[ "$JSON_MODE" == "1" ]]; then
+        if ! curl -fsSL https://get.docker.com | sh 1>&2; then
+            error "Docker installation failed"
+            exit 1
+        fi
+    else
+        if ! curl -fsSL https://get.docker.com | sh; then
+            error "Docker installation failed"
+            exit 1
+        fi
     fi
     if command -v systemctl &> /dev/null; then
         sudo systemctl start docker 2>/dev/null || true
         sudo systemctl enable docker 2>/dev/null || true
     fi
     success "Docker installed"
-    echo ""
+    spacer
 }
 
 ensure_buildx() {
@@ -167,8 +213,8 @@ check_docker() {
 
     if ! docker compose version &> /dev/null && ! docker-compose version &> /dev/null; then
         error "Docker Compose is not available"
-        echo "  This usually means Docker installed without the compose plugin."
-        echo "  Try: sudo apt-get install docker-compose-plugin"
+        detail "This usually means Docker installed without the compose plugin."
+        detail "Try: sudo apt-get install docker-compose-plugin"
         exit 1
     fi
     success "Docker Compose found"
@@ -178,7 +224,7 @@ check_docker() {
 
     if ! docker info &> /dev/null 2>&1; then
         error "Docker daemon is not running"
-        echo "  Start Docker and try again."
+        detail "Start Docker and try again."
         exit 1
     fi
     success "Docker daemon running"
@@ -249,7 +295,7 @@ clone_repo() {
         success "Cloned to $INSTALL_DIR"
     else
         error "Git is not installed"
-        echo "  Install git and try again."
+        detail "Install git and try again."
         exit 1
     fi
 }
@@ -273,7 +319,7 @@ check_python() {
 
     if ! command -v python3 &> /dev/null; then
         error "Python 3.6+ is required but could not be installed."
-        echo "  Install Python 3 manually and re-run this script."
+        detail "Install Python 3 manually and re-run this script."
         exit 1
     fi
     success "Python 3 installed"
@@ -293,7 +339,7 @@ main() {
 
     if [[ ! -d "installer" ]]; then
         error "Installer package not found. Your copy may be outdated."
-        echo "  Try: rm -rf $INSTALL_DIR && rerun the install script."
+        detail "Try: rm -rf $INSTALL_DIR && rerun the install script."
         exit 1
     fi
 

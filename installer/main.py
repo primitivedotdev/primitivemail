@@ -18,8 +18,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hostname", default="")
     parser.add_argument("--domain", default="")
+    parser.add_argument("--claim-subdomain", action="store_true", dest="claim_subdomain")
     parser.add_argument("--webhook-url", default="", dest="webhook_url")
     parser.add_argument("--webhook-secret", default="", dest="webhook_secret")
+    parser.add_argument("--event-webhook-url", default="", dest="event_webhook_url")
+    parser.add_argument("--event-webhook-secret", default="", dest="event_webhook_secret")
     parser.add_argument("--ip-literal", default="", dest="ip_literal")
     parser.add_argument("--allowed-sender-domains", default="", dest="allowed_sender_domains")
     parser.add_argument("--allowed-senders", default="", dest="allowed_senders")
@@ -27,8 +30,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spoof-protection", default="off", dest="spoof_protection")
     parser.add_argument("--no-prompt", "-y", action="store_true", dest="no_prompt")
     parser.add_argument("--no-start", action="store_true", dest="no_start")
+    parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --json implies --no-prompt: agents don't have a TTY. The _get_tty_input
+    # call would hang otherwise.
+    if args.json_output:
+        args.no_prompt = True
+    return args
 
 
 def check_existing_install(install_dir: str, no_prompt: bool) -> None:
@@ -60,11 +69,28 @@ def configure(args: argparse.Namespace) -> dict:
 
     ui.step("Configuration")
 
+    if args.claim_subdomain and (args.hostname or args.domain):
+        ui.error("--claim-subdomain and --domain/--hostname are mutually exclusive")
+        ui.info("--claim-subdomain lets us assign a domain for you.")
+        ui.info("--domain tells us you already have one.")
+        sys.exit(1)
+
+    if args.event_webhook_url and not config.validate_event_webhook_url(args.event_webhook_url):
+        ui.error(f"Invalid --event-webhook-url: {args.event_webhook_url}")
+        ui.info("Must be http:// or https:// with a host.")
+        sys.exit(1)
+
+    if args.event_webhook_secret and not args.event_webhook_url:
+        ui.error("--event-webhook-secret requires --event-webhook-url")
+        sys.exit(1)
+
     hostname = args.hostname
     domain = args.domain
     ip_literal = args.ip_literal
     webhook_url = args.webhook_url
     webhook_secret = args.webhook_secret
+    event_webhook_url = args.event_webhook_url
+    event_webhook_secret = args.event_webhook_secret
     allowed_sender_domains = args.allowed_sender_domains
     allowed_senders = args.allowed_senders
     allowed_recipients = args.allowed_recipients
@@ -197,6 +223,11 @@ def configure(args: argparse.Namespace) -> dict:
         webhook_secret = config.generate_webhook_secret()
         ui.warn(f"Webhook URL set without secret - generated one: {webhook_secret}")
 
+    if event_webhook_url and not event_webhook_secret:
+        event_webhook_secret = config.generate_webhook_secret()
+        ui.warn(f"Event webhook URL set without secret - generated one: {event_webhook_secret}")
+        ui.info("Save this - you'll need it to verify event webhook deliveries")
+
     return {
         "hostname": hostname,
         "domain": domain,
@@ -204,6 +235,8 @@ def configure(args: argparse.Namespace) -> dict:
         "has_domain": has_domain,
         "webhook_url": webhook_url,
         "webhook_secret": webhook_secret,
+        "event_webhook_url": event_webhook_url,
+        "event_webhook_secret": event_webhook_secret,
         "allowed_sender_domains": allowed_sender_domains,
         "allowed_senders": allowed_senders,
         "allowed_recipients": allowed_recipients,
@@ -219,6 +252,8 @@ def write_env(install_dir: str, cfg: dict) -> None:
         ip_literal=cfg["ip_literal"],
         webhook_url=cfg["webhook_url"],
         webhook_secret=cfg["webhook_secret"],
+        event_webhook_url=cfg.get("event_webhook_url", ""),
+        event_webhook_secret=cfg.get("event_webhook_secret", ""),
         allowed_sender_domains=cfg["allowed_sender_domains"],
         allowed_senders=cfg["allowed_senders"],
         allowed_recipients=cfg["allowed_recipients"],
@@ -238,6 +273,7 @@ def print_config_summary(cfg: dict) -> None:
         ip_literal=cfg["ip_literal"],
         has_domain=cfg["has_domain"],
         webhook_url=cfg["webhook_url"],
+        event_webhook_url=cfg.get("event_webhook_url", ""),
         allowed_sender_domains=cfg["allowed_sender_domains"],
         allowed_senders=cfg["allowed_senders"],
         allowed_recipients=cfg["allowed_recipients"],
@@ -265,14 +301,15 @@ def print_dns_instructions(cfg: dict) -> None:
         ui.info("Ensure outbound DNS (port 53) is not blocked by your firewall.")
 
 
-def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
+def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: bool = False) -> dict:
     """Claim a new free subdomain on primitive.email.
     Must be called after the server is running (port 25 must be open).
     Existing claims are handled earlier in configure().
+    When `force` is True (from --claim-subdomain), skip the confirm prompt.
     Returns updated cfg if successful, original cfg if not."""
     print()
 
-    if not no_prompt:
+    if not no_prompt and not force:
         if not ui.prompt_yn(
             "Would you like a free email domain? (e.g. cool-fox.primitive.email)",
             "y",
@@ -281,15 +318,18 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool) -> dict:
             return cfg
 
     ui.info("Claiming a free subdomain...")
+    ui.json_event("step", name="claim", status="start")
     result = config.claim_subdomain()
 
     if not result:
         ui.warn("Could not claim a subdomain. You can try again later or add your own domain.")
         ui.info("Continuing with IP literal mode.")
+        ui.json_event("step", name="claim", status="fail")
         return cfg
 
     domain = result["domain"]
     ui.success(f"Claimed: {domain}")
+    ui.json_event("step", name="claim", status="ok", domain=domain)
     print()
     print(f"  {ui.BOLD}Send email to:{ui.NC}")
     print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
@@ -326,13 +366,17 @@ def print_next_steps(cfg: dict, install_dir: str) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.json_output:
+        ui.enable_json_mode()
     install_dir = os.environ.get("PRIMITIVEMAIL_DIR", "./primitivemail")
 
     check_existing_install(install_dir, args.no_prompt)
+    ui.json_event("step", name="config", status="start")
     cfg = configure(args)
     write_env(install_dir, cfg)
     print_config_summary(cfg)
     print_dns_instructions(cfg)
+    ui.json_event("step", name="config", status="ok")
     server.start_server(
         install_dir=install_dir,
         no_start=args.no_start,
@@ -341,12 +385,27 @@ def main() -> None:
     )
 
     # After server is running (port 25 open), claim a free subdomain
-    # if the user doesn't have their own domain
-    if not cfg["has_domain"] and not args.no_start:
-        cfg = try_claim_subdomain(install_dir, cfg, args.no_prompt)
+    # if the user doesn't have their own domain or explicitly asked for one
+    should_claim = (
+        not args.no_start
+        and (args.claim_subdomain or not cfg["has_domain"])
+    )
+    if should_claim:
+        cfg = try_claim_subdomain(install_dir, cfg, args.no_prompt, force=args.claim_subdomain)
 
+    ui.json_event("step", name="install_cli", status="start")
     server.install_cli(install_dir)
+    ui.json_event("step", name="install_cli", status="ok")
     print_next_steps(cfg, install_dir)
+    ui.json_event(
+        "done",
+        install_dir=os.path.abspath(install_dir),
+        hostname=cfg["hostname"],
+        domain=cfg["domain"],
+        has_domain=cfg["has_domain"],
+        ip_literal=cfg["ip_literal"],
+        event_webhook_enabled=bool(cfg.get("event_webhook_url")),
+    )
 
 
 if __name__ == "__main__":

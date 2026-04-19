@@ -197,24 +197,33 @@ def start_server(
     """Full server start orchestration."""
     if no_start:
         ui.info("Skipping start (--no-start)")
+        ui.json_event("step", name="start", status="skipped", reason="no_start")
         return
 
     compose_cmd = get_compose_cmd()
     first_build = is_first_build()
 
+    ui.json_event("step", name="build", status="start")
     build_and_start(install_dir, verbose, first_build, compose_cmd)
+    ui.json_event("step", name="build", status="ok")
 
+    ui.json_event("step", name="wait_container", status="start")
     if not wait_for_container():
         ui.error("Container failed to start")
+        ui.json_event("step", name="wait_container", status="fail")
         print()
         print("  Check logs: docker logs primitivemail")
         raise SystemExit(1)
+    ui.json_event("step", name="wait_container", status="ok")
 
+    ui.json_event("step", name="wait_smtp", status="start")
     if not wait_for_smtp():
         ui.error("PrimitiveMail started but SMTP did not become ready")
+        ui.json_event("step", name="wait_smtp", status="fail")
         print()
         print("  Check logs: docker logs primitivemail")
         raise SystemExit(1)
+    ui.json_event("step", name="wait_smtp", status="ok")
 
     ui.success("PrimitiveMail is running on port 25")
 
@@ -225,6 +234,7 @@ def start_server(
 
     ui.info(f"Checking port 25 reachability on {check_ip}...")
     status = check_port_25_reachable(check_ip)
+    ui.json_event("step", name="port25_check", status="ok", reachability=status or "unknown")
 
     if status == "open":
         ui.success("Port 25 is reachable from the outside")

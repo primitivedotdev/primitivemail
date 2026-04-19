@@ -1,5 +1,6 @@
 """Terminal UI helpers for PrimitiveMail installer."""
 
+import json as _json
 import sys
 import subprocess
 import threading
@@ -13,25 +14,62 @@ BLUE = "\033[38;2;96;165;250m"
 MUTED = "\033[38;2;113;113;122m"
 NC = "\033[0m"
 
+# JSON mode: stdout is reserved for NDJSON events. Human-readable output
+# (info, success, warn, error, step, and any bare print() from display
+# helpers) gets redirected to stderr by swapping sys.stdout at enable time.
+# NDJSON events go through the saved original stdout in json_event().
+JSON_MODE = False
+_JSON_STDOUT = None  # original sys.stdout, captured at enable time
+
+
+def enable_json_mode() -> None:
+    """Flip to JSON output mode. Redirects sys.stdout to sys.stderr so every
+    existing print() call (including ones we don't control) goes to stderr;
+    NDJSON events are written directly to the preserved original stdout."""
+    global JSON_MODE, _JSON_STDOUT
+    JSON_MODE = True
+    _JSON_STDOUT = sys.stdout
+    sys.stdout = sys.stderr
+
+
+def _human_out(msg: str) -> None:
+    print(msg)
+
+
+def line(msg: str = "") -> None:
+    """Emit a decorative line. Goes to stderr in JSON mode via the stdout swap."""
+    print(msg)
+
+
+def json_event(event: str, **fields) -> None:
+    """Emit a single NDJSON event to the preserved stdout when JSON_MODE is on."""
+    if not JSON_MODE or _JSON_STDOUT is None:
+        return
+    payload = {"event": event, **fields}
+    _JSON_STDOUT.write(_json.dumps(payload, separators=(",", ":")) + "\n")
+    _JSON_STDOUT.flush()
+
 
 def info(msg: str) -> None:
-    print(f"{MUTED}.{NC} {msg}")
+    _human_out(f"{MUTED}.{NC} {msg}")
 
 
 def success(msg: str) -> None:
-    print(f"{GREEN}+{NC} {msg}")
+    _human_out(f"{GREEN}+{NC} {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"{YELLOW}!{NC} {msg}")
+    _human_out(f"{YELLOW}!{NC} {msg}")
 
 
 def error(msg: str) -> None:
-    print(f"{RED}x{NC} {msg}")
+    _human_out(f"{RED}x{NC} {msg}")
+    if JSON_MODE:
+        json_event("error", message=msg)
 
 
 def step(msg: str) -> None:
-    print(f"{BLUE}>{NC} {BOLD}{msg}{NC}")
+    _human_out(f"{BLUE}>{NC} {BOLD}{msg}{NC}")
 
 
 def _get_tty_input(prompt_text: str) -> str:
@@ -83,6 +121,21 @@ def run_with_progress(cmd: list, label: str, verbose: bool = False, cwd: str = N
             error(f"{label} failed")
             sys.exit(1)
         success(f"{label} complete")
+        return
+
+    # JSON mode: suppress the spinner so stdout stays clean NDJSON, but still
+    # capture output for error reporting. Run the command silently.
+    if JSON_MODE:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd)
+        output, _ = process.communicate()
+        if process.returncode == 0:
+            success(f"{label} complete")
+        else:
+            error(f"{label} failed")
+            lines = output.decode("utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-20:])
+            json_event("error", step=label.lower(), message=f"{label} failed", tail=tail)
+            sys.exit(1)
         return
 
     spin_chars = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
