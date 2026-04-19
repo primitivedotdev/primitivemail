@@ -332,10 +332,15 @@ export async function deliverEvent(
 			(response.headers.get(PRIMITIVE_CONFIRMED_HEADER) === "true" ||
 				response.headers.get(LEGACY_CONFIRMED_HEADER) === "true");
 
-		// We only read headers and status — drain the body so Node's
-		// undici can release the socket back to its keep-alive pool.
-		// Unread bodies hold the connection open until GC runs.
-		await response.body?.cancel().catch(() => {});
+		// We only need headers + status — but we have to actually consume
+		// the body before undici will return the socket to its keep-alive
+		// pool. `.cancel()` would abort the stream, which tells undici to
+		// destroy the connection instead of reusing it (the opposite of
+		// what we want). `.text()` reads to completion; the outer
+		// AbortSignal.timeout still applies, so a receiver that streams
+		// a giant body can't hang us. Errors are swallowed — they
+		// shouldn't override the delivery outcome we already computed.
+		await response.text().catch(() => {});
 
 		return logAndReturn({
 			status: delivered ? "delivered" : "failed",
