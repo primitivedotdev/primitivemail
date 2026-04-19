@@ -109,8 +109,17 @@ def build_config_summary(
     allowed_senders: str,
     allowed_recipients: str,
     spoof_protection: str,
+    observability_enabled: bool = False,
 ) -> list:
-    """Build config summary as plain text lines (no ANSI)."""
+    """Build config summary as plain text lines (no ANSI).
+
+    `observability_enabled` drives a disclosure line about the Alloy +
+    postfix-exporter containers. Off by default. Phase 1 installs never
+    flip this to True on their own (the installer does not write
+    COMPOSE_PROFILES); Phase 2's upgrade helper may set it when migrating
+    existing PROMETHEUS_URL users. The summary needs both branches so
+    the disclosure is truthful either way.
+    """
     lines = []
 
     if ip_literal and not has_domain:
@@ -151,6 +160,13 @@ def build_config_summary(
     }
     lines.append(f"Spoof protection:  {spoof_labels.get(spoof_protection, 'Off')}")
     lines.append("TLS:               Self-signed (auto-generated)")
+
+    if observability_enabled:
+        lines.append("Observability:     enabled (Alloy + postfix-exporter)")
+    else:
+        lines.append("Observability:     disabled (default)")
+        lines.append("                   Set COMPOSE_PROFILES=observability in .env")
+        lines.append("                   and run `primitive restart` to enable.")
 
     return lines
 

@@ -282,6 +282,17 @@ def write_env(install_dir: str, cfg: dict) -> None:
 
 
 def print_config_summary(cfg: dict) -> None:
+    # Observability containers (alloy + postfix-exporter) are gated behind
+    # the compose `observability` profile. The installer does not write
+    # COMPOSE_PROFILES itself (Phase 1 stays out of the .env mutation
+    # business; see .internal/13). Enabled state is determined from the
+    # cfg dict and the process environment only; we do not re-parse the
+    # .env file that write_env just wrote, so a pre-existing COMPOSE_PROFILES
+    # line in .env that was not exported into the installing shell will be
+    # reported as disabled here even though `docker compose up` would
+    # activate the profile. Acceptable for Phase 1.
+    observability_enabled = _observability_is_enabled(cfg)
+
     lines = config.build_config_summary(
         hostname=cfg["hostname"],
         domain=cfg["domain"],
@@ -293,12 +304,50 @@ def print_config_summary(cfg: dict) -> None:
         allowed_senders=cfg["allowed_senders"],
         allowed_recipients=cfg["allowed_recipients"],
         spoof_protection=cfg["spoof_protection"],
+        observability_enabled=observability_enabled,
     )
     print()
     ui.step("Configuration summary")
     print()
     for line in lines:
         print(f"  {line}")
+
+    # Parallel NDJSON event for agents scripting the install. The disabled
+    # message includes the exact remediation command so an agent reading
+    # step events doesn't need to cross-reference .env.example.
+    if observability_enabled:
+        ui.json_event(
+            "step",
+            name="observability",
+            status="ok",
+            enabled=True,
+            message="Observability containers enabled (Alloy + postfix-exporter).",
+        )
+    else:
+        ui.json_event(
+            "step",
+            name="observability",
+            status="ok",
+            enabled=False,
+            message=(
+                "Observability containers disabled by default. Set "
+                "COMPOSE_PROFILES=observability in .env and run "
+                "`primitive restart` to enable."
+            ),
+        )
+
+
+def _observability_is_enabled(cfg: dict) -> bool:
+    """True if the upcoming `docker compose up` will activate the
+    `observability` profile. Phase 1 never writes COMPOSE_PROFILES from
+    the installer, so this is False for every fresh install today. A
+    pre-set environment variable (exported before install.sh ran, or set
+    in an existing .env that Phase 2's migration helper preserved) can
+    still flip it to True — check that path so the summary and the NDJSON
+    event remain truthful either way."""
+    raw = cfg.get("compose_profiles") or os.environ.get("COMPOSE_PROFILES", "")
+    profiles = [p.strip() for p in raw.split(",") if p.strip()]
+    return "observability" in profiles
 
 
 def print_dns_instructions(cfg: dict) -> None:

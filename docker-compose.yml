@@ -67,6 +67,9 @@ services:
     restart: unless-stopped
     user: "65534:65534"                    # Run as nobody (non-root)
     read_only: true                         # Read-only filesystem
+    # Part of the observability profile. Off by default; enable with
+    # COMPOSE_PROFILES=observability in .env. See .env.example.
+    profiles: [observability]
     command:
       - --postfix.logfile_path=/var/log/postfix.log
       - --postfix.showq_path=/nonexistent  # Disable socket (log-only mode)
@@ -83,11 +86,24 @@ services:
         condition: service_healthy
 
   alloy:
-    image: grafana/alloy:latest
+    # Pinned deliberately. Alloy evolves fast; `:latest` has broken
+    # `alloy-config.alloy` compatibility in the past. Bump the pin in a
+    # dedicated PR that re-tests the config against the new release.
+    image: grafana/alloy:v1.15.1
     container_name: alloy
     restart: unless-stopped
     user: "65534:65534"                    # Run as nobody
     read_only: true
+    # Part of the observability profile. Off by default; enable with
+    # COMPOSE_PROFILES=observability in .env. See .env.example.
+    profiles: [observability]
+    # Wait for the scrape target so we don't spew connection errors
+    # during the window between compose starting alloy and the exporter
+    # finishing its own init. service_started (not service_healthy)
+    # because postfix-exporter has no healthcheck of its own.
+    depends_on:
+      postfix-exporter:
+        condition: service_started
     command:
       - run
       - --storage.path=/tmp/alloy

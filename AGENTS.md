@@ -168,6 +168,10 @@ Key settings:
 
 After editing `.env`, run `primitive restart` to apply changes.
 
+### Observability (optional)
+
+The Prometheus exporter (`postfix-exporter`) and log forwarder (Grafana Alloy) are off by default. To enable them, set `COMPOSE_PROFILES=observability` in `.env` and run `primitive restart`. Configure `PROMETHEUS_URL` / `PROMETHEUS_USER` / `PROMETHEUS_KEY` to point at your Prometheus-compatible endpoint.
+
 ## File Layout
 
 ```
