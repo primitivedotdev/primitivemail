@@ -44,7 +44,6 @@ const inFlightDeliveries = new Set<Promise<void>>();
 let deliveryConfig: LoadedDeliveryConfig = { enabled: false };
 let downloadServer: StartedDownloadServer | null = null;
 
-
 /**
  * Recover the next sequence number from the last line of the journal.
  */
