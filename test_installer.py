@@ -703,6 +703,62 @@ class TestHeartbeatTicker:
         assert captured.out == ""
         assert captured.err == ""
 
+    def test_no_heartbeat_after_step_fail_in_caller_pattern(self, capsys):
+        # Pattern-level regression: locks in the try/except SystemExit shape
+        # used by start_server — step:fail emitted OUTSIDE the with-block so
+        # the ticker thread is joined before the terminal event lands.
+        #
+        # Caveat: this test does NOT reliably reproduce the narrow race the
+        # ordering fix targets. That race requires the ticker thread to be
+        # past stop.wait() but pre-emit at the microsecond `stop.set()` fires
+        # — hard to trigger deterministically without mocking json_event to
+        # block. The structural fix (join before emitting terminal) is what
+        # prevents the race; this test confirms the pattern is intact and
+        # that heartbeats DO fire before the fail (non-vacuous), which is
+        # what a future refactor would accidentally break.
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            ui.json_event("step", name="build", status="start")
+            try:
+                with ui.HeartbeatTicker("build", interval=0.1):
+                    _time.sleep(0.25)   # let a couple heartbeats fire
+                    raise SystemExit(1)
+            except SystemExit:
+                ui.json_event("step", name="build", status="fail")
+            # Give a rogue trailing heartbeat plenty of time to surface.
+            _time.sleep(0.3)
+
+            captured = capsys.readouterr()
+            events = [_json.loads(l) for l in captured.out.strip().split("\n") if l]
+            fail_idx = next(
+                i for i, e in enumerate(events)
+                if e.get("event") == "step" and e.get("status") == "fail"
+            )
+            # Invariant: nothing but step:fail (and any explicit later events)
+            # after the terminal. No step_progress.
+            trailing_heartbeats = [
+                e for e in events[fail_idx + 1:]
+                if e.get("event") == "step_progress"
+            ]
+            assert trailing_heartbeats == [], (
+                f"step_progress fired after step:fail (contract violation): "
+                f"{trailing_heartbeats}"
+            )
+            # Proof heartbeats WERE firing — otherwise the test is vacuous.
+            preceding_heartbeats = [
+                e for e in events[:fail_idx]
+                if e.get("event") == "step_progress"
+            ]
+            assert len(preceding_heartbeats) >= 1, (
+                f"expected at least one heartbeat before fail; got {events}"
+            )
+        finally:
+            self._reset_json_mode()
+
 
 # ===========================================================================
 # parse_args behavior
