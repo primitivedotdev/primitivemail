@@ -285,9 +285,12 @@ def print_config_summary(cfg: dict) -> None:
     # Observability containers (alloy + postfix-exporter) are gated behind
     # the compose `observability` profile. The installer does not write
     # COMPOSE_PROFILES itself (Phase 1 stays out of the .env mutation
-    # business; see .internal/13). Enabled state is determined by the .env
-    # that the installer just wrote plus any inherited env, both checked
-    # the same way compose reads them at `docker compose up` time.
+    # business; see .internal/13). Enabled state is determined from the
+    # cfg dict and the process environment only; we do not re-parse the
+    # .env file that write_env just wrote, so a pre-existing COMPOSE_PROFILES
+    # line in .env that was not exported into the installing shell will be
+    # reported as disabled here even though `docker compose up` would
+    # activate the profile. Acceptable for Phase 1.
     observability_enabled = _observability_is_enabled(cfg)
 
     lines = config.build_config_summary(

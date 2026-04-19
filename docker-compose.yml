@@ -97,6 +97,13 @@ services:
     # Part of the observability profile. Off by default; enable with
     # COMPOSE_PROFILES=observability in .env. See .env.example.
     profiles: [observability]
+    # Wait for the scrape target so we don't spew connection errors
+    # during the window between compose starting alloy and the exporter
+    # finishing its own init. service_started (not service_healthy)
+    # because postfix-exporter has no healthcheck of its own.
+    depends_on:
+      postfix-exporter:
+        condition: service_started
     command:
       - run
       - --storage.path=/tmp/alloy
