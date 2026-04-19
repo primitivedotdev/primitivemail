@@ -5,12 +5,28 @@ import argparse
 import json
 import os
 import pwd
+import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 VERSION = "0.1.0"
+
+# Doc 08's "Implementation sketch" points at doc 00's SDK-adoption rule for
+# canonical-event validation in `emails read`. The public SDK helper
+# `validate_email_received_event` validates the webhook-event shape (with
+# `event`, `delivery`, `evt_` id), NOT the on-disk canonical stored by the
+# watcher (watcher.ts writes a canonical-email object with no webhook envelope).
+# Running that validator against the on-disk canonical would exit 5 on every
+# real email. Until the SDK exposes a helper that targets the on-disk
+# canonical shape specifically, the CLI treats JSON-parse success as the
+# exit-5 threshold. This matches doc 08's intent ("exit 5 on corrupted data")
+# without emitting a false positive on every well-formed email.
+
+
+_CANONICAL_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 
 
 def _invoking_user_home() -> Path:
@@ -50,6 +66,177 @@ def parse_filename_timestamp(filename):
         return datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
     except (ValueError, IndexError):
         return None
+
+
+def _tty_stderr(msg):
+    """Write a human status line to stderr only when stderr is a TTY.
+
+    Pipes and scripted consumers see a clean stderr; human operators see
+    match counts and applied-filter summaries.
+    """
+    if sys.stderr.isatty():
+        print(msg, file=sys.stderr)
+
+
+def _journal_path(maildata: Path) -> Path:
+    return maildata / "emails.jsonl"
+
+
+def _is_tombstone(entry: dict) -> bool:
+    """Tombstone schema (forward-compatible, design-captured in doc 22)."""
+    return entry.get("type") == "tombstone"
+
+
+def _iter_journal(path: Path, since_seq: int = 0, limit: int = 0):
+    """Yield (offset_after_line, raw_line_bytes, parsed_entry) tuples.
+
+    The journal is append-only and monotonic in `seq`; we stream forward.
+    `since_seq=0` yields every entry. `limit=0` means no limit.
+
+    Raises FileNotFoundError if the journal does not exist. Raises a
+    ValueError wrapping (offset, excerpt, error) when a line is not valid
+    JSON; callers map that to exit 5.
+    """
+    emitted = 0
+    with open(path, "rb") as fh:
+        offset = 0
+        for raw in fh:
+            offset += len(raw)
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                excerpt = stripped[:80].decode("utf-8", errors="replace")
+                raise ValueError(
+                    f"corrupt journal line at offset {offset - len(raw)}: "
+                    f"{exc} (excerpt: {excerpt!r})"
+                ) from exc
+            seq = entry.get("seq")
+            if not isinstance(seq, int):
+                raise ValueError(
+                    f"journal entry missing integer seq at offset {offset - len(raw)}"
+                )
+            if seq <= since_seq:
+                continue
+            yield offset, raw, entry
+            emitted += 1
+            if limit and emitted >= limit:
+                return
+
+
+def _resolve_id(maildata: Path, selector, *, domain=None, allow_prefix=False):
+    """Resolve a selector to a concrete (domain, id) pair.
+
+    Journal-authoritative. Filesystem globs are never used; the only
+    filesystem access is an exact-path stat on known, sidecar-free
+    suffixes performed by callers after this function returns. See doc 08
+    "Id resolution: authoritative spec" for the full contract.
+
+    Returns (domain, id) on success.
+
+    Raises `ResolveError(exit_code, message)` on failure, where exit_code
+    follows the shared exit-code scheme at the top of doc 08.
+    """
+    if not isinstance(selector, str) or not selector:
+        raise ResolveError(2, "empty id selector")
+
+    is_full_id = bool(_CANONICAL_ID_RE.match(selector))
+
+    # Case 1: full id + explicit --domain. Exact-path stat only.
+    if is_full_id and domain is not None:
+        canonical = maildata / domain / f"{selector}.json"
+        if canonical.exists():
+            return (domain, selector)
+        meta = maildata / domain / f"{selector}.meta.json"
+        if meta.exists():
+            # pre-canonical: watcher never produced <id>.json. Distinct from not-found.
+            raise ResolveError(
+                3,
+                f"id {selector} under {domain} is pre-canonical "
+                f"(meta.json exists, .json does not)",
+            )
+        raise ResolveError(1, f"id not found: {selector} under {domain}")
+
+    # Reject invalid selectors before touching the filesystem. A non-full
+    # id without --prefix can never match anything (the scan below is
+    # guarded on is_full_id / allow_prefix), so there is no reason to walk
+    # a potentially large journal just to raise exit 2.
+    if not is_full_id and not allow_prefix:
+        raise ResolveError(
+            2,
+            f"selector {selector!r} is not a full canonical id; "
+            "pass a full id like 20260417T101203Z-a1b2c3d4 "
+            "(--prefix is reserved for opt-in human use)",
+        )
+
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        raise ResolveError(1, f"journal not found at {journal}")
+
+    # Case 2 or 3: scan the journal (the authoritative source).
+    matches = []  # list of (domain, id)
+    try:
+        for _, _, entry in _iter_journal(journal):
+            if _is_tombstone(entry):
+                continue
+            entry_id = entry.get("id")
+            entry_domain = entry.get("domain")
+            if not isinstance(entry_id, str) or not isinstance(entry_domain, str):
+                continue
+            if is_full_id:
+                if entry_id == selector:
+                    matches.append((entry_domain, entry_id))
+            elif allow_prefix:
+                if entry_id.startswith(selector):
+                    matches.append((entry_domain, entry_id))
+    except ValueError as exc:
+        raise ResolveError(5, str(exc)) from exc
+
+    if not matches:
+        raise ResolveError(1, f"id not found: {selector}")
+
+    # Deduplicate identical (domain, id) pairs a tombstone-free forward
+    # scan should never yield, but the journal may legitimately repeat
+    # under recovery scenarios.
+    unique = list(dict.fromkeys(matches))
+    if len(unique) > 1:
+        domains = sorted({d for d, _ in unique})
+        raise ResolveError(
+            3,
+            f"ambiguous id {selector!r}: matches {len(unique)} entries "
+            f"(domains: {', '.join(domains)})",
+        )
+
+    return unique[0]
+
+
+class ResolveError(Exception):
+    def __init__(self, exit_code, message):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.message = message
+
+
+def _iso_timestamp(s):
+    """Parse an ISO-8601 UTC timestamp for `emails count --since`.
+
+    Rejects non-UTC values (no offset other than Z or +00:00) so the
+    contract is unambiguous. Raises ValueError on any invalid input.
+    """
+    if not isinstance(s, str) or not s:
+        raise ValueError("empty timestamp")
+    normalized = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"not a valid ISO-8601 timestamp: {s!r}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp must be UTC (e.g. ...Z): {s!r}")
+    if parsed.utcoffset() != timezone.utc.utcoffset(None):
+        raise ValueError(f"timestamp must be UTC (offset must be 0): {s!r}")
+    return parsed
 
 
 def cmd_version(args):
@@ -93,6 +280,448 @@ def cmd_emails_status(args):
     print(f"Last from:     {sender}")
 
 
+def cmd_emails_status_alias(args):
+    """Hidden compatibility shim for the old `emails-status` command.
+
+    Drops one release cycle after the `emails status` rename. See doc 08
+    "Compatibility notes".
+    """
+    print(
+        "warning: `primitive emails-status` is deprecated; "
+        "use `primitive emails status`",
+        file=sys.stderr,
+    )
+    cmd_emails_status(args)
+
+
+def cmd_emails_list(args):
+    maildata = get_maildata_path(args)
+    if not maildata.exists():
+        print(f"No maildata directory found at {maildata}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.limit is not None and args.limit < 0:
+        print("--limit must be >= 0 (0 means unlimited)", file=sys.stderr)
+        sys.exit(2)
+
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        # Empty inbox, not an error.
+        _tty_stderr("no emails (journal not yet created)")
+        return
+
+    limit = args.limit if args.limit is not None else 20
+    since = args.since or 0
+
+    matched = []
+    try:
+        for _, raw, entry in _iter_journal(journal, since_seq=since):
+            if _is_tombstone(entry):
+                continue
+            if args.domain and entry.get("domain") != args.domain:
+                continue
+            if args.from_addr:
+                from_addr = entry.get("from_address") or ""
+                if args.from_addr not in from_addr:
+                    continue
+            matched.append((raw, entry))
+            # `limit=0` is unlimited; otherwise stop once we have `limit`.
+            if limit and len(matched) >= limit:
+                break
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(5)
+
+    if args.json:
+        out = sys.stdout.buffer
+        for raw, _ in matched:
+            out.write(raw if raw.endswith(b"\n") else raw + b"\n")
+        out.flush()
+    else:
+        _print_list_human(matched)
+
+    filters = []
+    if args.domain:
+        filters.append(f"domain={args.domain}")
+    if args.from_addr:
+        filters.append(f"from~={args.from_addr}")
+    if since:
+        filters.append(f"since={since}")
+    filter_str = f" ({', '.join(filters)})" if filters else ""
+    _tty_stderr(f"{len(matched)} match(es){filter_str}")
+
+
+def _print_list_human(rows):
+    if not rows:
+        return
+    widths = {"seq": len("seq"), "received_at": len("received_at"), "from": len("from_address")}
+    normalized = []
+    for _, entry in rows:
+        seq = str(entry.get("seq", ""))
+        received = str(entry.get("received_at", ""))
+        from_addr = str(entry.get("from_address") or "")
+        subject = str(entry.get("subject") or "")
+        widths["seq"] = max(widths["seq"], len(seq))
+        widths["received_at"] = max(widths["received_at"], len(received))
+        widths["from"] = max(widths["from"], len(from_addr))
+        normalized.append((seq, received, from_addr, subject))
+    header = (
+        f"{'seq'.ljust(widths['seq'])}  "
+        f"{'received_at'.ljust(widths['received_at'])}  "
+        f"{'from_address'.ljust(widths['from'])}  subject"
+    )
+    print(header)
+    for seq, received, from_addr, subject in normalized:
+        print(
+            f"{seq.ljust(widths['seq'])}  "
+            f"{received.ljust(widths['received_at'])}  "
+            f"{from_addr.ljust(widths['from'])}  {subject}"
+        )
+
+
+def cmd_emails_read(args):
+    maildata = get_maildata_path(args)
+    if not maildata.exists():
+        print(f"No maildata directory found at {maildata}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        domain, resolved_id = _resolve_id(
+            maildata, args.id, domain=args.domain, allow_prefix=False,
+        )
+    except ResolveError as exc:
+        print(exc.message, file=sys.stderr)
+        sys.exit(exc.exit_code)
+
+    domain_dir = maildata / domain
+    fmt = args.format
+
+    if fmt == "raw":
+        eml_path = domain_dir / f"{resolved_id}.eml"
+        if not eml_path.exists():
+            print(f"raw .eml not found: {eml_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with open(eml_path, "rb") as fh:
+                sys.stdout.buffer.write(fh.read())
+            sys.stdout.buffer.flush()
+        except OSError as exc:
+            print(f"could not read {eml_path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    canonical_path = domain_dir / f"{resolved_id}.json"
+    if not canonical_path.exists():
+        print(f"canonical json not found: {canonical_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Read the canonical exactly once and parse it once. --format json
+    # emits the raw bytes verbatim (preserving key order and whitespace);
+    # --format text/html reads fields off the parsed dict. Splitting the
+    # read between `read_text()` inside a helper and a follow-up
+    # `read_bytes()` doubled the I/O and introduced a TOCTOU window.
+    try:
+        content = canonical_path.read_bytes()
+        event = json.loads(content)
+        if not isinstance(event, dict):
+            raise ValueError("canonical event is not a JSON object")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"{canonical_path}: {exc}", file=sys.stderr)
+        sys.exit(5)
+
+    if fmt == "json":
+        sys.stdout.buffer.write(content)
+        if not content.endswith(b"\n"):
+            sys.stdout.buffer.write(b"\n")
+        sys.stdout.buffer.flush()
+        return
+
+    # Guard against a malformed `email` field. The canonical schema
+    # requires `email` to be an object and `email.parsed` to be an object
+    # (or absent). Before this check the naive `event.get("email", {})
+    # .get("parsed")` would raise AttributeError on `"email": null`,
+    # leaking a Python traceback instead of the exit-5 contract a caller
+    # expects for a malformed canonical.
+    email_obj = event.get("email")
+    if not isinstance(email_obj, dict):
+        print(
+            f"{canonical_path}: malformed canonical (email is not an object)",
+            file=sys.stderr,
+        )
+        sys.exit(5)
+    parsed = email_obj.get("parsed")
+    if parsed is None:
+        parsed = {}
+    elif not isinstance(parsed, dict):
+        print(
+            f"{canonical_path}: malformed canonical (email.parsed is not an object)",
+            file=sys.stderr,
+        )
+        sys.exit(5)
+    if fmt == "text":
+        body = parsed.get("body_text")
+        if not body:
+            print("no body_text on this email", file=sys.stderr)
+            sys.exit(1)
+        print(body)
+        return
+    if fmt == "html":
+        body = parsed.get("body_html")
+        if not body:
+            print("no body_html on this email", file=sys.stderr)
+            sys.exit(1)
+        print(body)
+        return
+
+
+def cmd_emails_since(args):
+    maildata = get_maildata_path(args)
+    if not maildata.exists():
+        print(f"No maildata directory found at {maildata}", file=sys.stderr)
+        sys.exit(1)
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        print(f"journal not found at {journal}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        since_seq = int(args.seq)
+    except (TypeError, ValueError):
+        print(f"invalid <seq>: {args.seq!r} (must be a non-negative integer)", file=sys.stderr)
+        sys.exit(2)
+    if since_seq < 0:
+        print("<seq> must be >= 0", file=sys.stderr)
+        sys.exit(2)
+    if args.limit is not None and args.limit < 0:
+        print("--limit must be >= 0", file=sys.stderr)
+        sys.exit(2)
+
+    limit = args.limit if args.limit is not None else 0
+
+    out = sys.stdout.buffer
+    last_seq = since_seq
+    emitted = 0
+
+    def _emit(raw_bytes, entry):
+        nonlocal last_seq, emitted
+        out.write(raw_bytes if raw_bytes.endswith(b"\n") else raw_bytes + b"\n")
+        out.flush()
+        last_seq = entry.get("seq", last_seq)
+        emitted += 1
+
+    # Catch-up phase: scan forward from current EOF.
+    # Exit 5 paths here emit `last_seq=<N>` on stderr before exiting, so a
+    # consumer can resume from the last good entry regardless of which phase
+    # the corruption surfaced in. The follow phase has the same guarantee;
+    # the two shapes match so callers do not need phase-aware parsers.
+    try:
+        offset = 0
+        with open(journal, "rb") as fh:
+            for raw in fh:
+                offset += len(raw)
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    entry = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    print(f"last_seq={last_seq}", file=sys.stderr)
+                    print(
+                        f"corrupt journal line at offset {offset - len(raw)}: {exc}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(5)
+                seq = entry.get("seq")
+                if not isinstance(seq, int):
+                    print(f"last_seq={last_seq}", file=sys.stderr)
+                    print(
+                        f"journal entry missing integer seq at offset {offset - len(raw)}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(5)
+                if seq <= last_seq:
+                    continue
+                _emit(raw, entry)
+                if limit and emitted >= limit:
+                    if not args.follow:
+                        return
+                    break
+    except OSError as exc:
+        print(f"could not read journal: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.follow:
+        return
+
+    # Follow phase: poll file size, read complete lines from current offset,
+    # exit 4 on rotation or truncation. See doc 07 "Rotation and follow-race".
+    try:
+        st = os.stat(journal)
+    except OSError as exc:
+        print(f"journal disappeared: {exc}", file=sys.stderr)
+        sys.exit(4)
+    inode = st.st_ino
+    size = offset  # everything through catch-up is consumed
+    # One extra forward read to close the catch-up / follow handoff race.
+    try:
+        with open(journal, "rb") as fh:
+            fh.seek(size)
+            remaining = fh.read()
+        size += _emit_complete_lines(remaining, _emit)
+    except OSError as exc:
+        print(f"follow read failed: {exc}", file=sys.stderr)
+        sys.exit(4)
+    except _FollowCorruption as exc:
+        print(f"last_seq={last_seq}", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        sys.exit(5)
+
+    # Per doc 07: --limit caps catch-up only; follow-mode streaming runs
+    # uncapped once catch-up is complete.
+    try:
+        while True:
+            try:
+                st = os.stat(journal)
+            except FileNotFoundError:
+                print(f"last_seq={last_seq}", file=sys.stderr)
+                print("journal disappeared", file=sys.stderr)
+                sys.exit(4)
+            if st.st_ino != inode:
+                print(f"last_seq={last_seq}", file=sys.stderr)
+                print("journal rotated (inode changed)", file=sys.stderr)
+                sys.exit(4)
+            if st.st_size < size:
+                print(f"last_seq={last_seq}", file=sys.stderr)
+                print("journal truncated", file=sys.stderr)
+                sys.exit(4)
+            if st.st_size > size:
+                try:
+                    with open(journal, "rb") as fh:
+                        fh.seek(size)
+                        chunk = fh.read(st.st_size - size)
+                except OSError as exc:
+                    print(f"follow read failed: {exc}", file=sys.stderr)
+                    sys.exit(4)
+                try:
+                    size += _emit_complete_lines(chunk, _emit)
+                except _FollowCorruption as exc:
+                    print(f"last_seq={last_seq}", file=sys.stderr)
+                    print(str(exc), file=sys.stderr)
+                    sys.exit(5)
+                if size < st.st_size:
+                    # Writer appended a partial (non-\n-terminated) line.
+                    # Sleep before the next stat so we don't busy-spin on
+                    # the same unconsumed bytes while waiting for the
+                    # line terminator.
+                    time.sleep(0.25)
+                continue
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        # SIGINT: report last_seq and exit 0 per doc 07.
+        print(f"last_seq={last_seq}", file=sys.stderr)
+        sys.exit(0)
+
+
+class _FollowCorruption(Exception):
+    """Corruption detected mid-follow.
+
+    Raised by `_emit_complete_lines` instead of calling sys.exit directly so
+    the caller can emit `last_seq=<N>` to stderr before exiting 5, matching
+    the convention every exit-4 path in the follow loop already uses. Without
+    this, consumers parsing `last_seq=` from stderr cannot resume after a
+    corruption event.
+    """
+
+
+def _emit_complete_lines(buf: bytes, emit):
+    """Emit complete lines from buf using the given emit callable.
+
+    Returns the number of bytes consumed (the offset of the last newline).
+    A trailing partial line is not emitted, matching `tail -f` semantics.
+
+    Raises `_FollowCorruption` on bad JSON or a missing integer seq. The
+    caller is expected to report `last_seq` and exit 5.
+    """
+    consumed = 0
+    lines = buf.split(b"\n")
+    # If the buffer ended with \n, the last split entry is "".
+    # If it ended mid-line, keep that tail unconsumed.
+    for line in lines[:-1]:
+        raw = line + b"\n"
+        stripped = line.strip()
+        consumed += len(raw)
+        if not stripped:
+            continue
+        try:
+            entry = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise _FollowCorruption(f"corrupt journal line during follow: {exc}") from exc
+        seq = entry.get("seq")
+        if not isinstance(seq, int):
+            raise _FollowCorruption("journal entry missing integer seq during follow")
+        emit(raw, entry)
+    return consumed
+
+
+def cmd_emails_count(args):
+    maildata = get_maildata_path(args)
+    if not maildata.exists():
+        print(f"No maildata directory found at {maildata}", file=sys.stderr)
+        sys.exit(1)
+
+    since_ts = None
+    if args.since:
+        try:
+            since_ts = _iso_timestamp(args.since)
+        except ValueError as exc:
+            print(f"--since: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        # No journal, no emails. Matches "empty result is still success".
+        print(0)
+        _tty_stderr("0 match(es) (no journal)")
+        return
+
+    count = 0
+    try:
+        for _, _, entry in _iter_journal(journal):
+            if _is_tombstone(entry):
+                continue
+            if args.domain and entry.get("domain") != args.domain:
+                continue
+            if args.from_addr:
+                from_addr = entry.get("from_address") or ""
+                if args.from_addr not in from_addr:
+                    continue
+            if since_ts is not None:
+                received = entry.get("received_at")
+                if not isinstance(received, str):
+                    continue
+                try:
+                    received_dt = _iso_timestamp(received)
+                except ValueError:
+                    continue
+                if received_dt < since_ts:
+                    continue
+            count += 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(5)
+
+    print(count)
+    filters = []
+    if args.domain:
+        filters.append(f"domain={args.domain}")
+    if args.from_addr:
+        filters.append(f"from~={args.from_addr}")
+    if args.since:
+        filters.append(f"since={args.since}")
+    filter_str = f" ({', '.join(filters)})" if filters else ""
+    _tty_stderr(f"{count} match(es){filter_str}")
+
+
 def get_install_path():
     """Resolve the primitivemail install directory. Sudo-aware: when
     invoked under `sudo`, resolves against the original user's home
@@ -123,7 +752,7 @@ def cmd_restart(args):
     print("Done.")
 
 
-def main():
+def _build_parser():
     parser = argparse.ArgumentParser(
         prog="primitive",
         description="PrimitiveMail CLI - manage your self-hosted inbox",
@@ -132,15 +761,87 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("version", help="Show version")
-    sub.add_parser("emails-status", help="Show email inbox status")
+
+    emails = sub.add_parser("emails", help="Inspect the email inbox")
+    emails_sub = emails.add_subparsers(dest="emails_command")
+
+    emails_sub.add_parser("status", help="Count emails, show latest sender/time")
+
+    p_list = emails_sub.add_parser("list", help="List recent emails from the journal")
+    p_list.add_argument("--limit", type=int, default=None,
+                        help="Return at most N entries. Default 20. Use 0 for unlimited.")
+    p_list.add_argument("--since", type=int, default=None,
+                        help="Only entries with seq > <seq>. Default 0. "
+                             "For live tailing, see `emails since --follow`.")
+    p_list.add_argument("--domain", default=None,
+                        help="Filter by recipient domain.")
+    p_list.add_argument("--from", dest="from_addr", default=None,
+                        help='Substring match on "from_address".')
+    p_list.add_argument("--json", action="store_true",
+                        help="Emit one JSON object per line on stdout "
+                             "(matches emails.jsonl format).")
+
+    p_read = emails_sub.add_parser("read", help="Read one email in json, raw, text, or html")
+    p_read.add_argument("id", help="Canonical id (exact match).")
+    p_read.add_argument("--format", choices=["json", "raw", "text", "html"], default="json")
+    p_read.add_argument("--domain", default=None,
+                        help="Disambiguate when the id exists under two or more domains.")
+
+    p_since = emails_sub.add_parser(
+        "since",
+        help="Stream journal entries with seq > <seq>. "
+             "For filtered/formatted output, see `emails list --since`.",
+    )
+    p_since.add_argument("seq", help="Emit entries with seq > <seq>. Use 0 from the start.")
+    p_since.add_argument("--follow", "-f", action="store_true",
+                         help="After catch-up, keep streaming new entries.")
+    p_since.add_argument("--limit", type=int, default=None,
+                         help="Stop after N catch-up entries (0 = unlimited).")
+
+    p_count = emails_sub.add_parser(
+        "count", help="Count matching emails. Prints a single integer.",
+    )
+    p_count.add_argument("--domain", default=None, help="Filter by recipient domain.")
+    p_count.add_argument("--since", default=None,
+                         help="ISO-8601 received_at lower bound (inclusive, UTC).")
+    p_count.add_argument("--from", dest="from_addr", default=None,
+                         help="Substring match on from_address.")
+
+    # Hidden compatibility alias for the pre-rename command. Omitting `help=`
+    # keeps the descriptive row out of `primitive --help` so agents reading the
+    # help surface do not pick it up; the name still resolves as a valid
+    # command, prints a deprecation notice, and forwards to `emails status`.
+    # Drop one release after `emails status` ships.
+    sub.add_parser("emails-status")
+
     sub.add_parser("restart", help="Reload config and restart changed containers")
 
+    return parser
+
+
+def main():
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.command == "version":
         cmd_version(args)
     elif args.command == "emails-status":
-        cmd_emails_status(args)
+        cmd_emails_status_alias(args)
+    elif args.command == "emails":
+        sub = getattr(args, "emails_command", None)
+        if sub == "status":
+            cmd_emails_status(args)
+        elif sub == "list":
+            cmd_emails_list(args)
+        elif sub == "read":
+            cmd_emails_read(args)
+        elif sub == "since":
+            cmd_emails_since(args)
+        elif sub == "count":
+            cmd_emails_count(args)
+        else:
+            parser.parse_args(["emails", "--help"])
+            sys.exit(1)
     elif args.command == "restart":
         cmd_restart(args)
     else:
