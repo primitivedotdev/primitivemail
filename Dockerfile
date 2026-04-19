@@ -57,4 +57,14 @@ RUN mkdir -p /var/spool/postfix /var/lib/postfix && \
 
 EXPOSE 25 9901
 
+# Healthcheck: container is healthy once postfix is listening on :25 AND has
+# written its log file. This gates postfix-exporter's start via compose's
+# `depends_on: condition: service_healthy` — without it, the exporter races
+# primitivemail and crashloops ~5× trying to open /var/log/postfix.log before
+# postfix has created it. start-period tolerates the ~5s entrypoint (TLS cert
+# generation, milter startup wait, postfix launch); retries give slower boxes
+# more headroom.
+HEALTHCHECK --interval=3s --timeout=3s --start-period=5s --retries=20 \
+    CMD test -f /var/log/postfix.log && ss -tln 2>/dev/null | grep -q ":25 " || exit 1
+
 CMD ["/opt/mx-box/entrypoint.sh"]

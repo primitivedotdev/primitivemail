@@ -44,6 +44,7 @@ detail()  { _ui_out "  $*"; }
 # --- Parse --dir and --help before forwarding to Python ------------------
 
 INSTALL_DIR="${PRIMITIVEMAIL_DIR:-./primitivemail}"
+PREFLIGHT_MODE=0
 FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -54,6 +55,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dir=*)
             INSTALL_DIR="${1#--dir=}"
+            shift
+            ;;
+        --preflight)
+            # Read-only environment check: RAM, disk, port 25 reachability,
+            # outbound HTTPS, docker daemon state. Emits one JSON line and
+            # exits without starting the full install.
+            PREFLIGHT_MODE=1
             shift
             ;;
         --json)
@@ -90,6 +98,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Other:"
             echo "  --dir PATH                Install directory (default: ./primitivemail)"
+            echo "  --preflight               Check environment (RAM, disk, port 25, outbound HTTPS)"
+            echo "                            without installing. Emits one JSON line, exits 1 on failure."
             echo "  --help, -h                Show this help"
             exit 0
             ;;
@@ -100,6 +110,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Absolutize INSTALL_DIR before export. run_preflight `cd`s to the
+# installer module's directory before `exec`-ing Python, so a relative
+# PRIMITIVEMAIL_DIR would get abspath()'d against the WRONG cwd and the
+# disk check would probe the install.sh directory instead of the user's
+# intended target. Using `$(pwd)/$INSTALL_DIR` instead of `cd && pwd`
+# because the directory may not exist yet on first install.
+if [[ "$INSTALL_DIR" != /* ]]; then
+    INSTALL_DIR="$(pwd)/$INSTALL_DIR"
+fi
 export PRIMITIVEMAIL_DIR="$INSTALL_DIR"
 
 # --- Banner --------------------------------------------------------------
@@ -325,9 +344,61 @@ check_python() {
     success "Python 3 installed"
 }
 
+# --- Preflight (read-only env check) -------------------------------------
+
+# Delegates to installer/preflight.py. When run via `curl ... | bash --preflight`
+# there is no local checkout yet, so we fetch the preflight module from the
+# repo into a tempfile and run it directly. When run from a checkout, use the
+# local copy so branches can test their own preflight logic.
+#
+# This path is read-only: does NOT install Docker, does NOT install Python,
+# does NOT clone the repo. The whole point is catching "this environment
+# cannot support an install" before any of those mutations happen.
+run_preflight() {
+    if ! command -v python3 &> /dev/null; then
+        printf '{"event":"preflight","overall":"fail","failed":["python"],"checks":{"python":{"status":"fail","installed":false,"message":"python3 is required for preflight"}}}\n'
+        exit 1
+    fi
+
+    # Prefer a local checkout sitting alongside this script (dev / test).
+    local script_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "$script_dir" && -f "$script_dir/installer/preflight.py" ]]; then
+        cd "$script_dir"
+        exec python3 -u -m installer.preflight
+    fi
+    if [[ -d "$INSTALL_DIR/installer" && -f "$INSTALL_DIR/installer/preflight.py" ]]; then
+        cd "$INSTALL_DIR"
+        exec python3 -u -m installer.preflight
+    fi
+
+    # curl|bash path: no checkout available — fetch the module directly.
+    local tmp_preflight
+    tmp_preflight=$(mktemp)
+    # Plain `exit` triggers the trap; `exec` would replace the shell before
+    # EXIT fires, leaving the tempfile behind. So run python non-exec and
+    # propagate its exit code explicitly.
+    trap 'rm -f "$tmp_preflight"' EXIT
+    local raw_url="https://raw.githubusercontent.com/primitivedotdev/primitivemail/main/installer/preflight.py"
+    if ! curl -fsSL --max-time 10 "$raw_url" -o "$tmp_preflight"; then
+        printf '{"event":"preflight","overall":"fail","failed":["fetch"],"checks":{"fetch":{"status":"fail","message":"could not fetch preflight module from %s"}}}\n' "$raw_url"
+        exit 1
+    fi
+    python3 -u "$tmp_preflight"
+    exit $?
+}
+
 # --- Main ----------------------------------------------------------------
 
 main() {
+    # Preflight runs before any mutating step (Docker install, firewall, clone).
+    # Emits a single JSON line and exits with 0/1 so agents can gate on it.
+    if [[ "$PREFLIGHT_MODE" == "1" ]]; then
+        run_preflight
+    fi
+
     print_banner
     check_docker
     open_firewall
@@ -343,7 +414,10 @@ main() {
         exit 1
     fi
 
-    exec python3 -m installer.main ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+    # -u forces unbuffered stdio. Agents tailing /tmp/install.stderr (or any
+    # log file redirection) otherwise see block-buffered output lagging
+    # reality by minutes when stderr is a file instead of a TTY.
+    exec python3 -u -m installer.main ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
 }
 
 main

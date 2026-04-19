@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for installer/config.py pure functions."""
 
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -535,12 +536,13 @@ class TestJsonMode:
                 sys.stdout = ui._JSON_STDOUT
                 ui._JSON_STDOUT = None
 
-    def test_run_with_progress_emits_step_fail_before_error(self, capsys):
-        # Regression: when a subprocess under run_with_progress fails in JSON
-        # mode, the outer step-start (e.g. {step:"build",status:"start"}) must
-        # get a matching terminal step event before we bail. Agents keying on
-        # step=="build" were missing the failure entirely because the error
-        # event used step=label.lower() ("building") and no step-fail fired.
+    def test_run_with_progress_emits_error_not_step_fail(self, capsys):
+        # Contract: run_with_progress emits an `error` event keyed on step_name
+        # when the subprocess fails in JSON mode. It deliberately does NOT emit
+        # step:fail — that's the caller's responsibility (see start_server's
+        # try/except SystemExit around the HeartbeatTicker). Emitting step:fail
+        # here would (a) duplicate when the caller also emits it, and (b) race
+        # a trailing heartbeat from the still-running ticker thread.
         import json as _json
         from installer import ui
 
@@ -558,22 +560,19 @@ class TestJsonMode:
             lines = [l for l in captured.out.strip().split("\n") if l]
             events = [_json.loads(l) for l in lines]
 
-            # Must have a step-fail keyed on the contract name, and it must
-            # come BEFORE the error detail event.
-            step_fail_idx = next(
-                (i for i, e in enumerate(events)
-                 if e.get("event") == "step" and e.get("name") == "build"
-                 and e.get("status") == "fail"),
-                None,
-            )
-            error_idx = next(
-                (i for i, e in enumerate(events)
-                 if e.get("event") == "error" and e.get("step") == "build"),
-                None,
-            )
-            assert step_fail_idx is not None, f"no step:build:fail in {events}"
-            assert error_idx is not None, f"no error:step=build in {events}"
-            assert step_fail_idx < error_idx
+            # Error event fires with the contract step name (not label.lower()).
+            error_events = [
+                e for e in events
+                if e.get("event") == "error" and e.get("step") == "build"
+            ]
+            assert len(error_events) == 1, f"expected one error event, got {events}"
+
+            # No step:fail emitted by run_with_progress — the caller owns that.
+            fail_events = [
+                e for e in events
+                if e.get("event") == "step" and e.get("status") == "fail"
+            ]
+            assert fail_events == [], f"unexpected step:fail from run_with_progress: {fail_events}"
         finally:
             import sys
             ui.JSON_MODE = False
@@ -611,6 +610,229 @@ class TestJsonMode:
 
 
 # ===========================================================================
+# HeartbeatTicker
+# ===========================================================================
+
+class TestHeartbeatTicker:
+    """The ticker emits step_progress events so agents consuming --json
+    can tell "progressing" from "hung" during long steps (build, waits)."""
+
+    @staticmethod
+    def _reset_json_mode():
+        import sys
+        from installer import ui
+        ui.JSON_MODE = False
+        if ui._JSON_STDOUT is not None:
+            sys.stdout = ui._JSON_STDOUT
+            ui._JSON_STDOUT = None
+
+    def test_fires_during_long_step(self, capsys):
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            with ui.HeartbeatTicker("build", interval=0.1):
+                _time.sleep(0.35)
+            captured = capsys.readouterr()
+            events = [
+                _json.loads(l) for l in captured.out.strip().split("\n") if l
+            ]
+            progress = [e for e in events if e["event"] == "step_progress"]
+            # Should emit at ~0.1s, ~0.2s, ~0.3s
+            assert len(progress) >= 2, progress
+            for e in progress:
+                assert e["name"] == "build"
+                assert isinstance(e["elapsed_sec"], int)
+                assert e["elapsed_sec"] >= 0
+        finally:
+            self._reset_json_mode()
+
+    def test_silent_on_fast_step(self, capsys):
+        # Step that finishes well before the first interval emits zero events.
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            with ui.HeartbeatTicker("config", interval=5.0):
+                _time.sleep(0.05)
+            captured = capsys.readouterr()
+            assert "step_progress" not in captured.out
+        finally:
+            self._reset_json_mode()
+
+    def test_no_events_after_context_exit(self, capsys):
+        # Contract: no step_progress fires after the with-block exits, even
+        # if a subsequent interval would have been due.
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            with ui.HeartbeatTicker("wait_container", interval=0.1):
+                _time.sleep(0.25)
+            # Wait past multiple intervals — ticker must be stopped.
+            _time.sleep(0.5)
+            captured = capsys.readouterr()
+            events = [
+                _json.loads(l) for l in captured.out.strip().split("\n") if l
+            ]
+            progress = [e for e in events if e["event"] == "step_progress"]
+            # We had ~2 ticks inside the with. After exit, we waited for 5
+            # more intervals — none of them should have emitted.
+            assert len(progress) <= 3, progress
+            # Sanity: every elapsed_sec is from inside the with (~0.25s max).
+            for e in progress:
+                assert e["elapsed_sec"] < 2
+        finally:
+            self._reset_json_mode()
+
+    def test_noop_when_json_mode_off(self, capsys):
+        # Non-JSON mode: ticker spawns no thread, emits nothing.
+        import time as _time
+        from installer import ui
+
+        assert not ui.JSON_MODE  # module default
+        with ui.HeartbeatTicker("build", interval=0.05) as t:
+            _time.sleep(0.15)
+            assert t._thread is None
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_no_heartbeat_after_step_fail_under_forced_race(self, capsys, monkeypatch):
+        # Deterministic race reproduction: monkeypatch _tick to sleep 0.3s
+        # between wait() returning and the emit, widening the race window
+        # from microseconds to something a test can observe. Then run the
+        # CORRECT pattern (step:fail after with-exit) and assert no
+        # trailing heartbeat.
+        #
+        # Without the fix (step:fail inside the with-block), the main
+        # thread's step:fail emission happens DURING the ticker's 0.3s
+        # pre-emit sleep, and the ticker's later emit lands after step:fail
+        # — the exact bug greptile flagged. With the fix, __exit__'s join
+        # blocks for that 0.3s until the ticker completes its in-flight
+        # emit, THEN step:fail is emitted. Ordering preserved.
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        original_tick = ui.HeartbeatTicker._tick
+
+        def slow_tick(self):
+            # Reproduce the exact race: between wait() returning and the
+            # json_event call, insert a long enough sleep that the main
+            # thread can raise + stop.set() + begin join before we emit.
+            while not self._stop.wait(self._interval):
+                elapsed = int(_time.monotonic() - (self._started_at or 0))
+                _time.sleep(0.3)   # the race window, widened
+                ui.json_event(
+                    "step_progress", name=self._name, elapsed_sec=elapsed,
+                )
+
+        monkeypatch.setattr(ui.HeartbeatTicker, "_tick", slow_tick)
+
+        ui.enable_json_mode()
+        try:
+            ui.json_event("step", name="build", status="start")
+            try:
+                with ui.HeartbeatTicker("build", interval=0.05):
+                    # 0.08s lets the ticker fire wait() once (0.05s) and
+                    # enter its 0.3s pre-emit sleep. We then raise — at
+                    # this exact moment the ticker is past wait() but
+                    # pre-emit: the race window is wide open.
+                    _time.sleep(0.08)
+                    raise SystemExit(1)
+            except SystemExit:
+                # __exit__'s join() MUST have waited for the ticker to
+                # finish its in-flight emit before returning, so that this
+                # step:fail emission is guaranteed to land AFTER any
+                # heartbeat the ticker was mid-way through.
+                ui.json_event("step", name="build", status="fail")
+
+            captured = capsys.readouterr()
+            events = [_json.loads(l) for l in captured.out.strip().split("\n") if l]
+            fail_idx = next(
+                i for i, e in enumerate(events)
+                if e.get("event") == "step" and e.get("status") == "fail"
+            )
+            # The actual regression check: nothing after step:fail.
+            trailing = [
+                e for e in events[fail_idx + 1:]
+                if e.get("event") == "step_progress"
+            ]
+            assert trailing == [], (
+                f"fix failed — trailing heartbeat landed after step:fail: "
+                f"{trailing}"
+            )
+            # Non-vacuous: the ticker's in-flight heartbeat DID fire. If
+            # this assertion ever drops to zero, the monkeypatch is
+            # broken and the test isn't exercising the race.
+            preceding = [
+                e for e in events[:fail_idx]
+                if e.get("event") == "step_progress"
+            ]
+            assert len(preceding) >= 1, (
+                f"test vacuous — ticker never fired: {events}"
+            )
+        finally:
+            monkeypatch.setattr(ui.HeartbeatTicker, "_tick", original_tick)
+            self._reset_json_mode()
+
+    def test_no_heartbeat_after_step_fail_in_caller_pattern(self, capsys):
+        # Pattern-level regression for the common (unforced) timing case.
+        # The deterministic race is covered by the _under_forced_race test
+        # above; this one locks in the try/except SystemExit shape used by
+        # start_server so a refactor that removes the try/except would be
+        # caught here.
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        ui.enable_json_mode()
+        try:
+            ui.json_event("step", name="build", status="start")
+            try:
+                with ui.HeartbeatTicker("build", interval=0.1):
+                    _time.sleep(0.25)   # let a couple heartbeats fire
+                    raise SystemExit(1)
+            except SystemExit:
+                ui.json_event("step", name="build", status="fail")
+            # Give a rogue trailing heartbeat plenty of time to surface.
+            _time.sleep(0.3)
+
+            captured = capsys.readouterr()
+            events = [_json.loads(l) for l in captured.out.strip().split("\n") if l]
+            fail_idx = next(
+                i for i, e in enumerate(events)
+                if e.get("event") == "step" and e.get("status") == "fail"
+            )
+            # Invariant: nothing but step:fail (and any explicit later events)
+            # after the terminal. No step_progress.
+            trailing_heartbeats = [
+                e for e in events[fail_idx + 1:]
+                if e.get("event") == "step_progress"
+            ]
+            assert trailing_heartbeats == [], (
+                f"step_progress fired after step:fail (contract violation): "
+                f"{trailing_heartbeats}"
+            )
+            # Proof heartbeats WERE firing — otherwise the test is vacuous.
+            preceding_heartbeats = [
+                e for e in events[:fail_idx]
+                if e.get("event") == "step_progress"
+            ]
+            assert len(preceding_heartbeats) >= 1, (
+                f"expected at least one heartbeat before fail; got {events}"
+            )
+        finally:
+            self._reset_json_mode()
+
+
+# ===========================================================================
 # parse_args behavior
 # ===========================================================================
 
@@ -640,3 +862,75 @@ class TestParseArgsImplications:
         assert args.no_prompt is False
         assert args.claim_subdomain is False
         assert args.json_output is False
+
+
+# ===========================================================================
+# Preflight
+# ===========================================================================
+
+class TestPreflight:
+    """Preflight emits a single JSON object with a stable shape. The check
+    bodies are integration-tested against real infra (they hit /proc, network,
+    docker) — these tests pin the wrapper's schema."""
+
+    def test_run_all_has_expected_shape(self):
+        from installer import preflight
+        result = preflight.run_all()
+        assert result["event"] == "preflight"
+        assert result["overall"] in ("ok", "fail")
+        assert isinstance(result["failed"], list)
+        assert set(result["checks"].keys()) == {
+            "ram", "disk", "port_25_inbound", "outbound_https", "docker",
+        }
+        # Every check must have a status
+        for name, check in result["checks"].items():
+            assert "status" in check, f"{name} missing status"
+            assert check["status"] in ("ok", "fail", "skip"), (
+                f"{name} has unexpected status {check['status']}"
+            )
+
+    def test_overall_fail_iff_any_check_fails(self):
+        from installer import preflight
+        result = preflight.run_all()
+        has_fail = any(c.get("status") == "fail" for c in result["checks"].values())
+        if has_fail:
+            assert result["overall"] == "fail"
+            assert len(result["failed"]) > 0
+        else:
+            assert result["overall"] == "ok"
+            assert result["failed"] == []
+
+    def test_disk_check_respects_install_dir_parent(self, tmp_path, monkeypatch):
+        # Install dir doesn't exist yet — check should walk up to an ancestor
+        # that does, not error out.
+        from installer import preflight
+        fake_dir = tmp_path / "does" / "not" / "exist"
+        monkeypatch.setenv("PRIMITIVEMAIL_DIR", str(fake_dir))
+        result = preflight.check_disk()
+        assert result["status"] in ("ok", "fail")
+        # Path resolved to an existing ancestor
+        assert os.path.exists(result["path"])
+
+    def test_disk_check_bare_relative_path_does_not_fall_to_root(self, tmp_path, monkeypatch):
+        # Regression: a bare relative name like "primitivemail" (no ./) used
+        # to fall through to "/" because os.path.dirname("primitivemail") == ""
+        # exited the walk-up loop with an empty probe. Check now normalizes
+        # via abspath first so the probe becomes a cwd-anchored path, never "/".
+        #
+        # Cubic flagged an earlier version: "path exists + isabs" also passes
+        # for "/", so the assertion was vacuous. Strengthened: assert the
+        # resolved path is a descendant of cwd (tmp_path), proving the fix
+        # actually routed through abspath instead of the root fallback.
+        from installer import preflight
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PRIMITIVEMAIL_DIR", "primitivemail")  # bare relative
+        result = preflight.check_disk()
+        assert result["status"] in ("ok", "fail")
+        probe = result["path"]
+        # The whole point: not "/" and not any other absolute path unrelated
+        # to our input. After abspath("primitivemail") + walk-up, the probe
+        # should be tmp_path itself (its parent exists; primitivemail/ does not).
+        assert probe == str(tmp_path.resolve()), (
+            f"bare relative resolved to {probe!r}, expected {tmp_path.resolve()!r} "
+            f"— regression: root fallback likely fired"
+        )

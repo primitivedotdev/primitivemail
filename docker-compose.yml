@@ -74,6 +74,13 @@ services:
       - postfix-logs:/var/log:ro
     ports:
       - "127.0.0.1:9154:9154"              # Localhost only
+    # Wait for primitivemail's healthcheck (postfix listening + log file exists)
+    # before starting. Without this, the exporter crashloops ~5× trying to open
+    # /var/log/postfix.log before primitivemail has created it — noisy in
+    # `docker logs` and in dockerd's journal during install.
+    depends_on:
+      primitivemail:
+        condition: service_healthy
 
   alloy:
     image: grafana/alloy:latest
