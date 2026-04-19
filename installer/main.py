@@ -33,9 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    # --json implies --no-prompt: agents don't have a TTY. The _get_tty_input
-    # call would hang otherwise.
-    if args.json_output:
+    # --json implies --no-prompt: agents don't have a TTY, _get_tty_input would hang.
+    # --claim-subdomain implies --no-prompt: otherwise a user could interactively
+    # enter a real domain and then have it silently overwritten by the post-start
+    # claim step. If you want interactive mode, don't pass --claim-subdomain —
+    # the interactive flow has its own "do you want a free subdomain?" prompt.
+    if args.json_output or args.claim_subdomain:
         args.no_prompt = True
     return args
 
@@ -70,18 +73,27 @@ def configure(args: argparse.Namespace) -> dict:
     ui.step("Configuration")
 
     if args.claim_subdomain and (args.hostname or args.domain):
-        ui.error("--claim-subdomain and --domain/--hostname are mutually exclusive")
+        msg = "--claim-subdomain and --domain/--hostname are mutually exclusive"
+        ui.error(msg)
         ui.info("--claim-subdomain lets us assign a domain for you.")
         ui.info("--domain tells us you already have one.")
+        ui.json_event("step", name="config", status="fail")
+        ui.json_event("error", step="config", message=msg)
         sys.exit(1)
 
     if args.event_webhook_url and not config.validate_event_webhook_url(args.event_webhook_url):
-        ui.error(f"Invalid --event-webhook-url: {args.event_webhook_url}")
+        msg = f"Invalid --event-webhook-url: {args.event_webhook_url}"
+        ui.error(msg)
         ui.info("Must be http:// or https:// with a host.")
+        ui.json_event("step", name="config", status="fail")
+        ui.json_event("error", step="config", message=msg)
         sys.exit(1)
 
     if args.event_webhook_secret and not args.event_webhook_url:
-        ui.error("--event-webhook-secret requires --event-webhook-url")
+        msg = "--event-webhook-secret requires --event-webhook-url"
+        ui.error(msg)
+        ui.json_event("step", name="config", status="fail")
+        ui.json_event("error", step="config", message=msg)
         sys.exit(1)
 
     hostname = args.hostname
@@ -98,8 +110,11 @@ def configure(args: argparse.Namespace) -> dict:
 
     if not config.validate_spoof_protection(spoof_protection):
         if args.no_prompt:
-            ui.error(f"Invalid spoof protection level: {spoof_protection}")
+            msg = f"Invalid spoof protection level: {spoof_protection}"
+            ui.error(msg)
             ui.info("Valid values: off, monitor, standard, strict")
+            ui.json_event("step", name="config", status="fail")
+            ui.json_event("error", step="config", message=msg)
             sys.exit(1)
         else:
             ui.warn(f"Invalid spoof protection level: {spoof_protection}")

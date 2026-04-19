@@ -57,6 +57,8 @@ def build_and_start(
             capture_output=True,
         )
         if result.returncode != 0:
+            ui.json_event("step", name="build", status="fail")
+            ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
                 print(result.stderr.decode("utf-8", errors="replace"))
@@ -68,6 +70,8 @@ def build_and_start(
             cwd=install_dir,
         )
         if result.returncode != 0:
+            ui.json_event("step", name="build", status="fail")
+            ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             sys.exit(1)
     else:
@@ -78,6 +82,8 @@ def build_and_start(
             capture_output=True,
         )
         if result.returncode != 0:
+            ui.json_event("step", name="build", status="fail")
+            ui.json_event("error", step="build", message="docker compose up failed")
             ui.error("docker compose up failed")
             if result.stderr:
                 print(result.stderr.decode("utf-8", errors="replace"))
@@ -233,11 +239,15 @@ def start_server(
         return
 
     ui.info(f"Checking port 25 reachability on {check_ip}...")
+    ui.json_event("step", name="port25_check", status="start")
     status = check_port_25_reachable(check_ip)
-    ui.json_event("step", name="port25_check", status="ok", reachability=status or "unknown")
 
+    # "open"  -> ok     (all good)
+    # "closed"/"blocked"/"error" -> warn  (install succeeded; user has remediation)
+    # None    -> fall through to local nc fallback before emitting the event
     if status == "open":
         ui.success("Port 25 is reachable from the outside")
+        ui.json_event("step", name="port25_check", status="ok", reachability="open")
     elif status == "closed":
         print()
         ui.warn(f"Port 25 is not accepting connections on {check_ip}")
@@ -246,6 +256,7 @@ def start_server(
         print("    docker ps | grep primitivemail")
         print("    docker logs primitivemail")
         print()
+        ui.json_event("step", name="port25_check", status="warn", reachability="closed")
     elif status == "blocked":
         print()
         ui.warn(f"Port 25 appears blocked by a firewall on {check_ip}")
@@ -256,27 +267,34 @@ def start_server(
         for line in get_firewall_help(cloud):
             print(f"  {line}")
         print()
+        ui.json_event("step", name="port25_check", status="warn", reachability="blocked")
     elif status == "error":
         print()
         ui.warn(f"Port 25 check failed -- host unreachable at {check_ip}")
         print("  Verify that this is the correct public IP for your server.")
         print(f"  You can check manually at: {ui.BOLD}https://mx-tools.primitive.dev{ui.NC}")
         print()
+        ui.json_event("step", name="port25_check", status="warn", reachability="error")
     else:
-        # API unreachable — local fallback
+        # External API unreachable — fall back to a local nc probe before
+        # committing to a JSON event, so we don't report "unknown" when the
+        # fallback actually has a concrete answer.
         ui.warn("Could not reach port check service -- falling back to local check")
         fallback = check_port_25_local_fallback(check_ip)
         if fallback is None:
             ui.info("Public IP is on a local interface -- cannot verify port 25 from here")
             print(f"  Check manually at: {ui.BOLD}https://mx-tools.primitive.dev{ui.NC}")
+            ui.json_event("step", name="port25_check", status="warn", reachability="unknown")
         elif fallback:
             ui.success("Port 25 is reachable from this host")
+            ui.json_event("step", name="port25_check", status="ok", reachability="open_local")
         else:
             print()
             ui.warn(f"Port 25 does not appear reachable on {check_ip}")
             print("  PrimitiveMail is running, but external mail may not be able to reach it.")
             print(f"  You can verify manually at: {ui.BOLD}https://mx-tools.primitive.dev{ui.NC}")
             print()
+            ui.json_event("step", name="port25_check", status="warn", reachability="closed_local")
 
 
 def _ensure_local_bin_on_path() -> None:

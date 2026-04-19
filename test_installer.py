@@ -106,6 +106,9 @@ class TestGenerateEnvContent:
         assert "EVENT_WEBHOOK_SECRET=e1b2c3" in result
 
     def test_event_webhook_absent_by_default(self):
+        # When no event webhook is configured, the keys should still appear in
+        # .env (so grep shows every tunable) but with empty values — not
+        # missing, not with stale data leaking through.
         result = generate_env_content(
             hostname="mx.example.com", domain="example.com",
             enable_ip_literal=False, ip_literal="",
@@ -114,9 +117,10 @@ class TestGenerateEnvContent:
             allowed_sender_domains="", allowed_senders="",
             allowed_recipients="", spoof_protection="off",
         )
-        assert "EVENT_WEBHOOK_URL=" in result
-        assert "EVENT_WEBHOOK_SECRET=" in result
-        assert "EVENT_WEBHOOK_URL=\n" in result + "\n"  # value is empty
+        lines = result.strip().split("\n")
+        env = dict(line.split("=", 1) for line in lines)
+        assert env["EVENT_WEBHOOK_URL"] == ""
+        assert env["EVENT_WEBHOOK_SECRET"] == ""
 
     def test_no_quoting(self):
         result = generate_env_content(
@@ -530,3 +534,63 @@ class TestJsonMode:
             if ui._JSON_STDOUT is not None:
                 sys.stdout = ui._JSON_STDOUT
                 ui._JSON_STDOUT = None
+
+    def test_error_does_not_auto_emit_json_event(self, capsys):
+        # Regression: ui.error() used to auto-emit `event: error` on every
+        # call, which polluted successful runs where a recoverable error
+        # path called ui.error() without exiting. Callers must now emit
+        # json_event("error", ...) explicitly at terminal-exit sites.
+        import json as _json
+        from installer import ui
+        ui.enable_json_mode()
+        try:
+            ui.error("something went wrong but we recovered")
+            captured = capsys.readouterr()
+            # Nothing on stdout — no stray NDJSON
+            assert captured.out == ""
+            # Human-readable line went to stderr
+            assert "something went wrong" in captured.err
+            # Explicit call DOES emit
+            ui.json_event("error", step="config", message="explicit")
+            captured = capsys.readouterr()
+            line = captured.out.strip()
+            parsed = _json.loads(line)
+            assert parsed == {"event": "error", "step": "config", "message": "explicit"}
+        finally:
+            import sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
+
+# ===========================================================================
+# parse_args behavior
+# ===========================================================================
+
+class TestParseArgsImplications:
+
+    def test_claim_subdomain_implies_no_prompt(self, monkeypatch):
+        # --claim-subdomain is a "the agent wants us to assign a domain" signal;
+        # going through the interactive flow would let the user set a real
+        # domain which would then be clobbered by the post-start claim step.
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer", "--claim-subdomain"])
+        args = parse_args()
+        assert args.claim_subdomain is True
+        assert args.no_prompt is True
+
+    def test_json_implies_no_prompt(self, monkeypatch):
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer", "--json"])
+        args = parse_args()
+        assert args.json_output is True
+        assert args.no_prompt is True
+
+    def test_bare_invocation_stays_interactive(self, monkeypatch):
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer"])
+        args = parse_args()
+        assert args.no_prompt is False
+        assert args.claim_subdomain is False
+        assert args.json_output is False

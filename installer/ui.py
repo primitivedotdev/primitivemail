@@ -63,9 +63,12 @@ def warn(msg: str) -> None:
 
 
 def error(msg: str) -> None:
+    # No automatic json_event here — callers decide whether an error is
+    # terminal-with-a-JSON-event or recoverable. Terminal exit sites should
+    # emit `json_event("step", ..., status="fail")` and/or `json_event("error", ...)`
+    # explicitly before calling sys.exit(). Keeping this human-only avoids
+    # stray `event: error` lines in successful runs.
     _human_out(f"{RED}x{NC} {msg}")
-    if JSON_MODE:
-        json_event("error", message=msg)
 
 
 def step(msg: str) -> None:
@@ -115,27 +118,31 @@ def prompt_choice(prompt_text: str, max_val: int, default: int, no_prompt: bool)
 
 def run_with_progress(cmd: list, label: str, verbose: bool = False, cwd: str = None) -> None:
     """Run a command with a braille spinner. On failure, print last 20 lines and exit."""
-    if verbose:
-        result = subprocess.run(cmd, cwd=cwd)
-        if result.returncode != 0:
-            error(f"{label} failed")
-            sys.exit(1)
-        success(f"{label} complete")
-        return
-
-    # JSON mode: suppress the spinner so stdout stays clean NDJSON, but still
-    # capture output for error reporting. Run the command silently.
+    # JSON mode takes precedence over --verbose: we need a clean NDJSON stdout,
+    # and subprocesses inherit fd 1 regardless of Python's sys.stdout swap — so
+    # letting subprocess.run() run unrestricted would write docker build output
+    # straight to the real stdout and corrupt the event stream.
     if JSON_MODE:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd)
         output, _ = process.communicate()
         if process.returncode == 0:
             success(f"{label} complete")
         else:
-            error(f"{label} failed")
             lines = output.decode("utf-8", errors="replace").splitlines()
             tail = "\n".join(lines[-20:])
+            # Emit the structured error and let the caller's step-fail path
+            # (if any) run; exit with non-zero so the outer shell sees failure.
             json_event("error", step=label.lower(), message=f"{label} failed", tail=tail)
+            error(f"{label} failed")
             sys.exit(1)
+        return
+
+    if verbose:
+        result = subprocess.run(cmd, cwd=cwd)
+        if result.returncode != 0:
+            error(f"{label} failed")
+            sys.exit(1)
+        success(f"{label} complete")
         return
 
     spin_chars = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
