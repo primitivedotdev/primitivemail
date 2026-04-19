@@ -593,8 +593,12 @@ class TestEmailsRead:
         assert "not found" in err
 
     def test_read_prefix_without_opt_in_exits_2(self, seeded, capsys):
+        # A partial id (non-digit characters, not the full canonical
+        # regex) without --prefix is an invalid selector -> exit 2. A
+        # pure-digit selector is now treated as a seq lookup, so use a
+        # mixed-alphanumeric string to exercise the non-full-id path.
         maildata, _, _ = seeded
-        code, _, _ = _run_cli(maildata, ["emails", "read", "2026"], capsys=capsys)
+        code, _, _ = _run_cli(maildata, ["emails", "read", "20260417T"], capsys=capsys)
         assert code == 2
 
     def test_read_ambiguous_multi_domain_exits_3(self, tmp_path, capsys):
@@ -719,6 +723,148 @@ class TestEmailsRead:
         )
         assert code == 0
         assert "hello world" in out
+
+    def test_read_by_seq(self, seeded, capsys):
+        # Pure-digit selector is a seq lookup. seq=2 should resolve to id_b.
+        maildata, _, id_b = seeded
+        code, out, _ = _run_cli(
+            maildata, ["emails", "read", "2", "--format", "json"], capsys=capsys,
+        )
+        assert code == 0
+        event = json.loads(out)
+        assert event["id"] == id_b
+
+    def test_read_by_seq_not_found_exits_1(self, seeded, capsys):
+        maildata, _, _ = seeded
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", "999"], capsys=capsys,
+        )
+        assert code == 1
+        assert "999" in err
+
+    def test_read_by_seq_zero_exits_2(self, seeded, capsys):
+        # seq is 1-indexed per AGENTS.md. 0 is never a valid seq.
+        maildata, _, _ = seeded
+        code, _, err = _run_cli(maildata, ["emails", "read", "0"], capsys=capsys)
+        assert code == 2
+        assert ">= 1" in err
+
+    def test_read_by_seq_skips_tombstones(self, tmp_path, capsys):
+        # A tombstoned seq is not returned; caller gets the same not-found
+        # they would for an unknown seq.
+        entries = [(
+            _make_entry(1, "20260101T000001Z-aaaaaaa1", "ex.com",
+                        from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+            _make_canonical("20260101T000001Z-aaaaaaa1", "2026-01-01T00:00:01Z"),
+        )]
+        maildata = _seed_maildata(tmp_path, entries)
+        with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "seq": 2, "type": "tombstone",
+                "id": "20260101T000002Z-aaaaaaa2", "domain": "ex.com",
+                "deleted_at": "2026-01-02T00:00:00Z",
+            }) + "\n")
+        code, _, err = _run_cli(maildata, ["emails", "read", "2"], capsys=capsys)
+        assert code == 1
+        assert "not found" in err
+
+    def test_read_latest(self, seeded, capsys):
+        # --latest picks the last non-tombstone entry (id_b, seq 2).
+        maildata, _, id_b = seeded
+        code, out, _ = _run_cli(
+            maildata, ["emails", "read", "--latest", "--format", "json"], capsys=capsys,
+        )
+        assert code == 0
+        event = json.loads(out)
+        assert event["id"] == id_b
+
+    def test_read_latest_skips_tombstones(self, tmp_path, capsys):
+        # The newest entry is a tombstone; --latest returns the entry before.
+        id_real = "20260101T000001Z-aaaaaaa1"
+        entries = [(
+            _make_entry(1, id_real, "ex.com",
+                        from_addr="a@x.com", received_at="2026-01-01T00:00:01Z"),
+            _make_canonical(id_real, "2026-01-01T00:00:01Z"),
+        )]
+        maildata = _seed_maildata(tmp_path, entries)
+        with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "seq": 2, "type": "tombstone",
+                "id": "20260101T000002Z-aaaaaaa2", "domain": "ex.com",
+                "deleted_at": "2026-01-02T00:00:00Z",
+            }) + "\n")
+        code, out, _ = _run_cli(
+            maildata, ["emails", "read", "--latest", "--format", "json"], capsys=capsys,
+        )
+        assert code == 0
+        event = json.loads(out)
+        assert event["id"] == id_real
+
+    def test_read_latest_empty_journal_exits_1(self, tmp_path, capsys):
+        maildata = _seed_maildata(tmp_path, [])
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", "--latest"], capsys=capsys,
+        )
+        assert code == 1
+        assert "no emails" in err or "not found" in err
+
+    def test_read_latest_and_selector_exits_2(self, seeded, capsys):
+        maildata, id_a, _ = seeded
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", "--latest", id_a], capsys=capsys,
+        )
+        assert code == 2
+        assert "mutually exclusive" in err
+
+    def test_read_no_selector_and_no_latest_exits_2(self, seeded, capsys):
+        maildata, _, _ = seeded
+        code, _, err = _run_cli(maildata, ["emails", "read"], capsys=capsys)
+        assert code == 2
+        assert "selector" in err.lower() or "latest" in err.lower()
+
+    def test_read_prefix_opt_in_resolves_unique(self, seeded, capsys):
+        # With --prefix, a short id prefix that uniquely identifies one
+        # entry resolves. id_a starts with "20260417T101201Z-".
+        maildata, id_a, _ = seeded
+        code, out, _ = _run_cli(
+            maildata,
+            ["emails", "read", "--prefix", "20260417T101201Z", "--format", "json"],
+            capsys=capsys,
+        )
+        assert code == 0
+        event = json.loads(out)
+        assert event["id"] == id_a
+
+    def test_read_prefix_opt_in_ambiguous_exits_3(self, seeded, capsys):
+        # Both id_a and id_b share the prefix "20260417T10". With --prefix
+        # this is ambiguous.
+        maildata, _, _ = seeded
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", "--prefix", "20260417T10"], capsys=capsys,
+        )
+        assert code == 3
+        assert "ambiguous" in err.lower()
+
+    def test_read_prefix_wins_over_digits_as_seq(self, seeded, capsys):
+        # --prefix is an explicit opt-in. It MUST take precedence over the
+        # digits-as-seq shortcut, or `emails read --prefix 20260417`
+        # silently becomes a seq lookup for 20,260,417. The earlier
+        # version of this test used "20260417T101201" which contains a
+        # T, so isdigit() was already false and the test would have
+        # passed even with the bug still present.
+        #
+        # Use a pure-digit selector. Both seeded ids start with the date
+        # "20260417", so --prefix 20260417 hits the ambiguous path and
+        # exits 3. A regression that routes digits to _resolve_seq would
+        # instead return exit 1 ("seq not found") because 20,260,417
+        # does not exist as a seq. Exit 3 vs exit 1 directly proves the
+        # precedence.
+        maildata, _, _ = seeded
+        code, _, err = _run_cli(
+            maildata, ["emails", "read", "--prefix", "20260417"], capsys=capsys,
+        )
+        assert code == 3, f"expected exit 3 (ambiguous prefix), got {code}: {err}"
+        assert "ambiguous" in err.lower()
 
 
 # -----------------------------------------------------------------------------
