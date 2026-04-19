@@ -332,6 +332,11 @@ export async function deliverEvent(
 			(response.headers.get(PRIMITIVE_CONFIRMED_HEADER) === "true" ||
 				response.headers.get(LEGACY_CONFIRMED_HEADER) === "true");
 
+		// We only read headers and status — drain the body so Node's
+		// undici can release the socket back to its keep-alive pool.
+		// Unread bodies hold the connection open until GC runs.
+		await response.body?.cancel().catch(() => {});
+
 		return logAndReturn({
 			status: delivered ? "delivered" : "failed",
 			confirmed,
