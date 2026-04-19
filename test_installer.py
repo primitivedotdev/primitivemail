@@ -703,19 +703,91 @@ class TestHeartbeatTicker:
         assert captured.out == ""
         assert captured.err == ""
 
-    def test_no_heartbeat_after_step_fail_in_caller_pattern(self, capsys):
-        # Pattern-level regression: locks in the try/except SystemExit shape
-        # used by start_server — step:fail emitted OUTSIDE the with-block so
-        # the ticker thread is joined before the terminal event lands.
+    def test_no_heartbeat_after_step_fail_under_forced_race(self, capsys, monkeypatch):
+        # Deterministic race reproduction: monkeypatch _tick to sleep 0.3s
+        # between wait() returning and the emit, widening the race window
+        # from microseconds to something a test can observe. Then run the
+        # CORRECT pattern (step:fail after with-exit) and assert no
+        # trailing heartbeat.
         #
-        # Caveat: this test does NOT reliably reproduce the narrow race the
-        # ordering fix targets. That race requires the ticker thread to be
-        # past stop.wait() but pre-emit at the microsecond `stop.set()` fires
-        # — hard to trigger deterministically without mocking json_event to
-        # block. The structural fix (join before emitting terminal) is what
-        # prevents the race; this test confirms the pattern is intact and
-        # that heartbeats DO fire before the fail (non-vacuous), which is
-        # what a future refactor would accidentally break.
+        # Without the fix (step:fail inside the with-block), the main
+        # thread's step:fail emission happens DURING the ticker's 0.3s
+        # pre-emit sleep, and the ticker's later emit lands after step:fail
+        # — the exact bug greptile flagged. With the fix, __exit__'s join
+        # blocks for that 0.3s until the ticker completes its in-flight
+        # emit, THEN step:fail is emitted. Ordering preserved.
+        import json as _json
+        import time as _time
+        from installer import ui
+
+        original_tick = ui.HeartbeatTicker._tick
+
+        def slow_tick(self):
+            # Reproduce the exact race: between wait() returning and the
+            # json_event call, insert a long enough sleep that the main
+            # thread can raise + stop.set() + begin join before we emit.
+            while not self._stop.wait(self._interval):
+                elapsed = int(_time.monotonic() - (self._started_at or 0))
+                _time.sleep(0.3)   # the race window, widened
+                ui.json_event(
+                    "step_progress", name=self._name, elapsed_sec=elapsed,
+                )
+
+        monkeypatch.setattr(ui.HeartbeatTicker, "_tick", slow_tick)
+
+        ui.enable_json_mode()
+        try:
+            ui.json_event("step", name="build", status="start")
+            try:
+                with ui.HeartbeatTicker("build", interval=0.05):
+                    # 0.08s lets the ticker fire wait() once (0.05s) and
+                    # enter its 0.3s pre-emit sleep. We then raise — at
+                    # this exact moment the ticker is past wait() but
+                    # pre-emit: the race window is wide open.
+                    _time.sleep(0.08)
+                    raise SystemExit(1)
+            except SystemExit:
+                # __exit__'s join() MUST have waited for the ticker to
+                # finish its in-flight emit before returning, so that this
+                # step:fail emission is guaranteed to land AFTER any
+                # heartbeat the ticker was mid-way through.
+                ui.json_event("step", name="build", status="fail")
+
+            captured = capsys.readouterr()
+            events = [_json.loads(l) for l in captured.out.strip().split("\n") if l]
+            fail_idx = next(
+                i for i, e in enumerate(events)
+                if e.get("event") == "step" and e.get("status") == "fail"
+            )
+            # The actual regression check: nothing after step:fail.
+            trailing = [
+                e for e in events[fail_idx + 1:]
+                if e.get("event") == "step_progress"
+            ]
+            assert trailing == [], (
+                f"fix failed — trailing heartbeat landed after step:fail: "
+                f"{trailing}"
+            )
+            # Non-vacuous: the ticker's in-flight heartbeat DID fire. If
+            # this assertion ever drops to zero, the monkeypatch is
+            # broken and the test isn't exercising the race.
+            preceding = [
+                e for e in events[:fail_idx]
+                if e.get("event") == "step_progress"
+            ]
+            assert len(preceding) >= 1, (
+                f"test vacuous — ticker never fired: {events}"
+            )
+        finally:
+            monkeypatch.setattr(ui.HeartbeatTicker, "_tick", original_tick)
+            self._reset_json_mode()
+
+    def test_no_heartbeat_after_step_fail_in_caller_pattern(self, capsys):
+        # Pattern-level regression for the common (unforced) timing case.
+        # The deterministic race is covered by the _under_forced_race test
+        # above; this one locks in the try/except SystemExit shape used by
+        # start_server so a refactor that removes the try/except would be
+        # caught here.
         import json as _json
         import time as _time
         from installer import ui
@@ -843,16 +915,22 @@ class TestPreflight:
         # Regression: a bare relative name like "primitivemail" (no ./) used
         # to fall through to "/" because os.path.dirname("primitivemail") == ""
         # exited the walk-up loop with an empty probe. Check now normalizes
-        # via abspath first so the probe becomes the parent of cwd, not root.
+        # via abspath first so the probe becomes a cwd-anchored path, never "/".
+        #
+        # Cubic flagged an earlier version: "path exists + isabs" also passes
+        # for "/", so the assertion was vacuous. Strengthened: assert the
+        # resolved path is a descendant of cwd (tmp_path), proving the fix
+        # actually routed through abspath instead of the root fallback.
         from installer import preflight
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("PRIMITIVEMAIL_DIR", "primitivemail")  # bare relative
         result = preflight.check_disk()
         assert result["status"] in ("ok", "fail")
-        # Probe path resolves under cwd (tmp_path), not to "/"
-        assert os.path.exists(result["path"])
-        # On a real machine this could legitimately be / if tmp_path IS on
-        # the root filesystem's only mount; the important invariant is that
-        # we got a real absolute path derived from our input, not the "/"
-        # fallback that fired on empty dirname.
-        assert os.path.isabs(result["path"])
+        probe = result["path"]
+        # The whole point: not "/" and not any other absolute path unrelated
+        # to our input. After abspath("primitivemail") + walk-up, the probe
+        # should be tmp_path itself (its parent exists; primitivemail/ does not).
+        assert probe == str(tmp_path.resolve()), (
+            f"bare relative resolved to {probe!r}, expected {tmp_path.resolve()!r} "
+            f"— regression: root fallback likely fired"
+        )
