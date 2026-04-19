@@ -159,6 +159,18 @@ def _resolve_id(maildata: Path, selector, *, domain=None, allow_prefix=False):
             )
         raise ResolveError(1, f"id not found: {selector} under {domain}")
 
+    # Reject invalid selectors before touching the filesystem. A non-full
+    # id without --prefix can never match anything (the scan below is
+    # guarded on is_full_id / allow_prefix), so there is no reason to walk
+    # a potentially large journal just to raise exit 2.
+    if not is_full_id and not allow_prefix:
+        raise ResolveError(
+            2,
+            f"selector {selector!r} is not a full canonical id; "
+            "pass a full id like 20260417T101203Z-a1b2c3d4 "
+            "(--prefix is reserved for opt-in human use)",
+        )
+
     journal = _journal_path(maildata)
     if not journal.exists():
         raise ResolveError(1, f"journal not found at {journal}")
@@ -181,15 +193,6 @@ def _resolve_id(maildata: Path, selector, *, domain=None, allow_prefix=False):
                     matches.append((entry_domain, entry_id))
     except ValueError as exc:
         raise ResolveError(5, str(exc)) from exc
-
-    if not is_full_id and not allow_prefix:
-        # Non-full id without --prefix is an invalid selector.
-        raise ResolveError(
-            2,
-            f"selector {selector!r} is not a full canonical id; "
-            "pass a full id like 20260417T101203Z-a1b2c3d4 "
-            "(--prefix is reserved for opt-in human use)",
-        )
 
     if not matches:
         raise ResolveError(1, f"id not found: {selector}")
@@ -433,8 +436,9 @@ def cmd_emails_read(args):
     if fmt == "json":
         # Emit stored bytes verbatim (the SDK was a validator, not a
         # re-serializer). This preserves key order and whitespace.
-        sys.stdout.buffer.write(canonical_path.read_bytes())
-        if not canonical_path.read_bytes().endswith(b"\n"):
+        content = canonical_path.read_bytes()
+        sys.stdout.buffer.write(content)
+        if not content.endswith(b"\n"):
             sys.stdout.buffer.write(b"\n")
         sys.stdout.buffer.flush()
         return
@@ -575,6 +579,12 @@ def cmd_emails_since(args):
                     print(f"follow read failed: {exc}", file=sys.stderr)
                     sys.exit(4)
                 size += _emit_complete_lines(chunk, _emit)
+                if size < st.st_size:
+                    # Writer appended a partial (non-\n-terminated) line.
+                    # Sleep before the next stat so we don't busy-spin on
+                    # the same unconsumed bytes while waiting for the
+                    # line terminator.
+                    time.sleep(0.25)
                 continue
             time.sleep(0.25)
     except KeyboardInterrupt:

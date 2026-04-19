@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import pwd
+import select
 import subprocess
 import sys
 import time
@@ -735,10 +736,17 @@ class TestEmailsSince:
             with open(maildata / "emails.jsonl", "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(new_entry) + "\n")
                 fh.flush()
-            # Wait up to 3 seconds for the next line.
+            # Wait up to 3 seconds for the next line. Use select so the
+            # readline never blocks past the deadline if the child never
+            # writes again (in which case the assert below fails cleanly
+            # instead of the test hanging forever).
             deadline = time.time() + 3.0
             line = b""
             while time.time() < deadline:
+                remaining = max(0, deadline - time.time())
+                ready, _, _ = select.select([proc.stdout], [], [], remaining)
+                if not ready:
+                    continue
                 line = proc.stdout.readline()
                 if line:
                     break
