@@ -154,7 +154,8 @@ Without this, TLS failures appear in `deliveries.jsonl` as `fetch failed: self-s
 primitive version                  # Show version
 primitive emails status            # Count emails, show latest sender/time
 primitive emails list [opts]       # List recent emails from the journal
-primitive emails read <id> [opts]  # Read one email in json, raw, text, or html
+primitive emails read [sel] [opts] # Read one email. <sel> is a canonical id, a seq, or (with --prefix) a short id.
+                                   # Use --latest to skip the selector entirely.
 primitive emails since <seq>       # Stream journal entries with seq > <seq>
 primitive emails count [opts]      # Count matching emails
 primitive emails test [opts]       # Send a real external test email and wait for it to arrive

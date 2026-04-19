@@ -214,6 +214,70 @@ def _resolve_id(maildata: Path, selector, *, domain=None, allow_prefix=False):
     return unique[0]
 
 
+def _resolve_seq(maildata: Path, seq: int):
+    """Resolve a seq number to (domain, id) via the journal.
+
+    Journal-authoritative: we never stat-scan domain directories. A seq
+    that does not appear in the journal is exit 1 (not found), even if a
+    canonical file happens to exist on disk with that sequence elsewhere.
+    Tombstones are skipped; a caller asking for a tombstoned seq gets the
+    same not-found as an unknown seq, which matches what `emails read`
+    would do for any other deleted entry.
+    """
+    if seq < 1:
+        raise ResolveError(2, f"seq must be >= 1, got {seq}")
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        raise ResolveError(1, f"journal not found at {journal}")
+    try:
+        for _, _, entry in _iter_journal(journal):
+            if _is_tombstone(entry):
+                continue
+            if entry.get("seq") == seq:
+                domain = entry.get("domain")
+                entry_id = entry.get("id")
+                if not isinstance(domain, str) or not isinstance(entry_id, str):
+                    raise ResolveError(
+                        5,
+                        f"journal entry for seq {seq} is missing id or domain",
+                    )
+                return (domain, entry_id)
+    except ValueError as exc:
+        raise ResolveError(5, str(exc)) from exc
+    raise ResolveError(1, f"seq {seq} not found in journal")
+
+
+def _resolve_latest(maildata: Path):
+    """Resolve the most recent non-tombstone journal entry to (domain, id).
+
+    "Most recent" is the last entry emitted by the forward-scan iterator,
+    which matches journal order (i.e., received_at order for correctly-
+    written journals). Tombstones are skipped so `--latest` always points
+    at a readable email.
+    """
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        raise ResolveError(1, f"journal not found at {journal}")
+    latest = None
+    try:
+        for _, _, entry in _iter_journal(journal):
+            if _is_tombstone(entry):
+                continue
+            latest = entry
+    except ValueError as exc:
+        raise ResolveError(5, str(exc)) from exc
+    if latest is None:
+        raise ResolveError(1, "no emails in journal")
+    domain = latest.get("domain")
+    entry_id = latest.get("id")
+    if not isinstance(domain, str) or not isinstance(entry_id, str):
+        raise ResolveError(
+            5,
+            "latest journal entry is missing id or domain",
+        )
+    return (domain, entry_id)
+
+
 class ResolveError(Exception):
     def __init__(self, exit_code, message):
         super().__init__(message)
@@ -351,6 +415,11 @@ def cmd_emails_list(args):
         filters.append(f"since={since}")
     filter_str = f" ({', '.join(filters)})" if filters else ""
     _tty_stderr(f"{len(matched)} match(es){filter_str}")
+    # Nudge first-timers toward the read command. Only shown on an
+    # interactive stderr so scripted / piped consumers stay clean.
+    if matched and not args.json:
+        _tty_stderr("Read with: primitive emails read <id|seq> "
+                    "[--latest] [--format text|html|json|raw]")
 
 
 def _print_list_human(rows):
@@ -387,10 +456,31 @@ def cmd_emails_read(args):
         print(f"No maildata directory found at {maildata}", file=sys.stderr)
         sys.exit(1)
 
+    # Three ways to pick an entry:
+    #   --latest        -> most recent non-tombstone journal entry
+    #   digits only     -> seq lookup (disjoint from the canonical-id regex,
+    #                      which always has "T" and "-", so no ambiguity)
+    #   otherwise       -> canonical id (exact) or, with --prefix, a prefix
+    # --latest is mutually exclusive with a positional selector.
+    if args.latest and args.selector is not None:
+        print("--latest and a positional <selector> are mutually exclusive",
+              file=sys.stderr)
+        sys.exit(2)
+    if not args.latest and args.selector is None:
+        print("provide a selector (canonical id or seq number) or use --latest",
+              file=sys.stderr)
+        sys.exit(2)
+
     try:
-        domain, resolved_id = _resolve_id(
-            maildata, args.id, domain=args.domain, allow_prefix=False,
-        )
+        if args.latest:
+            domain, resolved_id = _resolve_latest(maildata)
+        elif args.selector.isdigit():
+            domain, resolved_id = _resolve_seq(maildata, int(args.selector))
+        else:
+            domain, resolved_id = _resolve_id(
+                maildata, args.selector,
+                domain=args.domain, allow_prefix=args.prefix,
+            )
     except ResolveError as exc:
         print(exc.message, file=sys.stderr)
         sys.exit(exc.exit_code)
@@ -1003,7 +1093,16 @@ def _build_parser():
                              "(matches emails.jsonl format).")
 
     p_read = emails_sub.add_parser("read", help="Read one email in json, raw, text, or html")
-    p_read.add_argument("id", help="Canonical id (exact match).")
+    p_read.add_argument(
+        "selector", nargs="?", default=None,
+        help="Canonical id (20260417T101203Z-a1b2c3d4), seq number (integer), "
+             "or short id prefix (requires --prefix). Omit when --latest is set.",
+    )
+    p_read.add_argument("--latest", action="store_true",
+                        help="Read the most recent email. Omits <selector>.")
+    p_read.add_argument("--prefix", action="store_true",
+                        help="Treat a non-canonical selector as an id prefix. "
+                             "Ambiguous prefixes (two or more matches) exit 3.")
     p_read.add_argument("--format", choices=["json", "raw", "text", "html"], default="json")
     p_read.add_argument("--domain", default=None,
                         help="Disambiguate when the id exists under two or more domains.")

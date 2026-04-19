@@ -197,9 +197,12 @@ def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> lis
 
     lines.append("Useful commands:")
     if has_domain:
+        # Lead with the end-to-end test. Blind-install users reach for it
+        # first to confirm the whole pipeline works.
         lines.append("primitive emails test             # send a real test email end-to-end")
-    lines.append("primitive emails status           # check inbox status")
     lines.append("primitive emails list             # list recent emails")
+    lines.append("primitive emails read --latest    # read the most recent email")
+    lines.append("primitive emails status           # inbox status summary")
     lines.append("docker logs primitivemail -f     # watch logs")
     lines.append("primitive restart                # reload after config changes")
     lines.append(f"cat {install_dir}/.env            # view config")
