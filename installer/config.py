@@ -123,7 +123,7 @@ def build_config_summary(
     lines = []
 
     if ip_literal and not has_domain:
-        lines.append(f"Receiving at:      anything@[{ip_literal}]  (IP literal)")
+        lines.append(f"Receiving at:      <any-name>@[{ip_literal}]  (IP literal)")
     else:
         lines.append(f"Hostname:          {hostname}")
         lines.append(f"Domain:            {domain}")
@@ -192,7 +192,7 @@ def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> lis
 
     if not has_domain and ip_literal:
         lines.append("Send a test email to:")
-        lines.append(f"anything@[{ip_literal}]")
+        lines.append(f"agent@[{ip_literal}]  (any local-part works)")
         lines.append("")
 
     lines.append("Useful commands:")

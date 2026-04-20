@@ -143,7 +143,7 @@ def configure(args: argparse.Namespace) -> dict:
         else:
             print()
             print(f"  {ui.GREEN}+{ui.NC} {ui.BOLD}We'll give you a free domain once your server is running.{ui.NC}")
-            print(f"    {ui.MUTED}Something like:{ui.NC} {ui.GREEN}anything@{ui.NC}{ui.YELLOW}<random-prefix>{ui.NC}{ui.GREEN}.primitive.email{ui.NC}")
+            print(f"    {ui.MUTED}Something like:{ui.NC} {ui.GREEN}agent{ui.NC}{ui.MUTED}@{ui.NC}{ui.YELLOW}<random-prefix>{ui.NC}{ui.MUTED}.primitive.email {ui.NC}{ui.MUTED}(any local-part works){ui.NC}")
             print(f"    {ui.YELLOW}(not active yet -- assigned after install completes){ui.NC}")
             print()
             ui.info("Detecting your public IP...")
@@ -396,7 +396,7 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: boo
     ui.json_event("step", name="claim", status="ok", domain=domain)
     print()
     print(f"  {ui.BOLD}Send email to:{ui.NC}")
-    print(f"  {ui.GREEN}anything@{domain}{ui.NC}")
+    print(f"  {ui.GREEN}agent@{domain}{ui.NC}  {ui.MUTED}(any local-part works){ui.NC}")
     print()
     print(f"  {ui.MUTED}Or verify end-to-end with:{ui.NC} {ui.BOLD}primitive emails test{ui.NC}")
     print()
