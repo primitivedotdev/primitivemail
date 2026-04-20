@@ -309,6 +309,32 @@ def cmd_version(args):
     print(f"primitive {VERSION}")
 
 
+def _journal_perms_line(maildata: Path) -> str:
+    """Return a one-line fact about the journal's on-disk permissions.
+
+    Exists so a fresh agent inspecting a running install has the access
+    model handed to it without having to reason from `ls -l` output. Two
+    install-test agents in a row saw `root:root` ownership and concluded
+    "needs sudo to read", which is wrong: the watcher writes world-
+    readable files (0644) on purpose. Stating the fact in `status` output
+    closes that inference gap for agents that never saw the installer
+    banner or AGENTS.md.
+    """
+    journal = _journal_path(maildata)
+    if not journal.exists():
+        return "Journal:       (not yet created; appears on first email)"
+    try:
+        st = journal.stat()
+        mode = oct(st.st_mode & 0o777)
+        readable = os.access(journal, os.R_OK)
+        import getpass
+        who = getpass.getuser()
+        access = f"readable as {who}" if readable else f"NOT readable as {who}"
+        return f"Journal:       {journal} (mode {mode}, {access}, no sudo)"
+    except OSError:
+        return f"Journal:       {journal} (stat failed)"
+
+
 def cmd_emails_status(args):
     maildata = get_maildata_path(args)
 
@@ -322,6 +348,7 @@ def cmd_emails_status(args):
 
     if total == 0:
         print("No emails received yet.")
+        print(_journal_perms_line(maildata))
         return
 
     # Most recent email (filenames sort chronologically)
@@ -344,6 +371,7 @@ def cmd_emails_status(args):
     print(f"Total emails:  {total}")
     print(f"Last received: {received_str}")
     print(f"Last from:     {sender}")
+    print(_journal_perms_line(maildata))
 
 
 def cmd_emails_status_alias(args):

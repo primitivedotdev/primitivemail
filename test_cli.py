@@ -1570,3 +1570,46 @@ class TestEmailsStatusRename:
                 primitive_cli.main()
         out, _ = capsys.readouterr()
         assert "status " in out
+
+
+class TestEmailsStatusJournalPermsLine:
+    """`primitive emails status` is where a fresh agent checks "is this
+    install working?". Surface the journal's access model in the output
+    so the agent does not reason from `ls -l` output and conclude
+    (incorrectly) that reads need sudo. Two install-test agents have
+    now made that mistake; baking the fact into status closes the gap
+    for real-user Claude sessions that never saw the installer banner."""
+
+    def test_reports_journal_perms_when_journal_exists(self, tmp_path, capsys):
+        maildata = tmp_path / "maildata"
+        maildata.mkdir()
+        journal = maildata / "emails.jsonl"
+        journal.write_text('{"seq":1}\n')
+        os.chmod(journal, 0o644)
+        dom = maildata / "ex.com"
+        dom.mkdir()
+        (dom / "20260101T000001Z-aaaaaaa1.eml").write_bytes(b"x")
+        (dom / "20260101T000001Z-aaaaaaa1.meta.json").write_text(
+            json.dumps({"smtp": {"mail_from": "a@x.com"}}),
+        )
+
+        code, out, _ = _run_cli(maildata, ["emails", "status"], capsys=capsys)
+        assert code == 0
+        assert "Journal:" in out
+        assert "0o644" in out or "0644" in out
+        assert "readable as" in out
+        assert "no sudo" in out
+
+    def test_reports_journal_absent_before_first_email(self, tmp_path, capsys):
+        # Fresh install: maildata/ exists but emails.jsonl has not been
+        # created yet. Status should still surface the perms story so an
+        # agent doesn't go looking for the file and then panic when it's
+        # missing.
+        maildata = tmp_path / "maildata"
+        maildata.mkdir()
+
+        code, out, _ = _run_cli(maildata, ["emails", "status"], capsys=capsys)
+        assert code == 0
+        assert "No emails received yet" in out
+        assert "Journal:" in out
+        assert "not yet created" in out
