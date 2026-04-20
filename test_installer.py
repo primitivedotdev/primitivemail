@@ -694,13 +694,23 @@ class TestRunEndToEndVerify:
         monkeypatch.setattr(main_mod.shutil, "which", lambda name: "/usr/local/bin/primitive")
         monkeypatch.setattr(main_mod.os.path, "exists", lambda p: True)
 
+        captured = {}
+
         def fake_run(cmd, **kwargs):
-            assert cmd[0].endswith("primitive")
-            assert cmd[1:3] == ["emails", "test"]
+            captured["cmd"] = cmd
             return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
         monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
         assert main_mod.run_end_to_end_verify(timeout_sec=10) is True
+        # Pin the full subprocess invocation. The CLI's --json output is the
+        # machine-readable path the installer relies on for exit-code
+        # classification, and the --timeout value must match the one the
+        # caller asked for so subprocess's hard-timeout buffer stays correct.
+        assert captured["cmd"][0].endswith("primitive")
+        assert captured["cmd"][1:3] == ["emails", "test"]
+        assert "--timeout" in captured["cmd"]
+        assert captured["cmd"][captured["cmd"].index("--timeout") + 1] == "10"
+        assert "--json" in captured["cmd"]
 
     def test_returns_false_on_timeout_waiting_for_delivery(self, monkeypatch):
         # Exit 6 per `primitive emails test`'s documented scheme: dispatched
@@ -749,6 +759,54 @@ class TestRunEndToEndVerify:
 
         monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
         assert main_mod.run_end_to_end_verify(timeout_sec=10) is False
+
+    def test_failure_surfaces_cli_stderr(self, monkeypatch, capsys):
+        # On a non-zero CLI exit the installer must forward whatever the
+        # CLI said on stderr. Without this, the operator sees only the
+        # classified reason ("exit 7: transport") and has no lead on
+        # which upstream failed. The NDJSON `step/verify/fail` event
+        # carries the same text under `cli_stderr` so agents can decide
+        # without re-parsing human output.
+        from installer import main as main_mod
+        from installer import ui
+
+        monkeypatch.setattr(main_mod.shutil, "which", lambda name: "/usr/local/bin/primitive")
+        monkeypatch.setattr(main_mod.os.path, "exists", lambda p: True)
+        monkeypatch.setattr(
+            main_mod.subprocess, "run",
+            lambda *a, **kw: type("R", (), {
+                "returncode": 7,
+                "stdout": "",
+                "stderr": "could not reach primitive.dev: NXDOMAIN",
+            })(),
+        )
+
+        # Capture NDJSON by enabling json mode; human output lands on
+        # stderr via the installer's ui shim.
+        ui.enable_json_mode()
+        try:
+            assert main_mod.run_end_to_end_verify(timeout_sec=10) is False
+            captured = capsys.readouterr()
+        finally:
+            import sys as _sys
+            ui.JSON_MODE = False
+            if ui._JSON_STDOUT is not None:
+                _sys.stdout = ui._JSON_STDOUT
+                ui._JSON_STDOUT = None
+
+        # Human stream carries the CLI's stderr tail inline.
+        assert "could not reach primitive.dev: NXDOMAIN" in captured.err
+        # NDJSON fail event carries the stderr under a typed key.
+        fail_lines = [l for l in captured.out.strip().splitlines()
+                      if '"status":"fail"' in l]
+        assert fail_lines, "expected a step/verify/fail NDJSON event"
+        import json as _json
+        fail_payload = _json.loads(fail_lines[-1])
+        assert fail_payload["cli_stderr"] == (
+            "could not reach primitive.dev: NXDOMAIN"
+        )
+        assert fail_payload["reason"] == "transport"
+        assert fail_payload["exit_code"] == 7
 
 
 # ===========================================================================
@@ -1236,6 +1294,27 @@ class TestParseArgsImplications:
         assert args.no_prompt is False
         assert args.claim_subdomain is False
         assert args.json_output is False
+
+    def test_skip_verify_default_false(self, monkeypatch):
+        # Unless explicitly opted out, the post-install end-to-end verify
+        # runs whenever a subdomain is claimed. The default has to be
+        # False or every install pays the "old fast path" cost forever.
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer", "--claim-subdomain"])
+        args = parse_args()
+        assert args.skip_verify is False
+
+    def test_skip_verify_flag_opts_out(self, monkeypatch):
+        # Explicit opt-out path. Agents that want a deterministic install
+        # without spending one of the test endpoint's rate-limit budget
+        # pass this and get the pre-verify behavior.
+        from installer.main import parse_args
+        monkeypatch.setattr(
+            "sys.argv",
+            ["installer", "--claim-subdomain", "--skip-verify"],
+        )
+        args = parse_args()
+        assert args.skip_verify is True
 
 
 # ===========================================================================

@@ -515,14 +515,26 @@ def run_end_to_end_verify(timeout_sec: int = 30) -> Optional[bool]:
         7: "transport",
     }
     reason = reason_by_code.get(result.returncode, "unknown")
+    # Surface whatever the CLI said on stderr. Without this the operator
+    # sees only "exit 6: timeout_waiting_for_delivery" and loses the text
+    # that would tell them which upstream (dispatcher, DNS, watcher) the
+    # CLI itself suspected. Truncate so a runaway CLI cannot blow up the
+    # installer output, but include the first ~400 chars which is more
+    # than enough for every documented error path.
+    stderr_tail = (result.stderr or "").strip()
+    if len(stderr_tail) > 400:
+        stderr_tail = stderr_tail[:400] + "... (truncated)"
     ui.warn(
         f"End-to-end verify failed (exit {result.returncode}: {reason}); "
         "the box looks set up, but we could not confirm delivery. "
         "Run `primitive emails test` to retry."
     )
+    if stderr_tail:
+        ui.info(f"CLI said: {stderr_tail}")
     ui.json_event(
         "step", name="verify", status="fail",
         exit_code=result.returncode, reason=reason,
+        cli_stderr=stderr_tail,
     )
     return False
 
