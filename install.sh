@@ -97,7 +97,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --spoof-protection LEVEL  off|monitor|standard|strict (default: off)"
             echo ""
             echo "Output:"
-            echo "  --json                    Emit NDJSON progress events on stdout (implies --no-prompt)"
+            echo "  --json                    NDJSON progress events on stdout, human output on stderr."
+            echo "                            Redirect streams separately (>stdout 2>stderr) to parse stdout"
+            echo "                            as pure NDJSON. Implies --no-prompt."
             echo "  --verbose                 Show detailed output"
             echo "  --no-prompt, -y           Non-interactive mode"
             echo ""
@@ -122,6 +124,11 @@ done
 # intended target. Using `$(pwd)/$INSTALL_DIR` instead of `cd && pwd`
 # because the directory may not exist yet on first install.
 if [[ "$INSTALL_DIR" != /* ]]; then
+    # Strip a leading `./` so the default value `./primitivemail` prepended
+    # with pwd does not render as `/home/ubuntu/./primitivemail` in the
+    # "Cloned to ..." log line. Agents that grep the log for the install
+    # path then get the tidy form, matching the `done` NDJSON event.
+    INSTALL_DIR="${INSTALL_DIR#./}"
     INSTALL_DIR="$(pwd)/$INSTALL_DIR"
 fi
 export PRIMITIVEMAIL_DIR="$INSTALL_DIR"

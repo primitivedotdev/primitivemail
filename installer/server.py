@@ -212,10 +212,56 @@ def check_port_25_local_fallback(ip: str) -> Optional[bool]:
     return False
 
 
+def _aws_imds_detect() -> bool:
+    """True if this host looks like AWS EC2/Lightsail.
+
+    Tries IMDSv2 first (PUT token, GET with token). IMDSv2-only is the
+    default on newer AWS AMIs, and an IMDSv1 GET returns 401 there, which
+    our previous implementation silently swallowed and reported as "not
+    AWS". Falls back to IMDSv1 unauthenticated for older instances still
+    configured to allow it.
+    """
+    # IMDSv2: request a session token, then probe metadata with it.
+    try:
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urllib.request.urlopen(token_req, timeout=1) as resp:
+            token = resp.read().decode("utf-8").strip()
+        if token:
+            probe = urllib.request.Request(
+                "http://169.254.169.254/latest/meta-data/",
+                headers={"X-aws-ec2-metadata-token": token},
+            )
+            with urllib.request.urlopen(probe, timeout=1):
+                return True
+    except Exception:
+        pass
+
+    # IMDSv1 fallback.
+    try:
+        req = urllib.request.Request("http://169.254.169.254/latest/meta-data/")
+        with urllib.request.urlopen(req, timeout=1):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 def detect_cloud_provider() -> Optional[str]:
-    """Detect AWS/GCP/Azure via metadata endpoints."""
+    """Detect AWS/GCP/Azure via metadata endpoints.
+
+    AWS detection has to handle IMDSv2 (token-based), which is the default
+    on modern AMIs. GCP and Azure use stable header-based endpoints with
+    no token dance.
+    """
+    if _aws_imds_detect():
+        return "aws"
+
     checks = [
-        ("aws", "http://169.254.169.254/latest/meta-data/", {}),
         ("gcp", "http://metadata.google.internal/computeMetadata/v1/",
          {"Metadata-Flavor": "Google"}),
         ("azure", "http://169.254.169.254/metadata/instance?api-version=2021-02-01",

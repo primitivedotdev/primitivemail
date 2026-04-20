@@ -393,13 +393,31 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: boo
 
     domain = result["domain"]
     ui.success(f"Claimed: {domain}")
-    ui.json_event("step", name="claim", status="ok", domain=domain)
+    cloud = server.detect_cloud_provider()
+    ui.json_event("step", name="claim", status="ok", domain=domain, cloud=cloud)
     print()
     print(f"  {ui.BOLD}Send email to:{ui.NC}")
     print(f"  {ui.GREEN}agent@{domain}{ui.NC}  {ui.MUTED}(any local-part works){ui.NC}")
     print()
     print(f"  {ui.MUTED}Or verify end-to-end with:{ui.NC} {ui.BOLD}primitive emails test{ui.NC}")
     print()
+    # Public-IP rotation warning for cloud providers where stop/start,
+    # rebuilds, or unattached instances can swap the public IP. The claim
+    # is anchored to the current IPv4; the subdomain silently detaches if
+    # the IP changes. Call this out at claim time (and again in the post-
+    # install summary) so operators pin an Elastic IP before publishing
+    # anything that depends on the address.
+    if cloud == "aws":
+        print(f"  {ui.YELLOW}!{ui.NC} {ui.BOLD}AWS detected.{ui.NC} {ui.MUTED}The subdomain is anchored to this{ui.NC}")
+        print(f"    {ui.MUTED}instance's current public IPv4. Attach an Elastic IP{ui.NC}")
+        print(f"    {ui.MUTED}before publishing this address, or it will silently{ui.NC}")
+        print(f"    {ui.MUTED}detach on the next stop/start.{ui.NC}")
+        print()
+    elif cloud in ("gcp", "azure"):
+        print(f"  {ui.YELLOW}!{ui.NC} {ui.BOLD}{cloud.upper()} detected.{ui.NC} {ui.MUTED}Pin a static public IP before{ui.NC}")
+        print(f"    {ui.MUTED}publishing this address; the claim is anchored to the{ui.NC}")
+        print(f"    {ui.MUTED}current IPv4 and detaches if it rotates.{ui.NC}")
+        print()
     print(f"  {ui.MUTED}Inbound only: PrimitiveMail receives mail, it does not{ui.NC}")
     print(f"  {ui.MUTED}send. For outbound or reply flows, bring your own domain{ui.NC}")
     print(f"  {ui.MUTED}(DKIM signing lives with the sending domain, not with{ui.NC}")
@@ -412,6 +430,8 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: boo
         "domain": domain,
         "ip_literal": "",
         "has_domain": True,
+        "claimed_subdomain": True,
+        "cloud": cloud,
     }
 
     write_env(install_dir, cfg)
@@ -427,6 +447,8 @@ def print_next_steps(cfg: dict, install_dir: str) -> None:
         has_domain=cfg["has_domain"],
         install_dir=install_dir,
         docker_cmd=server._docker_cmd(),
+        cloud=cfg.get("cloud"),
+        claimed_subdomain=cfg.get("claimed_subdomain", False),
     )
     print()
     ui.step("PrimitiveMail is ready")
@@ -477,6 +499,8 @@ def main() -> None:
         has_domain=cfg["has_domain"],
         ip_literal=cfg["ip_literal"],
         event_webhook_enabled=bool(cfg.get("event_webhook_url")),
+        claimed_subdomain=cfg.get("claimed_subdomain", False),
+        cloud=cfg.get("cloud"),
     )
 
 

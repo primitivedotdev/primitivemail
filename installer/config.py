@@ -191,6 +191,8 @@ def build_next_steps(
     has_domain: bool,
     install_dir: str,
     docker_cmd: Optional[list] = None,
+    cloud: Optional[str] = None,
+    claimed_subdomain: bool = False,
 ) -> list:
     """Build next-steps text as plain text lines.
 
@@ -199,6 +201,11 @@ def build_next_steps(
     get.docker.com on a fresh VPS, the invoking user isn't in the docker
     group yet, so the hint must carry `sudo` or operators copy-paste a
     command that fails with a permission-denied error.
+
+    `cloud` is the detected provider ('aws'|'gcp'|'azure'|None) and drives
+    the IP-pinning nudge, which only matters when `claimed_subdomain` is
+    True: a bring-your-own-domain install has its own A record and the
+    user is already managing IP binding on their side.
     """
     lines = []
 
@@ -221,9 +228,29 @@ def build_next_steps(
     lines.append("primitive restart                # reload after config changes")
     lines.append(f"cat {install_dir}/.env            # view config")
     lines.append("")
+    # Surface the on-disk paths explicitly. PrimitiveMail's pitch is "email
+    # on disk as canonical JSON", and agents should not have to read
+    # AGENTS.md to discover where to tail.
+    lines.append("On-disk paths:")
+    lines.append(f"{install_dir}/maildata/emails.jsonl        # append-only journal (tailable)")
+    lines.append(f"{install_dir}/maildata/<domain>/           # per-email .json, .eml, attachments")
+    lines.append("Files are root-owned but world-readable (0644). Read as the install user")
+    lines.append("without sudo; writes (rm, edit) need sudo.")
+    lines.append("")
     lines.append("Agent integration:")
     lines.append(f"cat {install_dir}/AGENTS.md        # how to consume email programmatically")
     lines.append("")
+    if claimed_subdomain and cloud == "aws":
+        lines.append("AWS note:")
+        lines.append("The claimed *.primitive.email subdomain is anchored to this instance's")
+        lines.append("current public IPv4. Attach an Elastic IP before publishing this address,")
+        lines.append("or it will silently detach on the next stop/start.")
+        lines.append("")
+    elif claimed_subdomain and cloud in ("gcp", "azure"):
+        lines.append(f"{cloud.upper()} note:")
+        lines.append("Pin a static public IP before publishing this address; the claim is")
+        lines.append("anchored to the current IPv4 and detaches if it rotates.")
+        lines.append("")
     lines.append("If running on a cloud provider (AWS, GCP, Azure, etc.):")
     lines.append("Make sure port 25 (TCP) is open in your security group / firewall rules.")
     lines.append("The install script can only open the OS-level firewall, not cloud firewalls.")

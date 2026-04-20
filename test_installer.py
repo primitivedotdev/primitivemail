@@ -456,6 +456,191 @@ class TestBuildNextSteps:
         assert "docker logs primitivemail -f" in text
         assert "sudo docker logs" not in text
 
+    def test_surfaces_journal_path(self):
+        # The pitch is "email on disk as canonical JSON". Agents should not
+        # have to read AGENTS.md to find the tailable journal; surface the
+        # path in the same block where we list the CLI commands.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/primitivemail",
+        )
+        text = "\n".join(lines)
+        assert "/home/ubuntu/primitivemail/maildata/emails.jsonl" in text
+        assert "/home/ubuntu/primitivemail/maildata/<domain>/" in text
+
+    def test_notes_maildata_is_root_owned_but_world_readable(self):
+        # The watcher writes as root, so files are root-owned, but 0644
+        # perms mean reads from the install user work without sudo. Only
+        # writes (rm, edit) need sudo. Pin the accurate framing so we do
+        # not regress to "all access needs sudo", which is what two
+        # install-test subagents incorrectly reported.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/primitivemail",
+        )
+        text = "\n".join(lines)
+        assert "root-owned" in text
+        assert "world-readable" in text
+        assert "writes" in text and "sudo" in text
+
+    def test_aws_elastic_ip_nudge_when_subdomain_claimed(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud="aws", claimed_subdomain=True,
+        )
+        text = "\n".join(lines)
+        assert "Elastic IP" in text
+        assert "stop/start" in text
+
+    def test_gcp_static_ip_nudge_when_subdomain_claimed(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud="gcp", claimed_subdomain=True,
+        )
+        text = "\n".join(lines)
+        assert "GCP" in text
+        assert "static public IP" in text
+
+    def test_no_ip_nudge_when_no_subdomain_claimed(self):
+        # Bring-your-own-domain installs manage their own A record; the
+        # anchor-to-current-IP concern does not apply. Do not nag them.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud="aws", claimed_subdomain=False,
+        )
+        text = "\n".join(lines)
+        assert "Elastic IP" not in text
+
+    def test_no_ip_nudge_when_not_on_cloud(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud=None, claimed_subdomain=True,
+        )
+        text = "\n".join(lines)
+        assert "Elastic IP" not in text
+        assert "AWS note" not in text
+
+
+# ===========================================================================
+# Cloud provider detection
+# ===========================================================================
+
+class TestDetectCloudProvider:
+    """detect_cloud_provider has to cope with IMDSv2 as AWS's default.
+    An IMDSv1 unauthenticated GET against an IMDSv2-only instance returns
+    401, not a connection error; the previous implementation caught that
+    and reported "not AWS", which broke the Elastic-IP nudge on modern
+    Lightsail / EC2 AMIs."""
+
+    def _stub_urlopen(self, handlers):
+        """Return a urlopen stub that dispatches on (method, url)."""
+        from installer import server
+
+        def fake_urlopen(req, timeout=None):
+            key = (getattr(req, "get_method", lambda: "GET")(), req.full_url)
+            if key in handlers:
+                result = handlers[key]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            raise URLError("unreachable")
+
+        import urllib.error
+        URLError = urllib.error.URLError
+        return fake_urlopen
+
+    def test_aws_imds_v2(self, monkeypatch):
+        from installer import server
+        import urllib.error
+
+        class FakeResp:
+            def __init__(self, body=b""):
+                self._body = body
+            def read(self):
+                return self._body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            method = req.get_method()
+            if method == "PUT" and url.endswith("/api/token"):
+                return FakeResp(b"fake-token-bytes")
+            if method == "GET" and url.endswith("/meta-data/"):
+                # Verify the caller actually passed the token.
+                assert req.get_header("X-aws-ec2-metadata-token") == "fake-token-bytes"
+                return FakeResp(b"ami-id\n")
+            raise urllib.error.URLError("unexpected call")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() == "aws"
+
+    def test_aws_imds_v1_fallback_when_v2_token_fails(self, monkeypatch):
+        # Old instances with IMDSv1-only (PUT to /api/token 404s or errors).
+        from installer import server
+        import urllib.error
+
+        class FakeResp:
+            def read(self):
+                return b"ami-id\n"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            method = req.get_method()
+            if method == "PUT":
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            if method == "GET" and url.endswith("/meta-data/"):
+                return FakeResp()
+            raise urllib.error.URLError("unexpected call")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() == "aws"
+
+    def test_aws_imds_v2_only_rejects_v1_unauth(self, monkeypatch):
+        # The real case on modern EC2: PUT token works, v1 GET (no token)
+        # returns 401. We should STILL return "aws" because the v2 path
+        # succeeded earlier; we never fall through to v1 when v2 worked.
+        from installer import server
+        import urllib.error
+
+        class FakeResp:
+            def __init__(self, body=b""):
+                self._body = body
+            def read(self):
+                return self._body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            method = req.get_method()
+            if method == "PUT" and url.endswith("/api/token"):
+                return FakeResp(b"token")
+            if method == "GET" and url.endswith("/meta-data/"):
+                if req.get_header("X-aws-ec2-metadata-token"):
+                    return FakeResp(b"ok")
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+            raise urllib.error.URLError("unexpected call")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() == "aws"
+
+    def test_not_on_cloud_returns_none(self, monkeypatch):
+        from installer import server
+        import urllib.error
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.URLError("no route to host")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() is None
+
 
 # ===========================================================================
 # Event webhook URL validation
