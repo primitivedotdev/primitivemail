@@ -1066,6 +1066,25 @@ def get_install_path():
     return _invoking_user_home() / "primitivemail"
 
 
+def _docker_cmd() -> list:
+    """Return the docker invocation prefix, e.g. ['docker'] or ['sudo', 'docker'].
+
+    get.docker.com does not add the invoking user to the docker group, so on
+    fresh VPS installs `docker ...` as the normal user exits with a permission
+    error on /var/run/docker.sock. We auto-escalate to sudo when a bare
+    `docker info` probe fails. Mirrors installer/server.py:_docker_cmd; kept
+    as a separate copy because cli/primitive is a standalone script with no
+    import path into the installer package.
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=5,
+        )
+        return ["docker"] if r.returncode == 0 else ["sudo", "docker"]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ["sudo", "docker"]
+
+
 def cmd_restart(args):
     install_dir = get_install_path()
     compose_file = install_dir / "docker-compose.yml"
@@ -1076,7 +1095,7 @@ def cmd_restart(args):
 
     print("Reloading PrimitiveMail (only changed containers restart)...")
     result = subprocess.run(
-        ["docker", "compose", "up", "-d"],
+        _docker_cmd() + ["compose", "up", "-d"],
         cwd=install_dir,
         capture_output=True,
         text=True,

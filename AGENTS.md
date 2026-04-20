@@ -176,6 +176,18 @@ primitive emails test --timeout 60 --json
 
 Exit codes: `0` received, `1` no subdomain claimed from this IP, `2` invalid CLI usage (conflicting flags or out-of-range `--timeout`), `4` rate-limited (10/hour per IP), `5` local journal unreadable while waiting, `6` dispatched but not observed within the timeout (check DNS / port 25 / container health), `7` could not reach primitive.dev.
 
+## About `*.primitive.email` subdomains
+
+A claim made via `--claim-subdomain` at install time is anchored to the public IPv4 the claim request came from. The claiming host receives a `{subdomain, domain, ip}` tuple; no ownership token is returned, and nothing is persisted locally that would let a different host prove it owns the same name.
+
+Practical consequences:
+
+- If this server's public IPv4 changes (instance stop/start without an Elastic IP, Lightsail rebuild, ISP rotation), the subdomain may stop resolving to you.
+- If you wipe and reinstall, even on the same host and same IP, the installer will claim a fresh subdomain; there is no way to recover the previous one.
+- The claim is inbound-only. DKIM signing lives with the sending domain, so `*.primitive.email` addresses are not suitable for outbound mail.
+
+For addresses you plan to publish or depend on long term, bring your own domain with `--domain` at install time. `*.primitive.email` is appropriate for experimentation, ephemeral agents, and smoke-testing; it is not appropriate for production addresses you cannot afford to have rotate out from under you.
+
 ## Configuration
 
 Config file: `~/primitivemail/.env`
