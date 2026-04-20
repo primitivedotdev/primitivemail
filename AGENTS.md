@@ -222,3 +222,22 @@ The Prometheus exporter (`postfix-exporter`) and log forwarder (Grafana Alloy) a
 ```
 
 `<id>.meta.json.failed` is a watcher-internal poison marker. Agents MUST NOT match it in their own globs and MUST NOT touch it. The journal is the source of truth for which ids exist; a file whose presence the journal does not announce should be treated as watcher state and left alone.
+
+### Permissions
+
+The watcher and postfix containers write as root, so everything under `maildata/` is root-owned (`drwxr-xr-x 3 root root`). The invoking user (typically `ubuntu` on a fresh VPS) is not in the `docker` group either. Practical consequences:
+
+- The `primitive` CLI reads the journal and email files without sudo; use it by default.
+- Direct reads from your shell (`cat`, `grep`, `tail -f emails.jsonl`, `jq`) need `sudo`. A bare `tail -f ~/primitivemail/maildata/emails.jsonl` as the install user will fail with `Permission denied`.
+- If you are writing a long-running consumer that tails the journal, run it under `sudo` or extend group membership on `maildata/` yourself. We deliberately do not add the install user to the `docker` group (docker group membership is effectively root on the host).
+
+### Parsing `--json` installer output
+
+`curl ... | bash -s -- --json` emits NDJSON `{event, ...}` lines on stdout and human-readable progress on stderr. The streams do not interleave; redirect them separately:
+
+```bash
+curl -fsSL https://get.primitive.dev | bash -s -- --no-prompt --json --claim-subdomain \
+  1>events.ndjson 2>install.log
+```
+
+Each line of `events.ndjson` parses independently with `jq`. If you instead capture with `2>&1` or watch the terminal directly, you see both streams mixed and have to filter; don't, just keep them separate.

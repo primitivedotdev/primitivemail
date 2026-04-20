@@ -456,6 +456,65 @@ class TestBuildNextSteps:
         assert "docker logs primitivemail -f" in text
         assert "sudo docker logs" not in text
 
+    def test_surfaces_journal_path(self):
+        # The pitch is "email on disk as canonical JSON". Agents should not
+        # have to read AGENTS.md to find the tailable journal; surface the
+        # path in the same block where we list the CLI commands.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/primitivemail",
+        )
+        text = "\n".join(lines)
+        assert "/home/ubuntu/primitivemail/maildata/emails.jsonl" in text
+        assert "/home/ubuntu/primitivemail/maildata/<domain>/" in text
+
+    def test_notes_maildata_is_root_owned(self):
+        # The watcher writes as root. Direct cat/tail from the invoking
+        # user fails without sudo. Call that out so operators do not chase
+        # a permission error thinking it is a real bug.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/primitivemail",
+        )
+        text = "\n".join(lines)
+        assert "root-owned" in text
+        assert "sudo" in text
+
+    def test_aws_elastic_ip_nudge_when_subdomain_claimed(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud="aws", claimed_subdomain=True,
+        )
+        text = "\n".join(lines)
+        assert "Elastic IP" in text
+        assert "stop/start" in text
+
+    def test_gcp_static_ip_nudge_when_subdomain_claimed(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud="gcp", claimed_subdomain=True,
+        )
+        text = "\n".join(lines)
+        assert "GCP" in text
+        assert "static public IP" in text
+
+    def test_no_ip_nudge_when_no_subdomain_claimed(self):
+        # Bring-your-own-domain installs manage their own A record; the
+        # anchor-to-current-IP concern does not apply. Do not nag them.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud="aws", claimed_subdomain=False,
+        )
+        text = "\n".join(lines)
+        assert "Elastic IP" not in text
+
+    def test_no_ip_nudge_when_not_on_cloud(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            cloud=None, claimed_subdomain=True,
+        )
+        text = "\n".join(lines)
+        assert "Elastic IP" not in text
+        assert "AWS note" not in text
+
 
 # ===========================================================================
 # Event webhook URL validation

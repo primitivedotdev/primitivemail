@@ -50,7 +50,7 @@ curl -fsSL https://get.primitive.dev | bash -s -- \
   --event-webhook-url=https://your-endpoint
 ```
 
-`--no-prompt` runs non-interactively. `--json` streams NDJSON progress events. `--claim-subdomain` grabs a free `*.primitive.email` name. `--event-webhook-url` wires push delivery. Run `curl -fsSL https://get.primitive.dev | bash -s -- --preflight` first to check RAM, disk, inbound 25, and outbound HTTPS.
+`--no-prompt` runs non-interactively. `--json` streams NDJSON progress events on stdout, with human-readable progress on stderr. Redirect them separately (`>events.ndjson 2>install.log`) if you want stdout to parse cleanly with `jq`. `--claim-subdomain` grabs a free `*.primitive.email` name. `--event-webhook-url` wires push delivery. Run `curl -fsSL https://get.primitive.dev | bash -s -- --preflight` first to check RAM, disk, inbound 25, and outbound HTTPS.
 
 ### Verify your install
 
@@ -61,6 +61,13 @@ primitive emails test
 ```
 
 `primitive.dev` sends a test email to your claimed subdomain and the CLI waits for it to land in the local journal (default 30s). A successful run exercises DNS, inbound port 25, postfix, the watcher, and the journal writer in one call.
+
+## Running on AWS (EC2, Lightsail)
+
+PrimitiveMail works fine on AWS for its stated use case. Two things to know:
+
+- **Attach an Elastic IP before publishing any address.** A claimed `*.primitive.email` subdomain is anchored to the instance's current public IPv4. Instance stop/start without an Elastic IP rotates the public IP and silently detaches the subdomain; a new install on the new IP gets a different name.
+- **EC2 and Lightsail block outbound TCP 25 by default.** This does not affect inbound mail (PrimitiveMail is inbound-only by design), so the receive pipeline works out of the box. It matters only if you later want to send from the same box: AWS requires a [port 25 removal request](https://aws.amazon.com/premiumsupport/knowledge-center/ec2-port-25-throttle/), or you use a relay.
 
 ## Agent integration
 
