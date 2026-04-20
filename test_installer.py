@@ -435,6 +435,27 @@ class TestBuildNextSteps:
         text = "\n".join(lines)
         assert "port 25" in text.lower() or "Port 25" in text
 
+    def test_docker_logs_hint_prefixes_sudo_when_not_in_docker_group(self):
+        # get.docker.com doesn't add the invoking user to the docker group,
+        # so on a fresh VPS the installer runs docker via `sudo docker`. The
+        # post-install hint has to carry the same prefix or operators copy
+        # a command that exits with "permission denied on docker.sock".
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/user/pm",
+            docker_cmd=["sudo", "docker"],
+        )
+        text = "\n".join(lines)
+        assert "sudo docker logs primitivemail -f" in text
+
+    def test_docker_logs_hint_has_no_sudo_when_in_docker_group(self):
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/user/pm",
+            docker_cmd=["docker"],
+        )
+        text = "\n".join(lines)
+        assert "docker logs primitivemail -f" in text
+        assert "sudo docker logs" not in text
+
 
 # ===========================================================================
 # Event webhook URL validation

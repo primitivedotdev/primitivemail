@@ -86,6 +86,92 @@ class TestInvokingUserHomeSudoAware:
         assert result == Path.home()
 
 
+class TestDockerCmd:
+    """`primitive restart` shells out to `docker compose up -d`. On fresh
+    VPS installs the invoking user is not in the docker group (get.docker.com
+    does not add them), so calling docker without sudo exits with a
+    permission error on /var/run/docker.sock. The CLI has to auto-escalate
+    the same way the installer does."""
+
+    def test_returns_plain_docker_when_info_succeeds(self, monkeypatch):
+        completed = MagicMock(returncode=0)
+        monkeypatch.setattr(primitive_cli.subprocess, "run",
+                            MagicMock(return_value=completed))
+        assert primitive_cli._docker_cmd() == ["docker"]
+
+    def test_falls_back_to_sudo_when_info_fails(self, monkeypatch):
+        # Non-zero exit from `docker info` is how the docker CLI signals
+        # permission-denied on the socket.
+        completed = MagicMock(returncode=1)
+        monkeypatch.setattr(primitive_cli.subprocess, "run",
+                            MagicMock(return_value=completed))
+        assert primitive_cli._docker_cmd() == ["sudo", "docker"]
+
+    def test_falls_back_to_sudo_when_docker_missing(self, monkeypatch):
+        # No docker binary at all: treat as needs-sudo (installer is about
+        # to put it there under root) rather than crashing the CLI.
+        monkeypatch.setattr(
+            primitive_cli.subprocess, "run",
+            MagicMock(side_effect=FileNotFoundError()),
+        )
+        assert primitive_cli._docker_cmd() == ["sudo", "docker"]
+
+
+class TestCmdRestartUsesDockerCmdPrefix:
+    """`primitive restart` must call docker through whatever prefix
+    `_docker_cmd()` returns, not hardcoded `docker`."""
+
+    def _build_args(self):
+        return MagicMock()
+
+    def test_restart_invokes_with_sudo_when_needed(self, tmp_path, monkeypatch):
+        # Pretend the install dir exists with a compose file.
+        install_dir = tmp_path / "primitivemail"
+        install_dir.mkdir()
+        (install_dir / "docker-compose.yml").write_text("services: {}\n")
+        monkeypatch.setattr(
+            primitive_cli, "get_install_path",
+            lambda: install_dir,
+        )
+        monkeypatch.setattr(
+            primitive_cli, "_docker_cmd",
+            lambda: ["sudo", "docker"],
+        )
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return MagicMock(returncode=0, stderr="")
+
+        monkeypatch.setattr(primitive_cli.subprocess, "run", fake_run)
+        primitive_cli.cmd_restart(self._build_args())
+        assert captured["cmd"][:3] == ["sudo", "docker", "compose"]
+        assert "up" in captured["cmd"] and "-d" in captured["cmd"]
+
+    def test_restart_invokes_without_sudo_when_in_group(self, tmp_path, monkeypatch):
+        install_dir = tmp_path / "primitivemail"
+        install_dir.mkdir()
+        (install_dir / "docker-compose.yml").write_text("services: {}\n")
+        monkeypatch.setattr(
+            primitive_cli, "get_install_path",
+            lambda: install_dir,
+        )
+        monkeypatch.setattr(
+            primitive_cli, "_docker_cmd",
+            lambda: ["docker"],
+        )
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return MagicMock(returncode=0, stderr="")
+
+        monkeypatch.setattr(primitive_cli.subprocess, "run", fake_run)
+        primitive_cli.cmd_restart(self._build_args())
+        assert captured["cmd"][:2] == ["docker", "compose"]
+        assert captured["cmd"][0] != "sudo"
+
+
 class TestGetInstallPathSudoAware:
     """End-to-end check that get_install_path respects the sudo-aware
     resolver. PRIMITIVEMAIL_DIR always wins when set."""

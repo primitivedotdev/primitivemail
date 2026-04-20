@@ -426,6 +426,7 @@ def print_next_steps(cfg: dict, install_dir: str) -> None:
         ip_literal=cfg["ip_literal"],
         has_domain=cfg["has_domain"],
         install_dir=install_dir,
+        docker_cmd=server._docker_cmd(),
     )
     print()
     ui.step("PrimitiveMail is ready")

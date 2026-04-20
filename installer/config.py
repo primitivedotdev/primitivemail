@@ -186,14 +186,28 @@ def build_dns_instructions(hostname: str, domain: str) -> list:
     ]
 
 
-def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> list:
-    """Build next-steps text as plain text lines."""
+def build_next_steps(
+    ip_literal: str,
+    has_domain: bool,
+    install_dir: str,
+    docker_cmd: Optional[list] = None,
+) -> list:
+    """Build next-steps text as plain text lines.
+
+    `docker_cmd` is the invocation prefix for the docker CLI on this host
+    (e.g. ['docker'] or ['sudo', 'docker']); when the installer just ran
+    get.docker.com on a fresh VPS, the invoking user isn't in the docker
+    group yet, so the hint must carry `sudo` or operators copy-paste a
+    command that fails with a permission-denied error.
+    """
     lines = []
 
     if not has_domain and ip_literal:
         lines.append("Send a test email to:")
         lines.append(f"agent@[{ip_literal}]  (any local-part works)")
         lines.append("")
+
+    docker_prefix = " ".join(docker_cmd) if docker_cmd else "docker"
 
     lines.append("Useful commands:")
     if has_domain:
@@ -203,7 +217,7 @@ def build_next_steps(ip_literal: str, has_domain: bool, install_dir: str) -> lis
     lines.append("primitive emails list             # list recent emails")
     lines.append("primitive emails read --latest    # read the most recent email")
     lines.append("primitive emails status           # inbox status summary")
-    lines.append("docker logs primitivemail -f     # watch logs")
+    lines.append(f"{docker_prefix} logs primitivemail -f     # watch logs")
     lines.append("primitive restart                # reload after config changes")
     lines.append(f"cat {install_dir}/.env            # view config")
     lines.append("")
