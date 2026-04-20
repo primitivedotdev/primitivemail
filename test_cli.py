@@ -1325,6 +1325,46 @@ class TestEmailsTest:
         assert body["seq"] == 2  # seq 1 is the stale entry the CLI ignored
         assert body["tag"] == "ab12cd34"
 
+    def test_wait_human_output_shows_from_to_subject(self, tmp_path, capsys, monkeypatch):
+        # Blind-install tester #5 couldn't tell from the one-line
+        # "Received in ...s (seq N)" output whether the message round-
+        # tripped externally or was synthesized locally. The human-mode
+        # success output now includes From:, To:, and Subject: so the
+        # operator can see at a glance that it came from primitive.dev.
+        subject = "PrimitiveMail test ab12cd34"
+        maildata = _seed_maildata(tmp_path, [])
+        import threading
+        pending_timer = {}
+
+        def stub(*a, **kw):
+            t = threading.Timer(
+                0.3, self._journal_append_with_subject,
+                args=(maildata, subject), kwargs={"seq": 1},
+            )
+            pending_timer["t"] = t
+            t.start()
+            return (200, json.dumps({
+                "ok": True, "tag": "ab12cd34", "subject": subject,
+                "from": "postmaster@test.primitive.dev",
+                "to": "test+ab12cd34@pink-violet.primitive.email",
+                "dispatched_at": "2026-04-19T20:30:00Z",
+            }))
+
+        monkeypatch.setattr(primitive_cli, "_post_test_email", stub)
+        try:
+            code, out, _ = _run_cli(
+                maildata, ["emails", "test", "--timeout", "5"], capsys=capsys,
+            )
+        finally:
+            if "t" in pending_timer:
+                pending_timer["t"].join()
+
+        assert code == 0
+        assert "Received in" in out
+        assert "From:" in out and "postmaster@test.primitive.dev" in out
+        assert "To:" in out and "test+ab12cd34@pink-violet.primitive.email" in out
+        assert "Subject:" in out and subject in out
+
     def test_wait_timeout_exits_6(self, tmp_path, capsys, monkeypatch):
         # No journal append within the timeout; expect exit 6 + timeout hint.
         # Fast-forward time so the test does not actually sleep --timeout

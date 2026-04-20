@@ -400,6 +400,11 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: boo
     print()
     print(f"  {ui.MUTED}Or verify end-to-end with:{ui.NC} {ui.BOLD}primitive emails test{ui.NC}")
     print()
+    print(f"  {ui.MUTED}Inbound only: PrimitiveMail receives mail, it does not{ui.NC}")
+    print(f"  {ui.MUTED}send. For outbound or reply flows, bring your own domain{ui.NC}")
+    print(f"  {ui.MUTED}(DKIM signing lives with the sending domain, not with{ui.NC}")
+    print(f"  {ui.MUTED}*.primitive.email subdomains).{ui.NC}")
+    print()
 
     cfg = {
         **cfg,
