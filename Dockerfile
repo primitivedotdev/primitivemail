@@ -31,23 +31,23 @@ RUN mkdir -p /opt/mx-box /mail/incoming && \
 WORKDIR /opt/mx-box
 
 # Copy config + scripts
-COPY postfix-main.cf.template /opt/mx-box/postfix-main.cf.template
-COPY postfix-master.cf.append /opt/mx-box/postfix-master.cf.append
-COPY relay_domains /opt/mx-box/relay_domains
-COPY relay_recipients /opt/mx-box/relay_recipients
-COPY command_filter.pcre /opt/mx-box/command_filter.pcre
-COPY transport /opt/mx-box/transport
-COPY aliases /opt/mx-box/aliases
-COPY entrypoint.sh /opt/mx-box/entrypoint.sh
-COPY store_mail.py /opt/mx-box/store_mail.py
-COPY email_validator.py /opt/mx-box/email_validator.py
-COPY primitivemail_milter.py /opt/mx-box/primitivemail_milter.py
-COPY store-mail-wrapper.sh /opt/mx-box/store-mail-wrapper.sh
-COPY store-mail-wrapper-debug.sh /opt/mx-box/store-mail-wrapper-debug.sh
-COPY store-mail.sh /opt/mx-box/store-mail.sh
-COPY store-mail-debug.sh /opt/mx-box/store-mail-debug.sh
-COPY test-pipe.sh /opt/mx-box/test-pipe.sh
-COPY debug-delivery.sh /opt/mx-box/debug-delivery.sh
+COPY postfix/postfix-main.cf.template /opt/mx-box/postfix-main.cf.template
+COPY postfix/postfix-master.cf.append /opt/mx-box/postfix-master.cf.append
+COPY postfix/relay_domains /opt/mx-box/relay_domains
+COPY postfix/relay_recipients /opt/mx-box/relay_recipients
+COPY postfix/command_filter.pcre /opt/mx-box/command_filter.pcre
+COPY postfix/transport /opt/mx-box/transport
+COPY postfix/aliases /opt/mx-box/aliases
+COPY milter/entrypoint.sh /opt/mx-box/entrypoint.sh
+COPY milter/store_mail.py /opt/mx-box/store_mail.py
+COPY milter/email_validator.py /opt/mx-box/email_validator.py
+COPY milter/primitivemail_milter.py /opt/mx-box/primitivemail_milter.py
+COPY scripts/pipe-transport/store-mail-wrapper.sh /opt/mx-box/store-mail-wrapper.sh
+COPY scripts/pipe-transport/store-mail-wrapper-debug.sh /opt/mx-box/store-mail-wrapper-debug.sh
+COPY scripts/pipe-transport/store-mail.sh /opt/mx-box/store-mail.sh
+COPY scripts/pipe-transport/store-mail-debug.sh /opt/mx-box/store-mail-debug.sh
+COPY scripts/pipe-transport/test-pipe.sh /opt/mx-box/test-pipe.sh
+COPY scripts/pipe-transport/debug-delivery.sh /opt/mx-box/debug-delivery.sh
 
 RUN chmod +x /opt/mx-box/entrypoint.sh /opt/mx-box/store_mail.py /opt/mx-box/primitivemail_milter.py /opt/mx-box/store-mail-wrapper.sh /opt/mx-box/store-mail-wrapper-debug.sh /opt/mx-box/store-mail.sh /opt/mx-box/store-mail-debug.sh /opt/mx-box/test-pipe.sh /opt/mx-box/debug-delivery.sh
 
