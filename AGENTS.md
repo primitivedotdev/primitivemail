@@ -46,16 +46,32 @@ Each attachment entry in the JSON has `filename`, `content_type`, `size_bytes`, 
 ### Watch for new email (recommended)
 
 ```bash
-tail -f ~/primitivemail/maildata/emails.jsonl
+primitive emails since 0 --follow
 ```
+
+Streams every journal entry and keeps the stream open, tailing new ones as they arrive. Works as the install user; no `sudo` needed (see Permissions below).
+
+Raw-file equivalent, for consumers that can't shell out to the CLI:
+
+```bash
+sudo tail -f ~/primitivemail/maildata/emails.jsonl
+```
+
+`sudo` is required because `maildata/` is root-owned (the watcher writes as root). A bare `tail -f` as the install user fails with `Permission denied`.
 
 ### Resume after crash
 
 Save the last `seq` you processed. On restart, skip lines until `seq > last_seq`.
 
 ```bash
-# Read from seq 5 onward
-tail -n +1 ~/primitivemail/maildata/emails.jsonl | while read -r line; do
+# Read from seq 5 onward, via the CLI (no sudo needed)
+primitive emails since 5 --follow
+```
+
+Or, raw:
+
+```bash
+sudo tail -n +1 ~/primitivemail/maildata/emails.jsonl | while read -r line; do
   seq=$(echo "$line" | jq -r '.seq // 0')
   [ "$seq" -le 4 ] && continue
   # process $line
@@ -65,7 +81,14 @@ done
 ### Read a specific email
 
 ```bash
-cat ~/primitivemail/maildata/<path from journal line>
+primitive emails read --latest              # most recent, no sudo needed
+primitive emails read <seq-or-id>           # by seq number or canonical id
+```
+
+Raw-file equivalent (sudo required):
+
+```bash
+sudo cat ~/primitivemail/maildata/<path from journal line>
 ```
 
 ## Receiving webhooks

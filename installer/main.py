@@ -499,6 +499,8 @@ def main() -> None:
         has_domain=cfg["has_domain"],
         ip_literal=cfg["ip_literal"],
         event_webhook_enabled=bool(cfg.get("event_webhook_url")),
+        claimed_subdomain=cfg.get("claimed_subdomain", False),
+        cloud=cfg.get("cloud"),
     )
 
 
