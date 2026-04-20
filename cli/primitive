@@ -944,7 +944,8 @@ def cmd_emails_test(args):
         if args.json:
             print(json.dumps({
                 "ok": True, "tag": tag, "subject": subject,
-                "dispatched_at": dispatched_at, "to": to_addr,
+                "from": from_addr, "to": to_addr,
+                "dispatched_at": dispatched_at,
                 "wait": False,
             }))
         else:

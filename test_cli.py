@@ -1272,6 +1272,30 @@ class TestEmailsTest:
         assert "ab12cd34" in out
         assert "Dispatched" in out
 
+    def test_no_wait_json_carries_from_and_to(self, tmp_path, capsys, monkeypatch):
+        # --no-wait --json must match --wait --json on identity fields
+        # (from, to, subject, tag). An earlier revision omitted `from`,
+        # making the two modes diverge; this pins symmetry.
+        self._stub_post(200, {
+            "ok": True, "tag": "ab12cd34",
+            "subject": "PrimitiveMail test ab12cd34",
+            "from": "postmaster@test.primitive.dev",
+            "to": "test+ab12cd34@pink-violet.primitive.email",
+            "dispatched_at": "2026-04-19T20:30:00Z",
+        }, monkeypatch)
+        maildata = _seed_maildata(tmp_path, [])
+        code, out, _ = _run_cli(
+            maildata, ["emails", "test", "--no-wait", "--json"], capsys=capsys,
+        )
+        assert code == 0
+        body = json.loads(out.strip())
+        assert body["ok"] is True
+        assert body["tag"] == "ab12cd34"
+        assert body["from"] == "postmaster@test.primitive.dev"
+        assert body["to"] == "test+ab12cd34@pink-violet.primitive.email"
+        assert body["subject"] == "PrimitiveMail test ab12cd34"
+        assert body["wait"] is False
+
     def test_wait_matches_journal_entry_by_subject(self, tmp_path, capsys, monkeypatch):
         # Seed one pre-existing entry that happens to share the server
         # subject (stale state from a prior run). The CLI MUST ignore it
