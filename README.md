@@ -27,6 +27,16 @@ less install.sh
 bash install.sh
 ```
 
+Want to pin a checksum? `get.primitive.dev` publishes a `sha256sum`-compatible hash alongside every served `install.sh`. They are generated from the same response body, so the hash matches whatever bytes you would have downloaded:
+
+```bash
+curl -fsSL https://get.primitive.dev -o install.sh && \
+  curl -fsSL https://get.primitive.dev/install.sh.sha256 | sha256sum -c && \
+  bash install.sh
+```
+
+The `&&` chain is load-bearing: if `sha256sum -c` exits non-zero (hash mismatch, network error, or a corrupted `.sha256` response), `bash install.sh` never runs. For branch-served installs (`get.primitive.dev/<branch>`), fetch `get.primitive.dev/<branch>/install.sh.sha256` instead.
+
 ### Scripted install
 
 For agents driving the install in a single pass:
