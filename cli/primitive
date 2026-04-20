@@ -938,12 +938,14 @@ def cmd_emails_test(args):
 
     dispatched_at = body.get("dispatched_at")
     to_addr = body.get("to", "")
+    from_addr = body.get("from", "")
 
     if not args.wait:
         if args.json:
             print(json.dumps({
                 "ok": True, "tag": tag, "subject": subject,
-                "dispatched_at": dispatched_at, "to": to_addr,
+                "from": from_addr, "to": to_addr,
+                "dispatched_at": dispatched_at,
                 "wait": False,
             }))
         else:
@@ -1033,13 +1035,26 @@ def cmd_emails_test(args):
     if args.json:
         print(json.dumps({
             "ok": True, "tag": tag, "subject": subject,
+            "from": from_addr, "to": to_addr,
             "dispatched_at": dispatched_at,
             "received_at": matched.get("received_at"),
             "seq": matched.get("seq"),
             "elapsed_ms": elapsed_ms,
         }))
     else:
-        print(f"Received in {elapsed_ms / 1000:.2f}s (seq {matched.get('seq')}).")
+        # Multi-line summary so the operator can see at a glance that the
+        # message genuinely round-tripped externally: the From: address is
+        # primitive.dev's sender, the To: is their claimed subdomain, and
+        # the subject is the server-stamped tag. Terse one-liner left
+        # ambiguous whether the message came from outside or was synthesized
+        # locally (reported in blind-install test #5).
+        seq = matched.get("seq")
+        print(f"Received in {elapsed_ms / 1000:.2f}s (seq {seq}).")
+        if from_addr:
+            print(f"  From:    {from_addr}")
+        if to_addr:
+            print(f"  To:      {to_addr}")
+        print(f"  Subject: {subject}")
 
 
 def get_install_path():
