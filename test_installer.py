@@ -517,6 +517,129 @@ class TestBuildNextSteps:
 
 
 # ===========================================================================
+# Cloud provider detection
+# ===========================================================================
+
+class TestDetectCloudProvider:
+    """detect_cloud_provider has to cope with IMDSv2 as AWS's default.
+    An IMDSv1 unauthenticated GET against an IMDSv2-only instance returns
+    401, not a connection error; the previous implementation caught that
+    and reported "not AWS", which broke the Elastic-IP nudge on modern
+    Lightsail / EC2 AMIs."""
+
+    def _stub_urlopen(self, handlers):
+        """Return a urlopen stub that dispatches on (method, url)."""
+        from installer import server
+
+        def fake_urlopen(req, timeout=None):
+            key = (getattr(req, "get_method", lambda: "GET")(), req.full_url)
+            if key in handlers:
+                result = handlers[key]
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            raise URLError("unreachable")
+
+        import urllib.error
+        URLError = urllib.error.URLError
+        return fake_urlopen
+
+    def test_aws_imds_v2(self, monkeypatch):
+        from installer import server
+        import urllib.error
+
+        class FakeResp:
+            def __init__(self, body=b""):
+                self._body = body
+            def read(self):
+                return self._body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            method = req.get_method()
+            if method == "PUT" and url.endswith("/api/token"):
+                return FakeResp(b"fake-token-bytes")
+            if method == "GET" and url.endswith("/meta-data/"):
+                # Verify the caller actually passed the token.
+                assert req.get_header("X-aws-ec2-metadata-token") == "fake-token-bytes"
+                return FakeResp(b"ami-id\n")
+            raise urllib.error.URLError("unexpected call")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() == "aws"
+
+    def test_aws_imds_v1_fallback_when_v2_token_fails(self, monkeypatch):
+        # Old instances with IMDSv1-only (PUT to /api/token 404s or errors).
+        from installer import server
+        import urllib.error
+
+        class FakeResp:
+            def read(self):
+                return b"ami-id\n"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            method = req.get_method()
+            if method == "PUT":
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            if method == "GET" and url.endswith("/meta-data/"):
+                return FakeResp()
+            raise urllib.error.URLError("unexpected call")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() == "aws"
+
+    def test_aws_imds_v2_only_rejects_v1_unauth(self, monkeypatch):
+        # The real case on modern EC2: PUT token works, v1 GET (no token)
+        # returns 401. We should STILL return "aws" because the v2 path
+        # succeeded earlier; we never fall through to v1 when v2 worked.
+        from installer import server
+        import urllib.error
+
+        class FakeResp:
+            def __init__(self, body=b""):
+                self._body = body
+            def read(self):
+                return self._body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            method = req.get_method()
+            if method == "PUT" and url.endswith("/api/token"):
+                return FakeResp(b"token")
+            if method == "GET" and url.endswith("/meta-data/"):
+                if req.get_header("X-aws-ec2-metadata-token"):
+                    return FakeResp(b"ok")
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+            raise urllib.error.URLError("unexpected call")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() == "aws"
+
+    def test_not_on_cloud_returns_none(self, monkeypatch):
+        from installer import server
+        import urllib.error
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.URLError("no route to host")
+
+        monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+        assert server.detect_cloud_provider() is None
+
+
+# ===========================================================================
 # Event webhook URL validation
 # ===========================================================================
 
