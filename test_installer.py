@@ -467,16 +467,19 @@ class TestBuildNextSteps:
         assert "/home/ubuntu/primitivemail/maildata/emails.jsonl" in text
         assert "/home/ubuntu/primitivemail/maildata/<domain>/" in text
 
-    def test_notes_maildata_is_root_owned(self):
-        # The watcher writes as root. Direct cat/tail from the invoking
-        # user fails without sudo. Call that out so operators do not chase
-        # a permission error thinking it is a real bug.
+    def test_notes_maildata_is_root_owned_but_world_readable(self):
+        # The watcher writes as root, so files are root-owned, but 0644
+        # perms mean reads from the install user work without sudo. Only
+        # writes (rm, edit) need sudo. Pin the accurate framing so we do
+        # not regress to "all access needs sudo", which is what two
+        # install-test subagents incorrectly reported.
         lines = build_next_steps(
             ip_literal="", has_domain=True, install_dir="/home/ubuntu/primitivemail",
         )
         text = "\n".join(lines)
         assert "root-owned" in text
-        assert "sudo" in text
+        assert "world-readable" in text
+        assert "writes" in text and "sudo" in text
 
     def test_aws_elastic_ip_nudge_when_subdomain_claimed(self):
         lines = build_next_steps(

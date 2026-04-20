@@ -49,29 +49,28 @@ Each attachment entry in the JSON has `filename`, `content_type`, `size_bytes`, 
 primitive emails since 0 --follow
 ```
 
-Streams every journal entry and keeps the stream open, tailing new ones as they arrive. Works as the install user; no `sudo` needed (see Permissions below).
+Streams every journal entry and keeps the stream open, tailing new ones as they arrive. Works before the first email lands (waits for the journal to appear) and across journal rotation.
 
 Raw-file equivalent, for consumers that can't shell out to the CLI:
 
 ```bash
-sudo tail -f ~/primitivemail/maildata/emails.jsonl
+tail -f ~/primitivemail/maildata/emails.jsonl
 ```
 
-`sudo` is required because `maildata/` is root-owned (the watcher writes as root). A bare `tail -f` as the install user fails with `Permission denied`.
+The journal is world-readable (mode 0644), so this runs as the install user without sudo. Caveat: `tail -f` errors out if the journal does not yet exist. Use `tail -F` (uppercase, retry-on-rotate) for long-running consumers, or prefer the CLI form above.
 
 ### Resume after crash
 
 Save the last `seq` you processed. On restart, skip lines until `seq > last_seq`.
 
 ```bash
-# Read from seq 5 onward, via the CLI (no sudo needed)
 primitive emails since 5 --follow
 ```
 
 Or, raw:
 
 ```bash
-sudo tail -n +1 ~/primitivemail/maildata/emails.jsonl | while read -r line; do
+tail -n +1 ~/primitivemail/maildata/emails.jsonl | while read -r line; do
   seq=$(echo "$line" | jq -r '.seq // 0')
   [ "$seq" -le 4 ] && continue
   # process $line
@@ -81,14 +80,14 @@ done
 ### Read a specific email
 
 ```bash
-primitive emails read --latest              # most recent, no sudo needed
+primitive emails read --latest              # most recent
 primitive emails read <seq-or-id>           # by seq number or canonical id
 ```
 
-Raw-file equivalent (sudo required):
+Raw-file equivalent:
 
 ```bash
-sudo cat ~/primitivemail/maildata/<path from journal line>
+cat ~/primitivemail/maildata/<path from journal line>
 ```
 
 ## Receiving webhooks
@@ -248,11 +247,13 @@ The Prometheus exporter (`postfix-exporter`) and log forwarder (Grafana Alloy) a
 
 ### Permissions
 
-The watcher and postfix containers write as root, so everything under `maildata/` is root-owned (`drwxr-xr-x 3 root root`). The invoking user (typically `ubuntu` on a fresh VPS) is not in the `docker` group either. Practical consequences:
+The watcher and postfix containers write as root, so everything under `maildata/` is root-owned. Files are mode `0644` and directories are `0755`, which means:
 
-- The `primitive` CLI reads the journal and email files without sudo; use it by default.
-- Direct reads from your shell (`cat`, `grep`, `tail -f emails.jsonl`, `jq`) need `sudo`. A bare `tail -f ~/primitivemail/maildata/emails.jsonl` as the install user will fail with `Permission denied`.
-- If you are writing a long-running consumer that tails the journal, run it under `sudo` or extend group membership on `maildata/` yourself. We deliberately do not add the install user to the `docker` group (docker group membership is effectively root on the host).
+- **Reads as the install user work without sudo.** `cat`, `tail -f`, `ls`, `grep`, `jq`, and the `primitive` CLI all work as `ubuntu` (or whichever user ran the install). The journal is world-readable by design.
+- **Writes require sudo.** Deleting files, editing in place, rotating logs, etc. must run as root (or via sudo). `primitive` never mutates files under `maildata/`, so CLI usage is unaffected.
+- **Docker is a separate concern.** The install user is not in the `docker` group on fresh VPS installs (get.docker.com does not add them). Commands like `docker logs primitivemail -f` need `sudo`; the `primitive` CLI auto-escalates internally. This is unrelated to `maildata/` permissions.
+
+If you want writes under `maildata/` as the install user (e.g. you're building a consumer that moves processed emails aside), the right fix is to chown the per-consumer output directory you control, not to chown `maildata/` itself. The watcher expects to own what it writes.
 
 ### Parsing `--json` installer output
 
