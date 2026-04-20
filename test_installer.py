@@ -518,6 +518,43 @@ class TestBuildNextSteps:
         assert "Elastic IP" not in text
         assert "AWS note" not in text
 
+    def test_verified_true_prints_end_to_end_banner(self):
+        # When the installer's post-install verify succeeds, the summary
+        # should lead with an unambiguous "this works" line that an agent
+        # can forward to the user without further prompting.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            verified=True,
+        )
+        text = "\n".join(lines)
+        assert "Verified end-to-end" in text
+        assert "real external email" in text
+
+    def test_verified_false_prints_retry_hint(self):
+        # Verify ran and failed. Do not fake success; tell the operator
+        # the box looks set up but delivery was not confirmed, and how to
+        # retry.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            verified=False,
+        )
+        text = "\n".join(lines)
+        assert "did not complete" in text
+        assert "primitive emails test" in text
+
+    def test_verified_none_is_silent(self):
+        # When verify was skipped (non-claim install, --skip-verify, CLI
+        # missing), produce neither a success nor a failure banner. The
+        # post-install output should not assert anything the installer
+        # did not prove.
+        lines = build_next_steps(
+            ip_literal="", has_domain=True, install_dir="/home/ubuntu/pm",
+            verified=None,
+        )
+        text = "\n".join(lines)
+        assert "Verified end-to-end" not in text
+        assert "did not complete" not in text
+
 
 # ===========================================================================
 # Cloud provider detection
@@ -640,6 +677,78 @@ class TestDetectCloudProvider:
 
         monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
         assert server.detect_cloud_provider() is None
+
+
+# ===========================================================================
+# End-to-end verify
+# ===========================================================================
+
+class TestRunEndToEndVerify:
+    """The installer auto-runs `primitive emails test` when a subdomain
+    was claimed, to turn a 'containers healthy' install into a 'yes, mail
+    works' install. Exit codes from the CLI drive the NDJSON outcome."""
+
+    def test_returns_true_on_cli_success(self, monkeypatch):
+        from installer import main as main_mod
+
+        monkeypatch.setattr(main_mod.shutil, "which", lambda name: "/usr/local/bin/primitive")
+        monkeypatch.setattr(main_mod.os.path, "exists", lambda p: True)
+
+        def fake_run(cmd, **kwargs):
+            assert cmd[0].endswith("primitive")
+            assert cmd[1:3] == ["emails", "test"]
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+        assert main_mod.run_end_to_end_verify(timeout_sec=10) is True
+
+    def test_returns_false_on_timeout_waiting_for_delivery(self, monkeypatch):
+        # Exit 6 per `primitive emails test`'s documented scheme: dispatched
+        # but not observed within the window. Box might be healthy; we
+        # just did not see the message arrive.
+        from installer import main as main_mod
+
+        monkeypatch.setattr(main_mod.shutil, "which", lambda name: "/usr/local/bin/primitive")
+        monkeypatch.setattr(main_mod.os.path, "exists", lambda p: True)
+        monkeypatch.setattr(
+            main_mod.subprocess, "run",
+            lambda *a, **kw: type("R", (), {"returncode": 6, "stdout": "", "stderr": ""})(),
+        )
+        assert main_mod.run_end_to_end_verify(timeout_sec=10) is False
+
+    def test_returns_false_on_rate_limit(self, monkeypatch):
+        from installer import main as main_mod
+
+        monkeypatch.setattr(main_mod.shutil, "which", lambda name: "/usr/local/bin/primitive")
+        monkeypatch.setattr(main_mod.os.path, "exists", lambda p: True)
+        monkeypatch.setattr(
+            main_mod.subprocess, "run",
+            lambda *a, **kw: type("R", (), {"returncode": 4, "stdout": "", "stderr": ""})(),
+        )
+        assert main_mod.run_end_to_end_verify(timeout_sec=10) is False
+
+    def test_returns_none_when_cli_not_installed(self, monkeypatch):
+        # Defensive: if the CLI somehow did not install (e.g. install_cli
+        # step silently bailed), the verify step should skip cleanly
+        # rather than crash, and return None so the done event can
+        # honestly report "we didn't check" instead of lying about it.
+        from installer import main as main_mod
+
+        monkeypatch.setattr(main_mod.shutil, "which", lambda name: None)
+        monkeypatch.setattr(main_mod.os.path, "exists", lambda p: False)
+        assert main_mod.run_end_to_end_verify(timeout_sec=10) is None
+
+    def test_returns_false_on_hard_subprocess_timeout(self, monkeypatch):
+        from installer import main as main_mod
+
+        monkeypatch.setattr(main_mod.shutil, "which", lambda name: "/usr/local/bin/primitive")
+        monkeypatch.setattr(main_mod.os.path, "exists", lambda p: True)
+
+        def fake_run(*a, **kw):
+            raise main_mod.subprocess.TimeoutExpired(cmd=a[0], timeout=1)
+
+        monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+        assert main_mod.run_end_to_end_verify(timeout_sec=10) is False
 
 
 # ===========================================================================

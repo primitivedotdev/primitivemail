@@ -193,6 +193,7 @@ def build_next_steps(
     docker_cmd: Optional[list] = None,
     cloud: Optional[str] = None,
     claimed_subdomain: bool = False,
+    verified: Optional[bool] = None,
 ) -> list:
     """Build next-steps text as plain text lines.
 
@@ -206,8 +207,24 @@ def build_next_steps(
     the IP-pinning nudge, which only matters when `claimed_subdomain` is
     True: a bring-your-own-domain install has its own A record and the
     user is already managing IP binding on their side.
+
+    `verified` reports the outcome of the installer-run end-to-end test:
+    True means a real external email landed in the local journal, False
+    means the test ran and something failed, None means the step was
+    skipped (not applicable, or the user passed --skip-verify). Agents
+    reading the post-install summary forward the wording to the user; a
+    True banner means "the box works, you can send to it now" without
+    any additional prompting.
     """
     lines = []
+
+    if verified is True:
+        lines.append("Verified end-to-end: a real external email was delivered and persisted.")
+        lines.append("")
+    elif verified is False:
+        lines.append("End-to-end verify did not complete successfully.")
+        lines.append("The box looks set up; run `primitive emails test` to retry.")
+        lines.append("")
 
     if not has_domain and ip_literal:
         lines.append("Send a test email to:")

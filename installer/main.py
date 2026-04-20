@@ -6,7 +6,10 @@ Called by install.sh after Docker, firewall, and clone are done.
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
+from typing import Optional
 
 from installer import config, ui, server
 
@@ -32,6 +35,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-start", action="store_true", dest="no_start")
     parser.add_argument("--json", action="store_true", dest="json_output")
     parser.add_argument("--verbose", action="store_true")
+    # End-to-end verification. When a subdomain claim succeeds, the installer
+    # asks primitive.dev to send a real external email to it and waits for
+    # the message to land in the local journal. A passing verify turns
+    # "containers are up" into "the full pipeline works", which is the
+    # question an agent forwarding a status to a user actually needs
+    # answered. `--skip-verify` is the escape hatch for people who want the
+    # old fast path (no rate-limit spend, no extra ~2-5s).
+    parser.add_argument("--skip-verify", action="store_true", dest="skip_verify",
+                        help="Skip the post-install end-to-end test email "
+                             "(runs by default when a subdomain was claimed)")
     args = parser.parse_args()
     # --json implies --no-prompt: agents don't have a TTY, _get_tty_input would hang.
     # --claim-subdomain implies --no-prompt: otherwise a user could interactively
@@ -441,7 +454,80 @@ def try_claim_subdomain(install_dir: str, cfg: dict, no_prompt: bool, force: boo
     return cfg
 
 
-def print_next_steps(cfg: dict, install_dir: str) -> None:
+def run_end_to_end_verify(timeout_sec: int = 30) -> Optional[bool]:
+    """Ask primitive.dev to send a real test email and wait for it to land.
+
+    Returns True on a fully-verified install, False on any failure (dispatch
+    error, delivery timeout, rate limit), or None when we could not run the
+    check at all (no CLI on PATH). The installer treats False as a warning,
+    not a hard error: the containers might be fine and a subsequent
+    `primitive emails test` might succeed on retry. What we are buying with
+    this step is a definitive "yes, mail works" signal that an agent
+    forwarding a status to a user can trust without further prompting.
+
+    Shells out to the already-installed `primitive` CLI rather than
+    recalling the test endpoint directly, so the exit-code scheme stays in
+    one place and future CLI changes (timeout handling, retries) propagate
+    to the installer automatically.
+    """
+    cli_path = shutil.which("primitive") or "/usr/local/bin/primitive"
+    if not os.path.exists(cli_path):
+        ui.warn("primitive CLI not found on PATH; skipping end-to-end verify")
+        ui.json_event("step", name="verify", status="skip",
+                      reason="cli_not_found")
+        return None
+
+    ui.step("Verifying end-to-end")
+    ui.info("Asking primitive.dev to send a test email and waiting for it to land...")
+    ui.json_event("step", name="verify", status="start", timeout_sec=timeout_sec)
+
+    try:
+        result = subprocess.run(
+            [cli_path, "emails", "test", "--timeout", str(timeout_sec), "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec + 15,
+        )
+    except subprocess.TimeoutExpired:
+        ui.warn("End-to-end verify hit a hard timeout; run `primitive emails test` to retry.")
+        ui.json_event("step", name="verify", status="fail",
+                      reason="subprocess_timeout")
+        return False
+    except Exception as exc:
+        ui.warn(f"End-to-end verify could not run: {exc}")
+        ui.json_event("step", name="verify", status="fail",
+                      reason="subprocess_error", message=str(exc))
+        return False
+
+    if result.returncode == 0:
+        ui.success("End-to-end verified: a real external email was received")
+        ui.json_event("step", name="verify", status="ok")
+        return True
+
+    # Non-zero: classify via the CLI's documented exit codes so the NDJSON
+    # event carries something an agent can decide on without re-parsing text.
+    reason_by_code = {
+        1: "no_subdomain_claimed",
+        2: "cli_usage",
+        4: "rate_limited",
+        5: "journal_unreadable",
+        6: "timeout_waiting_for_delivery",
+        7: "transport",
+    }
+    reason = reason_by_code.get(result.returncode, "unknown")
+    ui.warn(
+        f"End-to-end verify failed (exit {result.returncode}: {reason}); "
+        "the box looks set up, but we could not confirm delivery. "
+        "Run `primitive emails test` to retry."
+    )
+    ui.json_event(
+        "step", name="verify", status="fail",
+        exit_code=result.returncode, reason=reason,
+    )
+    return False
+
+
+def print_next_steps(cfg: dict, install_dir: str, verified: Optional[bool] = None) -> None:
     lines = config.build_next_steps(
         ip_literal=cfg["ip_literal"],
         has_domain=cfg["has_domain"],
@@ -449,6 +535,7 @@ def print_next_steps(cfg: dict, install_dir: str) -> None:
         docker_cmd=server._docker_cmd(),
         cloud=cfg.get("cloud"),
         claimed_subdomain=cfg.get("claimed_subdomain", False),
+        verified=verified,
     )
     print()
     ui.step("PrimitiveMail is ready")
@@ -490,7 +577,17 @@ def main() -> None:
     ui.json_event("step", name="install_cli", status="start")
     server.install_cli(install_dir)
     ui.json_event("step", name="install_cli", status="ok")
-    print_next_steps(cfg, install_dir)
+
+    # End-to-end verification. Only runs when a fresh subdomain was
+    # claimed in this install (bring-your-own-domain installs skip it
+    # because the user's DNS may not have propagated yet, and the test
+    # endpoint is identity-matched on source IP so it would look
+    # "unclaimed" from an unrelated-domain install anyway).
+    verified = None
+    if cfg.get("claimed_subdomain") and not args.skip_verify:
+        verified = run_end_to_end_verify()
+
+    print_next_steps(cfg, install_dir, verified=verified)
     ui.json_event(
         "done",
         install_dir=os.path.abspath(install_dir),
@@ -501,6 +598,7 @@ def main() -> None:
         event_webhook_enabled=bool(cfg.get("event_webhook_url")),
         claimed_subdomain=cfg.get("claimed_subdomain", False),
         cloud=cfg.get("cloud"),
+        verified=verified,
     )
 
 

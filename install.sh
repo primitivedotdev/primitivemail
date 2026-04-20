@@ -107,6 +107,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --dir PATH                Install directory (default: ./primitivemail)"
             echo "  --preflight               Check environment (RAM, disk, port 25, outbound HTTPS)"
             echo "                            without installing. Emits one JSON line, exits 1 on failure."
+            echo "  --skip-verify             Skip the post-install end-to-end test email (runs by"
+            echo "                            default when --claim-subdomain succeeds)."
             echo "  --help, -h                Show this help"
             exit 0
             ;;
