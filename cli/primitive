@@ -309,6 +309,21 @@ def cmd_version(args):
     print(f"primitive {VERSION}")
 
 
+def _invoking_user_name() -> str:
+    """Return the invoking user's login name, not the effective UID under sudo.
+
+    Mirrors _invoking_user_home's SUDO_USER fallback. When an operator runs
+    `sudo primitive ...`, euid is 0 but SUDO_USER names the real caller; we
+    want the reports to read "ubuntu", not "root", in both invocation
+    modes.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root" and os.geteuid() == 0:
+        return sudo_user
+    import getpass
+    return getpass.getuser()
+
+
 def _journal_perms_line(maildata: Path) -> str:
     """Return a one-line fact about the journal's on-disk permissions.
 
@@ -319,6 +334,11 @@ def _journal_perms_line(maildata: Path) -> str:
     readable files (0644) on purpose. Stating the fact in `status` output
     closes that inference gap for agents that never saw the installer
     banner or AGENTS.md.
+
+    Readability is checked against the file mode's "other" bit rather than
+    os.access(), because os.access() uses the effective UID: under
+    `sudo primitive ...` it would report True even if the file were 0600,
+    defeating the whole purpose of the line.
     """
     journal = _journal_path(maildata)
     if not journal.exists():
@@ -326,11 +346,11 @@ def _journal_perms_line(maildata: Path) -> str:
     try:
         st = journal.stat()
         mode = oct(st.st_mode & 0o777)
-        readable = os.access(journal, os.R_OK)
-        import getpass
-        who = getpass.getuser()
-        access = f"readable as {who}" if readable else f"NOT readable as {who}"
-        return f"Journal:       {journal} (mode {mode}, {access}, no sudo)"
+        other_readable = bool(st.st_mode & 0o004)
+        who = _invoking_user_name()
+        if other_readable:
+            return f"Journal:       {journal} (mode {mode}, readable as {who}, no sudo needed)"
+        return f"Journal:       {journal} (mode {mode}, NOT readable as {who}; sudo required)"
     except OSError:
         return f"Journal:       {journal} (stat failed)"
 

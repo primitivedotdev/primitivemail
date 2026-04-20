@@ -1596,9 +1596,9 @@ class TestEmailsStatusJournalPermsLine:
         code, out, _ = _run_cli(maildata, ["emails", "status"], capsys=capsys)
         assert code == 0
         assert "Journal:" in out
-        assert "0o644" in out or "0644" in out
+        assert "0o644" in out
         assert "readable as" in out
-        assert "no sudo" in out
+        assert "no sudo needed" in out
 
     def test_reports_journal_absent_before_first_email(self, tmp_path, capsys):
         # Fresh install: maildata/ exists but emails.jsonl has not been
@@ -1613,3 +1613,51 @@ class TestEmailsStatusJournalPermsLine:
         assert "No emails received yet" in out
         assert "Journal:" in out
         assert "not yet created" in out
+
+    def test_reports_sudo_user_not_root_under_sudo(self, tmp_path, capsys, monkeypatch):
+        # `sudo primitive emails status`: euid is 0, SUDO_USER names the
+        # real caller. The line should read "readable as ubuntu", not
+        # "readable as root" (and must not contradict itself by saying
+        # "no sudo needed" while clearly running under sudo).
+        maildata = tmp_path / "maildata"
+        maildata.mkdir()
+        journal = maildata / "emails.jsonl"
+        journal.write_text('{"seq":1}\n')
+        os.chmod(journal, 0o644)
+        dom = maildata / "ex.com"
+        dom.mkdir()
+        (dom / "20260101T000001Z-aaaaaaa1.eml").write_bytes(b"x")
+        (dom / "20260101T000001Z-aaaaaaa1.meta.json").write_text(
+            json.dumps({"smtp": {"mail_from": "a@x.com"}}),
+        )
+        monkeypatch.setenv("SUDO_USER", "ubuntu")
+        monkeypatch.setattr(primitive_cli.os, "geteuid", lambda: 0)
+
+        code, out, _ = _run_cli(maildata, ["emails", "status"], capsys=capsys)
+        assert code == 0
+        assert "readable as ubuntu" in out
+        assert "readable as root" not in out
+
+    def test_reports_not_readable_when_mode_restricts_other(self, tmp_path, capsys):
+        # Belt-and-braces: if someone chmods the journal to 0600 the line
+        # must flip to "NOT readable as <user>; sudo required" rather than
+        # lying about the access model. We check the "other" read bit
+        # from the file mode rather than calling os.access, because
+        # os.access uses euid and would report True under sudo even with
+        # 0600 perms.
+        maildata = tmp_path / "maildata"
+        maildata.mkdir()
+        journal = maildata / "emails.jsonl"
+        journal.write_text('{"seq":1}\n')
+        os.chmod(journal, 0o600)
+        dom = maildata / "ex.com"
+        dom.mkdir()
+        (dom / "20260101T000001Z-aaaaaaa1.eml").write_bytes(b"x")
+        (dom / "20260101T000001Z-aaaaaaa1.meta.json").write_text(
+            json.dumps({"smtp": {"mail_from": "a@x.com"}}),
+        )
+
+        code, out, _ = _run_cli(maildata, ["emails", "status"], capsys=capsys)
+        assert code == 0
+        assert "NOT readable" in out
+        assert "sudo required" in out
