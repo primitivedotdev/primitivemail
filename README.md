@@ -2,6 +2,8 @@
 
 A self-hosted SMTP inbox for agents. One command, one VPS, incoming mail on disk as JSON.
 
+Landing page: [primitive.dev/mail](https://primitive.dev/mail).
+
 ## Features
 
 - **One command install.** Fresh Ubuntu VPS to working inbox in a few minutes.
