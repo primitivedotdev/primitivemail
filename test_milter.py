@@ -1821,5 +1821,473 @@ class TestMetaJsonSidecar:
         assert 'auth' in meta
 
 
+# ===========================================================================
+# Config file + SIGHUP reload
+# ===========================================================================
+
+class TestConfigFile:
+    """Config file loading with environment variable fallback."""
+
+    def test_read_config_file_valid(self, tmp_path):
+        cfg_path = tmp_path / "milter.json"
+        cfg_path.write_text(json.dumps({
+            "webhook_url": "https://file.example.com/hook",
+            "webhook_secret": "file-secret",
+        }))
+        data = pm._read_config_file(str(cfg_path))
+        assert data["webhook_url"] == "https://file.example.com/hook"
+        assert data["webhook_secret"] == "file-secret"
+
+    def test_read_config_file_missing(self):
+        data = pm._read_config_file("/nonexistent/path/milter.json")
+        assert data == {}
+
+    def test_read_config_file_invalid_json(self, tmp_path):
+        cfg_path = tmp_path / "bad.json"
+        cfg_path.write_text("not json {{{")
+        data = pm._read_config_file(str(cfg_path))
+        assert data == {}
+
+    def test_read_config_file_non_object(self, tmp_path):
+        cfg_path = tmp_path / "array.json"
+        cfg_path.write_text(json.dumps(["a", "b"]))
+        data = pm._read_config_file(str(cfg_path))
+        assert data == {}
+
+    def test_cfg_file_wins_over_env(self):
+        file_data = {"webhook_url": "https://from-file.com"}
+        with patch.dict(os.environ, {"WEBHOOK_URL": "https://from-env.com"}):
+            assert pm._cfg(file_data, "webhook_url", "WEBHOOK_URL") == "https://from-file.com"
+
+    def test_cfg_falls_back_to_env(self):
+        with patch.dict(os.environ, {"WEBHOOK_URL": "https://from-env.com"}):
+            assert pm._cfg({}, "webhook_url", "WEBHOOK_URL") == "https://from-env.com"
+
+    def test_cfg_falls_back_to_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            result = pm._cfg({}, "webhook_url", "WEBHOOK_URL_NONEXISTENT", "default-val")
+            assert result == "default-val"
+
+
+class TestParseHelpers:
+    """Helpers for comma-separated sets and extra headers."""
+
+    def test_parse_comma_set_string(self):
+        assert pm._parse_comma_set("a.com, b.com, c.com") == {"a.com", "b.com", "c.com"}
+
+    def test_parse_comma_set_list(self):
+        assert pm._parse_comma_set(["A.COM", "B.com"]) == {"a.com", "b.com"}
+
+    def test_parse_comma_set_empty(self):
+        assert pm._parse_comma_set("") == set()
+        assert pm._parse_comma_set(None) == set()
+
+    def test_parse_extra_headers_dict(self):
+        assert pm._parse_extra_headers({"x-foo": "bar"}) == {"x-foo": "bar"}
+
+    def test_parse_extra_headers_json_string(self):
+        assert pm._parse_extra_headers('{"x-foo": "bar"}') == {"x-foo": "bar"}
+
+    def test_parse_extra_headers_invalid(self):
+        assert pm._parse_extra_headers("not json") == {}
+        assert pm._parse_extra_headers("") == {}
+        assert pm._parse_extra_headers(None) == {}
+
+    def test_parse_extra_headers_non_object_json(self):
+        assert pm._parse_extra_headers('["a","b"]') == {}
+
+
+class TestApplyConfig:
+    """_apply_config sets globals from file data + env fallback."""
+
+    def _save_globals(self):
+        return {
+            'WEBHOOK_URL': pm.WEBHOOK_URL,
+            'WEBHOOK_SECRET': pm.WEBHOOK_SECRET,
+            'WEBHOOK_EXTRA_HEADERS': pm.WEBHOOK_EXTRA_HEADERS,
+            'STORAGE_URL': pm.STORAGE_URL,
+            'STORAGE_KEY': pm.STORAGE_KEY,
+            'STORAGE_AUTH_STYLE': pm.STORAGE_AUTH_STYLE,
+            'ALLOWED_SENDER_DOMAINS': pm.ALLOWED_SENDER_DOMAINS,
+            'ALLOWED_SENDERS': pm.ALLOWED_SENDERS,
+            'ALLOW_BOUNCES': pm.ALLOW_BOUNCES,
+            'SENDER_FILTERING_ENABLED': pm.SENDER_FILTERING_ENABLED,
+            'ALLOWED_RECIPIENTS': pm.ALLOWED_RECIPIENTS,
+            'RECIPIENT_FILTERING_ENABLED': pm.RECIPIENT_FILTERING_ENABLED,
+            'SPOOF_PROTECTION': pm.SPOOF_PROTECTION,
+            'MESSAGE_ID_DOMAIN': pm.MESSAGE_ID_DOMAIN,
+            'STANDALONE_MODE': pm.STANDALONE_MODE,
+            'MAIL_DIR': pm.MAIL_DIR,
+            'SPAMHAUS_DNSBL_DOMAIN': pm.SPAMHAUS_DNSBL_DOMAIN,
+            'STORAGE_UPLOAD_THRESHOLD': pm.STORAGE_UPLOAD_THRESHOLD,
+        }
+
+    def _restore_globals(self, saved):
+        for k, v in saved.items():
+            setattr(pm, k, v)
+
+    def test_apply_from_file_data(self):
+        saved = self._save_globals()
+        try:
+            pm._apply_config({
+                "webhook_url": "https://test-apply.com/hook",
+                "webhook_secret": "secret-apply",
+                "allowed_sender_domains": ["example.com", "test.com"],
+                "allowed_recipients": "user@a.com,admin@b.com",
+                "spoof_protection": "monitor",
+            }, reloadable_only=False)
+
+            assert pm.WEBHOOK_URL == "https://test-apply.com/hook"
+            assert pm.WEBHOOK_SECRET == "secret-apply"
+            assert pm.ALLOWED_SENDER_DOMAINS == {"example.com", "test.com"}
+            assert pm.SENDER_FILTERING_ENABLED is True
+            assert pm.ALLOWED_RECIPIENTS == {"user@a.com", "admin@b.com"}
+            assert pm.RECIPIENT_FILTERING_ENABLED is True
+            assert pm.STANDALONE_MODE is False
+        finally:
+            self._restore_globals(saved)
+
+    def test_apply_reloadable_only_does_not_change_identity(self):
+        saved = self._save_globals()
+        try:
+            # Start in webhook mode so reload doesn't hit mode-switch guard
+            pm._apply_config({
+                "webhook_url": "https://original-url.com",
+                "webhook_secret": "secret",
+                "mydomain": "primitivemail",
+            }, reloadable_only=False)
+            pm.MESSAGE_ID_DOMAIN = "original.com"
+            pm.MAIL_DIR = "/original/dir"
+
+            pm._apply_config({
+                "webhook_url": "https://new-url.com",
+                "webhook_secret": "secret",
+                "mydomain": "should-be-ignored.com",
+                "mail_dir": "/should/be/ignored",
+            }, reloadable_only=True)
+
+            assert pm.WEBHOOK_URL == "https://new-url.com"
+            assert pm.MESSAGE_ID_DOMAIN == "original.com"
+            assert pm.MAIL_DIR == "/original/dir"
+        finally:
+            self._restore_globals(saved)
+
+    def test_apply_env_fallback_when_key_missing_from_file(self):
+        saved = self._save_globals()
+        try:
+            with patch.dict(os.environ, {"WEBHOOK_URL": "https://env-fallback.com",
+                                          "WEBHOOK_SECRET": "env-secret"}):
+                pm._apply_config({}, reloadable_only=False)
+                assert pm.WEBHOOK_URL == "https://env-fallback.com"
+                assert pm.WEBHOOK_SECRET == "env-secret"
+        finally:
+            self._restore_globals(saved)
+
+    def test_standalone_mode_when_no_webhook_url(self):
+        saved = self._save_globals()
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                # Remove WEBHOOK_URL from env to avoid leaking
+                env = {k: v for k, v in os.environ.items() if k != 'WEBHOOK_URL'}
+                with patch.dict(os.environ, env, clear=True):
+                    pm._apply_config({}, reloadable_only=False)
+                    assert pm.STANDALONE_MODE is True
+        finally:
+            self._restore_globals(saved)
+
+    def test_allow_bounces_parsing(self):
+        saved = self._save_globals()
+        try:
+            pm._apply_config({"allow_bounces": "false"}, reloadable_only=False)
+            assert pm.ALLOW_BOUNCES is False
+
+            pm._apply_config({"allow_bounces": True}, reloadable_only=False)
+            assert pm.ALLOW_BOUNCES is True
+
+            pm._apply_config({}, reloadable_only=False)
+            assert pm.ALLOW_BOUNCES is True  # default
+        finally:
+            self._restore_globals(saved)
+
+
+class TestSighupReload:
+    """SIGHUP-triggered config reload."""
+
+    def _save_globals(self):
+        return {
+            'WEBHOOK_URL': pm.WEBHOOK_URL,
+            'WEBHOOK_SECRET': pm.WEBHOOK_SECRET,
+            'WEBHOOK_EXTRA_HEADERS': pm.WEBHOOK_EXTRA_HEADERS,
+            'STORAGE_URL': pm.STORAGE_URL,
+            'STORAGE_KEY': pm.STORAGE_KEY,
+            'STORAGE_AUTH_STYLE': pm.STORAGE_AUTH_STYLE,
+            'ALLOWED_SENDER_DOMAINS': pm.ALLOWED_SENDER_DOMAINS,
+            'ALLOWED_SENDERS': pm.ALLOWED_SENDERS,
+            'ALLOW_BOUNCES': pm.ALLOW_BOUNCES,
+            'SENDER_FILTERING_ENABLED': pm.SENDER_FILTERING_ENABLED,
+            'ALLOWED_RECIPIENTS': pm.ALLOWED_RECIPIENTS,
+            'RECIPIENT_FILTERING_ENABLED': pm.RECIPIENT_FILTERING_ENABLED,
+            'SPOOF_PROTECTION': pm.SPOOF_PROTECTION,
+            'MESSAGE_ID_DOMAIN': pm.MESSAGE_ID_DOMAIN,
+            'STANDALONE_MODE': pm.STANDALONE_MODE,
+            'MAIL_DIR': pm.MAIL_DIR,
+            'SPAMHAUS_DNSBL_DOMAIN': pm.SPAMHAUS_DNSBL_DOMAIN,
+            'STORAGE_UPLOAD_THRESHOLD': pm.STORAGE_UPLOAD_THRESHOLD,
+        }
+
+    def _restore_globals(self, saved):
+        for k, v in saved.items():
+            setattr(pm, k, v)
+
+    def test_reload_updates_webhook_url(self, tmp_path):
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://original.com/hook",
+                "webhook_secret": "original-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm.WEBHOOK_URL == "https://original.com/hook"
+
+            # Update config file and trigger reload
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://updated.com/hook",
+                "webhook_secret": "updated-secret",
+            }))
+            pm.reload_config()
+
+            assert pm.WEBHOOK_URL == "https://updated.com/hook"
+            assert pm.WEBHOOK_SECRET == "updated-secret"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_updates_filtering(self, tmp_path):
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com/hook",
+                "webhook_secret": "secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm.SENDER_FILTERING_ENABLED is False
+            assert pm.ALLOWED_RECIPIENTS == set()
+
+            # Add filtering via reload
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com/hook",
+                "webhook_secret": "secret",
+                "allowed_sender_domains": ["trusted.com"],
+                "allowed_recipients": ["inbox@myco.com"],
+            }))
+            pm.reload_config()
+
+            assert pm.SENDER_FILTERING_ENABLED is True
+            assert pm.ALLOWED_SENDER_DOMAINS == {"trusted.com"}
+            assert pm.RECIPIENT_FILTERING_ENABLED is True
+            assert pm.ALLOWED_RECIPIENTS == {"inbox@myco.com"}
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_does_not_change_identity(self, tmp_path):
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com",
+                "webhook_secret": "s",
+                "mydomain": "original.com",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm.MESSAGE_ID_DOMAIN == "original.com"
+
+            # Try to change mydomain via reload — should be ignored
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com",
+                "webhook_secret": "s",
+                "mydomain": "sneaky-change.com",
+            }))
+            pm.reload_config()
+
+            assert pm.MESSAGE_ID_DOMAIN == "original.com"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_survives_missing_config_file(self, tmp_path):
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            pm.WEBHOOK_URL = "https://before.com"
+            pm.CONFIG_FILE_PATH = str(tmp_path / "does-not-exist.json")
+
+            # Should not crash, falls back to env vars
+            pm.reload_config()
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_survives_corrupt_config_file(self, tmp_path):
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "corrupt.json"
+            cfg_path.write_text("{{{invalid")
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm.WEBHOOK_URL = "https://before-corrupt.com"
+
+            # Should not crash
+            pm.reload_config()
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_rejects_mode_switch_webhook_to_standalone(self, tmp_path):
+        """Cannot switch from webhook to standalone mode via SIGHUP."""
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://webhook-mode.com",
+                "webhook_secret": "secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm.STANDALONE_MODE is False
+            assert pm.WEBHOOK_URL == "https://webhook-mode.com"
+
+            # Try to remove webhook_url via reload — should be rejected
+            cfg_path.write_text(json.dumps({}))
+            with patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                          if k != 'WEBHOOK_URL'}, clear=True):
+                pm.reload_config()
+
+            # Should still be the original URL
+            assert pm.WEBHOOK_URL == "https://webhook-mode.com"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_rejects_missing_secret(self, tmp_path):
+        """Cannot reload with webhook_url but no webhook_secret."""
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://original.com",
+                "webhook_secret": "original-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+
+            # Reload with URL but no secret — should be rejected
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://new-url.com",
+            }))
+            with patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                          if k != 'WEBHOOK_SECRET'}, clear=True):
+                pm.reload_config()
+
+            # Should still be the original values
+            assert pm.WEBHOOK_URL == "https://original.com"
+            assert pm.WEBHOOK_SECRET == "original-secret"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+    def test_reload_callable_as_signal_handler(self, tmp_path):
+        """reload_config accepts signum and frame args (signal handler signature)."""
+        saved = self._save_globals()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            # Start in webhook mode so reload doesn't hit mode-switch guard
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://initial.com",
+                "webhook_secret": "initial-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+
+            # Update config and reload with signal handler signature
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://signal-test.com",
+                "webhook_secret": "sig-secret",
+            }))
+            pm.reload_config(signum=1, frame=None)
+
+            assert pm.WEBHOOK_URL == "https://signal-test.com"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_globals(saved)
+
+
+class TestEndToEndConfigFile:
+    """Integration: config file → milter behaviour."""
+
+    def test_webhook_uses_config_file_url(self, tmp_path):
+        """A milter with config-file-sourced WEBHOOK_URL posts to the right place."""
+        saved_url = pm.WEBHOOK_URL
+        saved_secret = pm.WEBHOOK_SECRET
+        saved_standalone = pm.STANDALONE_MODE
+        saved_dnsbl = pm.SPAMHAUS_DNSBL_DOMAIN
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://config-file-target.com/hook",
+                "webhook_secret": "cfg-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            pm.SPAMHAUS_DNSBL_DOMAIN = ''
+
+            m = pm.PrimitiveMailMilter()
+            m.setreply = MagicMock()
+            m.addheader = MagicMock()
+            m.chgheader = MagicMock()
+            m.client_ip = '127.0.0.1'
+            m.client_hostname = 'localhost'
+            m.helo = 'test.example.com'
+
+            m.envfrom('<sender@example.com>')
+            m.envrcpt('<user@example.com>')
+            m.header('From', 'sender@example.com')
+            m.header('To', 'user@example.com')
+            m.header('Subject', 'Config file test')
+            m.header('Message-ID', '<cfg-test@example.com>')
+            m.body(b'Config file test body')
+
+            captured_urls = []
+
+            def capture_request(request, timeout=None):
+                captured_urls.append(request.full_url)
+                return make_webhook_response('accepted')
+
+            with patch('urllib.request.urlopen', side_effect=capture_request):
+                result = m.eom()
+
+            assert result == mock_milter.ACCEPT
+            assert len(captured_urls) == 1
+            assert captured_urls[0] == "https://config-file-target.com/hook"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            pm.WEBHOOK_URL = saved_url
+            pm.WEBHOOK_SECRET = saved_secret
+            pm.STANDALONE_MODE = saved_standalone
+            pm.SPAMHAUS_DNSBL_DOMAIN = saved_dnsbl
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

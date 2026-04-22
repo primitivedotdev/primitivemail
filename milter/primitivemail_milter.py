@@ -19,6 +19,7 @@ import re
 import json
 import base64
 import logging
+import signal
 import time
 import hashlib
 import ipaddress
@@ -208,125 +209,232 @@ except ImportError:
 except Exception as e:
     logger.warning(f"Failed to initialize Loki handler: {e}")
 
-# Configuration from environment
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET')
+# ---------------------------------------------------------------------------
+# Configuration: config file (optional) with environment variable fallback
+#
+# If a JSON config file exists at CONFIG_FILE_PATH (default:
+# /etc/primitive/milter.json), values are loaded from it. Any value not
+# present in the file falls back to the corresponding environment variable.
+# If no config file exists, all values come from environment variables —
+# this is the original behaviour and remains fully supported.
+#
+# A subset of values can be reloaded at runtime by sending SIGHUP to the
+# process. See RELOADABLE_KEYS below for which values support hot reload
+# and _apply_config() for the reload logic.
+# ---------------------------------------------------------------------------
 
-# Extra headers to include on webhook calls (JSON object, optional).
-# Useful for deployment protection bypass, API gateway auth, etc.
-# Example: WEBHOOK_EXTRA_HEADERS='{"x-vercel-protection-bypass": "secret123"}'
-WEBHOOK_EXTRA_HEADERS = {}
-try:
-    raw = os.environ.get('WEBHOOK_EXTRA_HEADERS', '')
-    if raw:
-        WEBHOOK_EXTRA_HEADERS = json.loads(raw)
-        if not isinstance(WEBHOOK_EXTRA_HEADERS, dict):
+CONFIG_FILE_PATH = os.environ.get('CONFIG_FILE', '/etc/primitive/milter.json')
+
+# Keys that are safe to update at runtime via SIGHUP.  Identity/path values
+# (mydomain, mail_dir, etc.) are NOT reloadable because Postfix and the
+# filesystem depend on them being stable for the life of the process.
+RELOADABLE_KEYS = frozenset({
+    'webhook_url', 'webhook_secret', 'webhook_extra_headers',
+    'storage_url', 'storage_key', 'storage_auth_style',
+    'allowed_sender_domains', 'allowed_senders', 'allowed_recipients',
+    'allow_bounces', 'spoof_protection',
+})
+
+
+def _read_config_file(path: str) -> dict:
+    """Read a JSON config file.  Returns {} if the file does not exist or
+    is not valid JSON (with a warning)."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning(f"Config file {path} is not a JSON object, ignoring")
+                return {}
+            return data
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        logger.warning(f"Failed to read config file {path}: {e}")
+        return {}
+
+
+def _cfg(file_data: dict, key: str, env_var: str, default=None):
+    """Resolve a config value: config file wins, then env var, then default."""
+    if key in file_data:
+        return file_data[key]
+    return os.environ.get(env_var, default)
+
+
+def _parse_comma_set(value) -> set:
+    """Parse a comma-separated string (or list) into a lowercase set."""
+    if isinstance(value, list):
+        return {v.strip().lower() for v in value if v.strip()}
+    if isinstance(value, str) and value.strip():
+        return {v.strip().lower() for v in value.split(',') if v.strip()}
+    return set()
+
+
+def _parse_extra_headers(value) -> dict:
+    """Parse webhook extra headers from a dict or JSON string."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
             logger.error("WEBHOOK_EXTRA_HEADERS must be a JSON object, ignoring")
-            WEBHOOK_EXTRA_HEADERS = {}
-        else:
-            logger.info(f"Webhook extra headers configured: {list(WEBHOOK_EXTRA_HEADERS.keys())}")
-except (json.JSONDecodeError, ValueError) as e:
-    logger.error(f"Invalid WEBHOOK_EXTRA_HEADERS JSON: {e}")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Invalid WEBHOOK_EXTRA_HEADERS JSON: {e}")
+    return {}
 
-# Storage configuration for large email uploads
-# Supports S3-compatible storage (AWS S3, R2, MinIO, Supabase Storage, etc.)
-STORAGE_URL = os.environ.get('STORAGE_URL')        # e.g. https://s3.amazonaws.com/my-bucket
-STORAGE_KEY = os.environ.get('STORAGE_KEY')          # Auth key/token
-STORAGE_AUTH_STYLE = os.environ.get('STORAGE_AUTH_STYLE', 's3')  # "s3" or "supabase"
 
-# Domain for generated message-IDs (falls back to MYDOMAIN or "primitivemail")
-MESSAGE_ID_DOMAIN = os.environ.get('MYDOMAIN', 'primitivemail')
-
-# Standalone mode: if no webhook URL configured, accept all valid emails
-STANDALONE_MODE = not WEBHOOK_URL
-
-# Mail storage directory for standalone mode
-MAIL_DIR = os.environ.get('MAIL_DIR', '/mail/incoming')
-
-if STANDALONE_MODE:
-    logger.info("No WEBHOOK_URL configured - running in standalone mode (accept all valid emails)")
-else:
-    if not WEBHOOK_SECRET:
-        logger.error("WEBHOOK_SECRET must be set when WEBHOOK_URL is configured")
-        sys.exit(1)
-
-# Storage upload (optional - only needed for large emails when webhook is configured)
-if not STANDALONE_MODE and not STORAGE_URL:
-    logger.info("STORAGE_URL not set - large emails (>3MB) will be sent inline via webhook")
-
-# Size threshold for storage-first upload (bytes)
-STORAGE_UPLOAD_THRESHOLD = 3_000_000
-
-# --- Sender filtering ---
-# Envelope-level allowlist. Not authentication -- sender can be forged.
-# For real verification, use SPOOF_PROTECTION.
-_sender_domains = os.environ.get('ALLOWED_SENDER_DOMAINS', '')
-ALLOWED_SENDER_DOMAINS = {d.strip().lower() for d in _sender_domains.split(',') if d.strip()} if _sender_domains.strip() else set()
-
-_senders = os.environ.get('ALLOWED_SENDERS', '')
-ALLOWED_SENDERS = {s.strip().lower() for s in _senders.split(',') if s.strip()} if _senders.strip() else set()
-
-ALLOW_BOUNCES = os.environ.get('ALLOW_BOUNCES', 'true').lower() == 'true'
-
-SENDER_FILTERING_ENABLED = bool(ALLOWED_SENDER_DOMAINS or ALLOWED_SENDERS)
-
-# --- Recipient filtering ---
-_recipients = os.environ.get('ALLOWED_RECIPIENTS', '')
-ALLOWED_RECIPIENTS = {r.strip().lower() for r in _recipients.split(',') if r.strip()} if _recipients.strip() else set()
-
-RECIPIENT_FILTERING_ENABLED = bool(ALLOWED_RECIPIENTS)
-
-# --- Spoof protection (SPF/DKIM/DMARC) ---
-SPOOF_PROTECTION = os.environ.get('SPOOF_PROTECTION', 'off').lower()
-if SPOOF_PROTECTION not in ('off', 'monitor', 'standard', 'strict'):
-    logger.warning(f"Invalid SPOOF_PROTECTION value '{SPOOF_PROTECTION}' - defaulting to 'off'")
-    SPOOF_PROTECTION = 'off'
-
-if SPOOF_PROTECTION != 'off':
-    missing = []
-    if not SPF_AVAILABLE:
-        missing.append('pyspf')
-    if not DKIM_AVAILABLE:
-        missing.append('dkimpy')
-    if not DNS_AVAILABLE:
-        missing.append('dnspython')
-    if missing:
-        logger.warning(f"SPOOF_PROTECTION={SPOOF_PROTECTION} but missing packages: {', '.join(missing)} - falling back to 'off'")
-        SPOOF_PROTECTION = 'off'
-    else:
-        # DKIM verification uses headers reconstructed from milter callbacks,
-        # which may differ from the original wire format. Most DKIM signers use
-        # "relaxed" canonicalization which tolerates these differences, but some
-        # signatures with "simple" canonicalization may fail verification.
-        # Recommend "monitor" mode initially to observe results before enforcing.
-        if SPOOF_PROTECTION in ('standard', 'strict'):
+def _validate_spoof_protection(value: str) -> str:
+    """Validate and return a spoof protection level, with dependency checks."""
+    value = value.lower() if value else 'off'
+    if value not in ('off', 'monitor', 'standard', 'strict'):
+        logger.warning(f"Invalid SPOOF_PROTECTION value '{value}' - defaulting to 'off'")
+        return 'off'
+    if value != 'off':
+        missing = []
+        if not SPF_AVAILABLE:
+            missing.append('pyspf')
+        if not DKIM_AVAILABLE:
+            missing.append('dkimpy')
+        if not DNS_AVAILABLE:
+            missing.append('dnspython')
+        if missing:
+            logger.warning(f"SPOOF_PROTECTION={value} but missing packages: {', '.join(missing)} - falling back to 'off'")
+            return 'off'
+        if value in ('standard', 'strict'):
             logger.info("Note: DKIM verification uses reconstructed headers. "
                         "Consider 'monitor' mode first to verify accuracy.")
+    return value
+
+
+def _apply_config(file_data: dict, reloadable_only: bool = False):
+    """Apply configuration from file data + env var fallbacks.
+
+    When reloadable_only=True (SIGHUP), only RELOADABLE_KEYS are updated.
+    When reloadable_only=False (startup), everything is set.
+    """
+    global WEBHOOK_URL, WEBHOOK_SECRET, WEBHOOK_EXTRA_HEADERS
+    global STORAGE_URL, STORAGE_KEY, STORAGE_AUTH_STYLE
+    global MESSAGE_ID_DOMAIN, STANDALONE_MODE, MAIL_DIR
+    global ALLOWED_SENDER_DOMAINS, ALLOWED_SENDERS, ALLOW_BOUNCES
+    global SENDER_FILTERING_ENABLED
+    global ALLOWED_RECIPIENTS, RECIPIENT_FILTERING_ENABLED
+    global SPOOF_PROTECTION
+    global SPAMHAUS_DNSBL_DOMAIN
+    global STORAGE_UPLOAD_THRESHOLD
+
+    # --- Reloadable values ---
+    new_webhook_url = _cfg(file_data, 'webhook_url', 'WEBHOOK_URL')
+    new_webhook_secret = _cfg(file_data, 'webhook_secret', 'WEBHOOK_SECRET')
+
+    if reloadable_only:
+        # Guard: don't allow reload to flip between standalone and webhook mode.
+        # That's a fundamental mode change that requires a restart.
+        was_webhook = not STANDALONE_MODE
+        would_be_webhook = bool(new_webhook_url)
+        if was_webhook != would_be_webhook:
+            logger.error(f"Config reload rejected: cannot switch modes via SIGHUP "
+                         f"(current: {'webhook' if was_webhook else 'standalone'}, "
+                         f"new config would be: {'webhook' if would_be_webhook else 'standalone'}). "
+                         f"Restart the milter to change modes.")
+            return
+
+        # Guard: webhook mode requires a secret
+        if would_be_webhook and not new_webhook_secret:
+            logger.error("Config reload rejected: webhook_url is set but webhook_secret is missing")
+            return
+
+    WEBHOOK_URL = new_webhook_url
+    WEBHOOK_SECRET = new_webhook_secret
+    WEBHOOK_EXTRA_HEADERS = _parse_extra_headers(
+        _cfg(file_data, 'webhook_extra_headers', 'WEBHOOK_EXTRA_HEADERS', ''))
+    if WEBHOOK_EXTRA_HEADERS:
+        logger.info(f"Webhook extra headers configured: {list(WEBHOOK_EXTRA_HEADERS.keys())}")
+
+    STORAGE_URL = _cfg(file_data, 'storage_url', 'STORAGE_URL')
+    STORAGE_KEY = _cfg(file_data, 'storage_key', 'STORAGE_KEY')
+    STORAGE_AUTH_STYLE = _cfg(file_data, 'storage_auth_style', 'STORAGE_AUTH_STYLE', 's3')
+
+    _sender_domains = _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')
+    ALLOWED_SENDER_DOMAINS = _parse_comma_set(_sender_domains)
+    _senders = _cfg(file_data, 'allowed_senders', 'ALLOWED_SENDERS', '')
+    ALLOWED_SENDERS = _parse_comma_set(_senders)
+    ALLOW_BOUNCES = str(_cfg(file_data, 'allow_bounces', 'ALLOW_BOUNCES', 'true')).lower() == 'true'
+    SENDER_FILTERING_ENABLED = bool(ALLOWED_SENDER_DOMAINS or ALLOWED_SENDERS)
+
+    _recipients = _cfg(file_data, 'allowed_recipients', 'ALLOWED_RECIPIENTS', '')
+    ALLOWED_RECIPIENTS = _parse_comma_set(_recipients)
+    RECIPIENT_FILTERING_ENABLED = bool(ALLOWED_RECIPIENTS)
+
+    SPOOF_PROTECTION = _validate_spoof_protection(
+        _cfg(file_data, 'spoof_protection', 'SPOOF_PROTECTION', 'off'))
+
+    if reloadable_only:
+        return
+
+    # --- Non-reloadable values (startup only) ---
+    MESSAGE_ID_DOMAIN = _cfg(file_data, 'mydomain', 'MYDOMAIN', 'primitivemail')
+    MAIL_DIR = _cfg(file_data, 'mail_dir', 'MAIL_DIR', '/mail/incoming')
+    STORAGE_UPLOAD_THRESHOLD = int(_cfg(file_data, 'storage_upload_threshold',
+                                        'STORAGE_UPLOAD_THRESHOLD', '3000000'))
+
+    STANDALONE_MODE = not WEBHOOK_URL
+
+    # Spamhaus DNSBL
+    SPAMHAUS_DNSBL_DOMAIN = str(_cfg(file_data, 'spamhaus_dnsbl_domain',
+                                      'SPAMHAUS_DNSBL_DOMAIN', '')).strip().lower().rstrip('.')
+    if SPAMHAUS_DNSBL_DOMAIN and not DNS_AVAILABLE:
+        logger.warning("SPAMHAUS_DNSBL_DOMAIN is set but dnspython is unavailable - DNSBL disabled")
+        SPAMHAUS_DNSBL_DOMAIN = ''
+
+
+def _log_config_summary():
+    """Log the current configuration state."""
+    if STANDALONE_MODE:
+        logger.info("No WEBHOOK_URL configured - running in standalone mode (accept all valid emails)")
+    else:
+        if not WEBHOOK_SECRET:
+            logger.error("WEBHOOK_SECRET must be set when WEBHOOK_URL is configured")
+            sys.exit(1)
+    if not STANDALONE_MODE and not STORAGE_URL:
+        logger.info("STORAGE_URL not set - large emails (>3MB) will be sent inline via webhook")
+    if SENDER_FILTERING_ENABLED:
+        logger.info(f"Sender filtering enabled: {len(ALLOWED_SENDER_DOMAINS)} domains, {len(ALLOWED_SENDERS)} addresses")
+    if RECIPIENT_FILTERING_ENABLED:
+        logger.info(f"Recipient filtering enabled: {len(ALLOWED_RECIPIENTS)} addresses")
+    if SPOOF_PROTECTION != 'off':
+        logger.info(f"Spoof protection: {SPOOF_PROTECTION}")
+    if SPAMHAUS_DNSBL_DOMAIN:
+        logger.info(f"Spamhaus DNSBL enabled: {SPAMHAUS_DNSBL_DOMAIN} (enforcing {SPAMHAUS_DROP_CODE})")
+
+
+def reload_config(signum=None, frame=None):
+    """Reload hot-reloadable config values from the config file.
+
+    Called on SIGHUP. Re-reads the config file and updates only the
+    reloadable globals. Non-reloadable values (mydomain, mail_dir, etc.)
+    are left unchanged.
+    """
+    logger.info("SIGHUP received - reloading configuration")
+    file_data = _read_config_file(CONFIG_FILE_PATH)
+    _apply_config(file_data, reloadable_only=True)
+    logger.info(f"Config reloaded (webhook_url={WEBHOOK_URL}, "
+                f"sender_filter={SENDER_FILTERING_ENABLED}, "
+                f"recipient_filter={RECIPIENT_FILTERING_ENABLED}, "
+                f"spoof_protection={SPOOF_PROTECTION})")
+
+
+# --- Initial config load ---
+_initial_file_data = _read_config_file(CONFIG_FILE_PATH)
+if _initial_file_data:
+    logger.info(f"Config file loaded: {CONFIG_FILE_PATH}")
+_apply_config(_initial_file_data, reloadable_only=False)
+_log_config_summary()
 
 # DNS resolver timeout for SPF/DKIM/DMARC lookups
 DNS_TIMEOUT = 3
 
-# Spamhaus DNSBL (optional).
-# Set SPAMHAUS_DNSBL_DOMAIN to the full query suffix, for example:
-# - zen.spamhaus.org
-# - <your_DQS_key>.zen.dq.spamhaus.net
-# We only enforce the DROP return code (127.0.0.9) for now so the behavior
-# matches the existing DROP-only cron policy.
-SPAMHAUS_DNSBL_DOMAIN = os.environ.get('SPAMHAUS_DNSBL_DOMAIN', '').strip().lower().rstrip('.')
 SPAMHAUS_DROP_CODE = '127.0.0.9'
-
-if SPAMHAUS_DNSBL_DOMAIN and not DNS_AVAILABLE:
-    logger.warning("SPAMHAUS_DNSBL_DOMAIN is set but dnspython is unavailable - DNSBL disabled")
-    SPAMHAUS_DNSBL_DOMAIN = ''
-
-if SENDER_FILTERING_ENABLED:
-    logger.info(f"Sender filtering enabled: {len(ALLOWED_SENDER_DOMAINS)} domains, {len(ALLOWED_SENDERS)} addresses")
-if RECIPIENT_FILTERING_ENABLED:
-    logger.info(f"Recipient filtering enabled: {len(ALLOWED_RECIPIENTS)} addresses")
-if SPOOF_PROTECTION != 'off':
-    logger.info(f"Spoof protection: {SPOOF_PROTECTION}")
-if SPAMHAUS_DNSBL_DOMAIN:
-    logger.info(f"Spamhaus DNSBL enabled: {SPAMHAUS_DNSBL_DOMAIN} (enforcing {SPAMHAUS_DROP_CODE})")
 
 validator = EmailValidator()
 
@@ -1403,6 +1511,9 @@ def main():
     """Start the milter"""
     global METRICS_ENABLED
 
+    # Register SIGHUP handler for config reload
+    signal.signal(signal.SIGHUP, reload_config)
+
     # Socket configuration
     # Use TCP socket for easier Docker networking
     socket_spec = "inet:9900@0.0.0.0"
@@ -1420,6 +1531,10 @@ def main():
     logger.info("PrimitiveMail Milter starting")
     logger.info(f"  Mode: {'standalone' if STANDALONE_MODE else 'webhook'}")
     logger.info(f"  Socket: {socket_spec}")
+    if _initial_file_data:
+        logger.info(f"  Config file: {CONFIG_FILE_PATH}")
+    else:
+        logger.info(f"  Config: environment variables (no config file)")
     if STANDALONE_MODE:
         logger.info(f"  Mail dir: {MAIL_DIR}")
     else:
@@ -1432,6 +1547,7 @@ def main():
     logger.info(f"  Spoof protection: {SPOOF_PROTECTION}")
     logger.info(f"  Spamhaus DNSBL: {SPAMHAUS_DNSBL_DOMAIN or 'disabled'}")
     logger.info(f"  Metrics: {'enabled' if METRICS_ENABLED else 'disabled'}")
+    logger.info(f"  SIGHUP reload: enabled")
     logger.info("=" * 60)
 
     # Set timeout (must be longer than webhook timeout)
