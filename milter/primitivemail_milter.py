@@ -225,15 +225,52 @@ except Exception as e:
 
 CONFIG_FILE_PATH = os.environ.get('CONFIG_FILE', '/etc/primitive/milter.json')
 
-# Keys that are safe to update at runtime via SIGHUP.  Identity/path values
-# (mydomain, mail_dir, etc.) are NOT reloadable because Postfix and the
-# filesystem depend on them being stable for the life of the process.
-RELOADABLE_KEYS = frozenset({
-    'webhook_url', 'webhook_secret', 'webhook_extra_headers',
-    'storage_url', 'storage_key', 'storage_auth_style',
-    'allowed_sender_domains', 'allowed_senders', 'allowed_recipients',
-    'allow_bounces', 'spoof_protection',
-})
+
+class ReloadableConfig:
+    """Holds all config values that can be hot-reloaded via SIGHUP.
+
+    Bundled into a single object so that swapping the module-level reference
+    (_rcfg) is one atomic pointer assignment under the GIL.  Handler threads
+    snapshot this reference once per message (self._cfg = _rcfg) and use it
+    for the duration of the request, guaranteeing they never see a
+    partially-applied config.
+
+    Non-reloadable values (mydomain, mail_dir, standalone_mode, etc.) are
+    set once at startup as plain module-level globals and are NOT included
+    here — they are safe because they never change.
+    """
+
+    def __init__(self, *, webhook_url=None, webhook_secret=None,
+                 webhook_extra_headers=None, storage_url=None,
+                 storage_key=None, storage_auth_style='s3',
+                 allowed_sender_domains=None, allowed_senders=None,
+                 allow_bounces=True, allowed_recipients=None,
+                 spoof_protection='off'):
+        self.webhook_url = webhook_url
+        self.webhook_secret = webhook_secret
+        self.webhook_extra_headers = webhook_extra_headers or {}
+        self.storage_url = storage_url
+        self.storage_key = storage_key
+        self.storage_auth_style = storage_auth_style
+        self.allowed_sender_domains = allowed_sender_domains or set()
+        self.allowed_senders = allowed_senders or set()
+        self.allow_bounces = allow_bounces
+        self.allowed_recipients = allowed_recipients or set()
+        self.spoof_protection = spoof_protection
+
+    @property
+    def sender_filtering_enabled(self):
+        return bool(self.allowed_sender_domains or self.allowed_senders)
+
+    @property
+    def recipient_filtering_enabled(self):
+        return bool(self.allowed_recipients)
+
+
+# The live config object.  Handler threads snapshot this at the start of
+# each message (self._cfg = _rcfg) to get a consistent view.  The reload
+# path builds a new ReloadableConfig and swaps this reference atomically.
+_rcfg = ReloadableConfig()
 
 
 def _read_config_file(path: str) -> dict:
@@ -307,31 +344,55 @@ def _validate_spoof_protection(value: str) -> str:
     return value
 
 
+def _build_reloadable_config(file_data: dict) -> ReloadableConfig:
+    """Build a ReloadableConfig from file data + env var fallbacks."""
+    extra = _parse_extra_headers(
+        _cfg(file_data, 'webhook_extra_headers', 'WEBHOOK_EXTRA_HEADERS', ''))
+    if extra:
+        logger.info(f"Webhook extra headers configured: {list(extra.keys())}")
+
+    return ReloadableConfig(
+        webhook_url=_cfg(file_data, 'webhook_url', 'WEBHOOK_URL'),
+        webhook_secret=_cfg(file_data, 'webhook_secret', 'WEBHOOK_SECRET'),
+        webhook_extra_headers=extra,
+        storage_url=_cfg(file_data, 'storage_url', 'STORAGE_URL'),
+        storage_key=_cfg(file_data, 'storage_key', 'STORAGE_KEY'),
+        storage_auth_style=_cfg(file_data, 'storage_auth_style', 'STORAGE_AUTH_STYLE', 's3'),
+        allowed_sender_domains=_parse_comma_set(
+            _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')),
+        allowed_senders=_parse_comma_set(
+            _cfg(file_data, 'allowed_senders', 'ALLOWED_SENDERS', '')),
+        allow_bounces=str(_cfg(file_data, 'allow_bounces', 'ALLOW_BOUNCES', 'true')).lower() == 'true',
+        allowed_recipients=_parse_comma_set(
+            _cfg(file_data, 'allowed_recipients', 'ALLOWED_RECIPIENTS', '')),
+        spoof_protection=_validate_spoof_protection(
+            _cfg(file_data, 'spoof_protection', 'SPOOF_PROTECTION', 'off')),
+    )
+
+
 def _apply_config(file_data: dict, reloadable_only: bool = False):
     """Apply configuration from file data + env var fallbacks.
 
-    When reloadable_only=True (SIGHUP), only RELOADABLE_KEYS are updated.
-    When reloadable_only=False (startup), everything is set.
+    Reloadable values are bundled into a ReloadableConfig object and swapped
+    atomically (single reference assignment, GIL-atomic).  Handler threads
+    snapshot the reference at the start of each message so they always see a
+    consistent config.
+
+    When reloadable_only=True (SIGHUP), only the ReloadableConfig is swapped.
+    When reloadable_only=False (startup), non-reloadable module globals are
+    also set.
     """
-    global WEBHOOK_URL, WEBHOOK_SECRET, WEBHOOK_EXTRA_HEADERS
-    global STORAGE_URL, STORAGE_KEY, STORAGE_AUTH_STYLE
+    global _rcfg
     global MESSAGE_ID_DOMAIN, STANDALONE_MODE, MAIL_DIR
-    global ALLOWED_SENDER_DOMAINS, ALLOWED_SENDERS, ALLOW_BOUNCES
-    global SENDER_FILTERING_ENABLED
-    global ALLOWED_RECIPIENTS, RECIPIENT_FILTERING_ENABLED
-    global SPOOF_PROTECTION
     global SPAMHAUS_DNSBL_DOMAIN
     global STORAGE_UPLOAD_THRESHOLD
 
-    # --- Reloadable values ---
-    new_webhook_url = _cfg(file_data, 'webhook_url', 'WEBHOOK_URL')
-    new_webhook_secret = _cfg(file_data, 'webhook_secret', 'WEBHOOK_SECRET')
+    new_cfg = _build_reloadable_config(file_data)
 
     if reloadable_only:
         # Guard: don't allow reload to flip between standalone and webhook mode.
-        # That's a fundamental mode change that requires a restart.
         was_webhook = not STANDALONE_MODE
-        would_be_webhook = bool(new_webhook_url)
+        would_be_webhook = bool(new_cfg.webhook_url)
         if was_webhook != would_be_webhook:
             logger.error(f"Config reload rejected: cannot switch modes via SIGHUP "
                          f"(current: {'webhook' if was_webhook else 'standalone'}, "
@@ -340,34 +401,14 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
             return
 
         # Guard: webhook mode requires a secret
-        if would_be_webhook and not new_webhook_secret:
+        if would_be_webhook and not new_cfg.webhook_secret:
             logger.error("Config reload rejected: webhook_url is set but webhook_secret is missing")
             return
 
-    WEBHOOK_URL = new_webhook_url
-    WEBHOOK_SECRET = new_webhook_secret
-    WEBHOOK_EXTRA_HEADERS = _parse_extra_headers(
-        _cfg(file_data, 'webhook_extra_headers', 'WEBHOOK_EXTRA_HEADERS', ''))
-    if WEBHOOK_EXTRA_HEADERS:
-        logger.info(f"Webhook extra headers configured: {list(WEBHOOK_EXTRA_HEADERS.keys())}")
-
-    STORAGE_URL = _cfg(file_data, 'storage_url', 'STORAGE_URL')
-    STORAGE_KEY = _cfg(file_data, 'storage_key', 'STORAGE_KEY')
-    STORAGE_AUTH_STYLE = _cfg(file_data, 'storage_auth_style', 'STORAGE_AUTH_STYLE', 's3')
-
-    _sender_domains = _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')
-    ALLOWED_SENDER_DOMAINS = _parse_comma_set(_sender_domains)
-    _senders = _cfg(file_data, 'allowed_senders', 'ALLOWED_SENDERS', '')
-    ALLOWED_SENDERS = _parse_comma_set(_senders)
-    ALLOW_BOUNCES = str(_cfg(file_data, 'allow_bounces', 'ALLOW_BOUNCES', 'true')).lower() == 'true'
-    SENDER_FILTERING_ENABLED = bool(ALLOWED_SENDER_DOMAINS or ALLOWED_SENDERS)
-
-    _recipients = _cfg(file_data, 'allowed_recipients', 'ALLOWED_RECIPIENTS', '')
-    ALLOWED_RECIPIENTS = _parse_comma_set(_recipients)
-    RECIPIENT_FILTERING_ENABLED = bool(ALLOWED_RECIPIENTS)
-
-    SPOOF_PROTECTION = _validate_spoof_protection(
-        _cfg(file_data, 'spoof_protection', 'SPOOF_PROTECTION', 'off'))
+    # Atomic swap — one pointer assignment, GIL-atomic.  Handler threads
+    # that already hold a reference to the old _rcfg continue using it
+    # for the current message; new messages will pick up this new object.
+    _rcfg = new_cfg
 
     if reloadable_only:
         return
@@ -378,7 +419,7 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     STORAGE_UPLOAD_THRESHOLD = int(_cfg(file_data, 'storage_upload_threshold',
                                         'STORAGE_UPLOAD_THRESHOLD', '3000000'))
 
-    STANDALONE_MODE = not WEBHOOK_URL
+    STANDALONE_MODE = not _rcfg.webhook_url
 
     # Spamhaus DNSBL
     SPAMHAUS_DNSBL_DOMAIN = str(_cfg(file_data, 'spamhaus_dnsbl_domain',
@@ -390,20 +431,21 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
 
 def _log_config_summary():
     """Log the current configuration state."""
+    cfg = _rcfg
     if STANDALONE_MODE:
         logger.info("No WEBHOOK_URL configured - running in standalone mode (accept all valid emails)")
     else:
-        if not WEBHOOK_SECRET:
+        if not cfg.webhook_secret:
             logger.error("WEBHOOK_SECRET must be set when WEBHOOK_URL is configured")
             sys.exit(1)
-    if not STANDALONE_MODE and not STORAGE_URL:
+    if not STANDALONE_MODE and not cfg.storage_url:
         logger.info("STORAGE_URL not set - large emails (>3MB) will be sent inline via webhook")
-    if SENDER_FILTERING_ENABLED:
-        logger.info(f"Sender filtering enabled: {len(ALLOWED_SENDER_DOMAINS)} domains, {len(ALLOWED_SENDERS)} addresses")
-    if RECIPIENT_FILTERING_ENABLED:
-        logger.info(f"Recipient filtering enabled: {len(ALLOWED_RECIPIENTS)} addresses")
-    if SPOOF_PROTECTION != 'off':
-        logger.info(f"Spoof protection: {SPOOF_PROTECTION}")
+    if cfg.sender_filtering_enabled:
+        logger.info(f"Sender filtering enabled: {len(cfg.allowed_sender_domains)} domains, {len(cfg.allowed_senders)} addresses")
+    if cfg.recipient_filtering_enabled:
+        logger.info(f"Recipient filtering enabled: {len(cfg.allowed_recipients)} addresses")
+    if cfg.spoof_protection != 'off':
+        logger.info(f"Spoof protection: {cfg.spoof_protection}")
     if SPAMHAUS_DNSBL_DOMAIN:
         logger.info(f"Spamhaus DNSBL enabled: {SPAMHAUS_DNSBL_DOMAIN} (enforcing {SPAMHAUS_DROP_CODE})")
 
@@ -411,17 +453,26 @@ def _log_config_summary():
 def reload_config(signum=None, frame=None):
     """Reload hot-reloadable config values from the config file.
 
-    Called on SIGHUP. Re-reads the config file and updates only the
-    reloadable globals. Non-reloadable values (mydomain, mail_dir, etc.)
-    are left unchanged.
+    Called on SIGHUP. Re-reads the config file and builds a new
+    ReloadableConfig, then swaps it atomically.  Non-reloadable values
+    (mydomain, mail_dir, etc.) are left unchanged.
+
+    If the config file was present at startup but is now missing or
+    unreadable, the reload is aborted to prevent accidentally clearing
+    file-only settings.
     """
     logger.info("SIGHUP received - reloading configuration")
     file_data = _read_config_file(CONFIG_FILE_PATH)
+    if not file_data and _initial_file_data:
+        logger.warning("Config file is missing or unreadable; "
+                       "aborting reload to preserve current state")
+        return
     _apply_config(file_data, reloadable_only=True)
-    logger.info(f"Config reloaded (webhook_url={WEBHOOK_URL}, "
-                f"sender_filter={SENDER_FILTERING_ENABLED}, "
-                f"recipient_filter={RECIPIENT_FILTERING_ENABLED}, "
-                f"spoof_protection={SPOOF_PROTECTION})")
+    cfg = _rcfg
+    logger.info(f"Config reloaded (webhook_url={cfg.webhook_url}, "
+                f"sender_filter={cfg.sender_filtering_enabled}, "
+                f"recipient_filter={cfg.recipient_filtering_enabled}, "
+                f"spoof_protection={cfg.spoof_protection})")
 
 
 # --- Initial config load ---
@@ -430,6 +481,22 @@ if _initial_file_data:
     logger.info(f"Config file loaded: {CONFIG_FILE_PATH}")
 _apply_config(_initial_file_data, reloadable_only=False)
 _log_config_summary()
+
+# Module-level aliases for backward compatibility with tests and logging.
+# Handler code must NOT read these — use self._cfg (snapshot of _rcfg) instead.
+WEBHOOK_URL = _rcfg.webhook_url
+WEBHOOK_SECRET = _rcfg.webhook_secret
+WEBHOOK_EXTRA_HEADERS = _rcfg.webhook_extra_headers
+STORAGE_URL = _rcfg.storage_url
+STORAGE_KEY = _rcfg.storage_key
+STORAGE_AUTH_STYLE = _rcfg.storage_auth_style
+ALLOWED_SENDER_DOMAINS = _rcfg.allowed_sender_domains
+ALLOWED_SENDERS = _rcfg.allowed_senders
+ALLOW_BOUNCES = _rcfg.allow_bounces
+SENDER_FILTERING_ENABLED = _rcfg.sender_filtering_enabled
+ALLOWED_RECIPIENTS = _rcfg.allowed_recipients
+RECIPIENT_FILTERING_ENABLED = _rcfg.recipient_filtering_enabled
+SPOOF_PROTECTION = _rcfg.spoof_protection
 
 # DNS resolver timeout for SPF/DKIM/DMARC lookups
 DNS_TIMEOUT = 3
@@ -494,6 +561,10 @@ class PrimitiveMailMilter(Milter.Base):
 
     def reset(self):
         """Reset state for new message"""
+        # Snapshot the reloadable config for this message.  All handler
+        # methods use self._cfg so they see a consistent config even if a
+        # SIGHUP-triggered reload swaps _rcfg mid-message.
+        self._cfg = _rcfg
         self.sender = None
         self.recipients = []
         self.headers = []
@@ -619,23 +690,24 @@ class PrimitiveMailMilter(Milter.Base):
             return Milter.REJECT
 
         # --- Sender filtering ---
-        if SENDER_FILTERING_ENABLED:
+        cfg = self._cfg
+        if cfg.sender_filtering_enabled:
             if not self.sender:
                 # Bounce message (empty MAIL FROM)
-                if not ALLOW_BOUNCES:
+                if not cfg.allow_bounces:
                     self.log("Bounce rejected (ALLOW_BOUNCES=false)")
                     self.setreply("550", "5.7.1", "Bounces not accepted")
                     return Milter.REJECT
             else:
                 sender_lower = self.sender.lower()
                 sender_domain = sender_lower.split('@')[1] if '@' in sender_lower else ''
-                if sender_lower not in ALLOWED_SENDERS and sender_domain not in ALLOWED_SENDER_DOMAINS:
+                if sender_lower not in cfg.allowed_senders and sender_domain not in cfg.allowed_sender_domains:
                     self.log(f"Sender not authorized: {self.sender}")
                     self.setreply("550", "5.7.0", "Message rejected")
                     return Milter.REJECT
 
         # --- SPF check (earliest possible -- we have client_ip, sender, helo) ---
-        if SPOOF_PROTECTION != 'off' and self.sender and SPF_AVAILABLE:
+        if cfg.spoof_protection != 'off' and self.sender and SPF_AVAILABLE:
             try:
                 result, explanation = spfmod.check2(
                     i=self.client_ip,
@@ -646,7 +718,7 @@ class PrimitiveMailMilter(Milter.Base):
                 self.spf_result = result
                 self.log(f"SPF check: {result} ({explanation})")
 
-                if SPOOF_PROTECTION == 'strict' and result in ('fail', 'softfail'):
+                if cfg.spoof_protection == 'strict' and result in ('fail', 'softfail'):
                     self.setreply("550", "5.7.23", f"SPF validation failed: {explanation}")
                     return Milter.REJECT
             except Exception as e:
@@ -668,7 +740,7 @@ class PrimitiveMailMilter(Milter.Base):
         self.log(f"RCPT TO: {rcpt!r}")
         if rcpt:
             # --- Recipient filtering ---
-            if RECIPIENT_FILTERING_ENABLED and rcpt.lower() not in ALLOWED_RECIPIENTS:
+            if self._cfg.recipient_filtering_enabled and rcpt.lower() not in self._cfg.allowed_recipients:
                 self.log(f"Recipient not allowed: {rcpt}")
                 self.setreply("550", "5.1.1", "Recipient not accepted")
                 return Milter.REJECT
@@ -1035,7 +1107,8 @@ class PrimitiveMailMilter(Milter.Base):
                 self._trace_span.set_tag("email.message_id", self.message_id)
 
         # --- DKIM + DMARC checks (need full message) ---
-        if SPOOF_PROTECTION != 'off':
+        cfg = self._cfg
+        if cfg.spoof_protection != 'off':
             dkim_result, dkim_domains = self._check_dkim(raw_email_bytes)
             self.log(f"DKIM check: {dkim_result} (domains: {dkim_domains})")
 
@@ -1061,7 +1134,7 @@ class PrimitiveMailMilter(Milter.Base):
                            f"{dmarc_result['policy']}; pass={'true' if dmarc_result['pass'] else 'false'}")
 
             # Enforcement
-            if SPOOF_PROTECTION == 'standard':
+            if cfg.spoof_protection == 'standard':
                 if dmarc_result['policy'] == 'reject' and not dmarc_result['pass']:
                     self.setreply("550", "5.7.1", f"Failed DMARC policy for {from_domain}")
                     self._result_label = 'reject_permanent'
@@ -1073,7 +1146,7 @@ class PrimitiveMailMilter(Milter.Base):
                     self.addheader("X-PrimitiveMail-Auth-Warning",
                                    f"DMARC quarantine policy for {from_domain}")
 
-            elif SPOOF_PROTECTION == 'strict':
+            elif cfg.spoof_protection == 'strict':
                 # SPF already checked in envfrom(), DKIM is new here
                 if dkim_result == 'fail':
                     self.setreply("550", "5.7.20", "DKIM validation failed")
@@ -1095,7 +1168,7 @@ class PrimitiveMailMilter(Milter.Base):
             try:
                 # Pass auth data if spoof protection ran (local vars from above)
                 save_kwargs = {}
-                if SPOOF_PROTECTION != 'off':
+                if cfg.spoof_protection != 'off':
                     save_kwargs = {
                         'dkim_result': dkim_result,
                         'dkim_domains': dkim_domains,
@@ -1120,7 +1193,7 @@ class PrimitiveMailMilter(Milter.Base):
 
         # Webhook mode: upload large emails to storage ONCE (same bytes for all recipients)
         storage_result = None
-        if size > STORAGE_UPLOAD_THRESHOLD and STORAGE_URL:
+        if size > STORAGE_UPLOAD_THRESHOLD and cfg.storage_url:
             storage_result = self.upload_to_storage(raw_email_bytes)
             if not storage_result['success']:
                 self.log_error(f"Storage upload failed: {storage_result.get('error', 'unknown')}")
@@ -1139,7 +1212,7 @@ class PrimitiveMailMilter(Milter.Base):
         if len(valid_recipients) > 5:
             self.log(f"Warning: {len(valid_recipients)} recipients - webhook calls will be sequential")
 
-        use_inline = size > STORAGE_UPLOAD_THRESHOLD and not STORAGE_URL
+        use_inline = size > STORAGE_UPLOAD_THRESHOLD and not cfg.storage_url
         if use_inline:
             self.log(f"Large email ({size} bytes) but no STORAGE_URL - sending inline")
 
@@ -1256,20 +1329,21 @@ class PrimitiveMailMilter(Milter.Base):
         - "supabase": Bearer token + apikey header (Supabase Storage)
         - "s3": Bearer token only (generic S3-compatible)
         """
+        cfg = self._cfg
         upload_id = str(uuid.uuid4())
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
         storage_key = f"incoming/{upload_id}.eml"
-        url = f"{STORAGE_URL.rstrip('/')}/{storage_key}"
+        url = f"{cfg.storage_url.rstrip('/')}/{storage_key}"
 
         # Build auth headers based on storage backend
         headers = {
             'Content-Type': 'message/rfc822',
         }
-        if STORAGE_AUTH_STYLE == 'supabase':
-            headers['Authorization'] = f'Bearer {STORAGE_KEY}'
-            headers['apikey'] = STORAGE_KEY
+        if cfg.storage_auth_style == 'supabase':
+            headers['Authorization'] = f'Bearer {cfg.storage_key}'
+            headers['apikey'] = cfg.storage_key
         else:
-            headers['Authorization'] = f'Bearer {STORAGE_KEY}'
+            headers['Authorization'] = f'Bearer {cfg.storage_key}'
 
         storage_span = None
         if TRACING_ENABLED:
@@ -1337,7 +1411,8 @@ class PrimitiveMailMilter(Milter.Base):
                                      raw_bytes: Optional[bytes], size: int,
                                      storage_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Call the ingestion webhook for a single recipient"""
-        self.log(f"Posting to webhook: {WEBHOOK_URL}")
+        cfg = self._cfg
+        self.log(f"Posting to webhook: {cfg.webhook_url}")
 
         # Child trace span for webhook call
         webhook_span = None
@@ -1345,7 +1420,7 @@ class PrimitiveMailMilter(Milter.Base):
             webhook_span = tracer.trace(
                 "milter.webhook_call",
                 service="milter",
-                resource=WEBHOOK_URL,
+                resource=cfg.webhook_url,
             )
             webhook_span.set_tag("email.recipient", recipient)
             webhook_span.set_tag("email.domain", domain)
@@ -1379,15 +1454,15 @@ class PrimitiveMailMilter(Milter.Base):
 
         try:
             webhook_headers = {
-                'Authorization': f'Bearer {WEBHOOK_SECRET}',
+                'Authorization': f'Bearer {cfg.webhook_secret}',
                 'Content-Type': 'application/json',
-                **WEBHOOK_EXTRA_HEADERS,
+                **cfg.webhook_extra_headers,
             }
             if TRACING_ENABLED and webhook_span and HTTPPropagator:
                 HTTPPropagator.inject(webhook_span.context, webhook_headers)
 
             req = urllib.request.Request(
-                WEBHOOK_URL,
+                cfg.webhook_url,
                 data=json.dumps(payload).encode('utf-8'),
                 headers=webhook_headers,
                 method='POST'
@@ -1535,16 +1610,17 @@ def main():
         logger.info(f"  Config file: {CONFIG_FILE_PATH}")
     else:
         logger.info(f"  Config: environment variables (no config file)")
+    cfg = _rcfg
     if STANDALONE_MODE:
         logger.info(f"  Mail dir: {MAIL_DIR}")
     else:
-        logger.info(f"  Webhook: {WEBHOOK_URL}")
-        logger.info(f"  Storage: {STORAGE_URL or 'not configured (inline only)'}")
-    if SENDER_FILTERING_ENABLED:
-        logger.info(f"  Sender filter: {len(ALLOWED_SENDER_DOMAINS)} domains, {len(ALLOWED_SENDERS)} addresses")
-    if RECIPIENT_FILTERING_ENABLED:
-        logger.info(f"  Recipient filter: {len(ALLOWED_RECIPIENTS)} addresses")
-    logger.info(f"  Spoof protection: {SPOOF_PROTECTION}")
+        logger.info(f"  Webhook: {cfg.webhook_url}")
+        logger.info(f"  Storage: {cfg.storage_url or 'not configured (inline only)'}")
+    if cfg.sender_filtering_enabled:
+        logger.info(f"  Sender filter: {len(cfg.allowed_sender_domains)} domains, {len(cfg.allowed_senders)} addresses")
+    if cfg.recipient_filtering_enabled:
+        logger.info(f"  Recipient filter: {len(cfg.allowed_recipients)} addresses")
+    logger.info(f"  Spoof protection: {cfg.spoof_protection}")
     logger.info(f"  Spamhaus DNSBL: {SPAMHAUS_DNSBL_DOMAIN or 'disabled'}")
     logger.info(f"  Metrics: {'enabled' if METRICS_ENABLED else 'disabled'}")
     logger.info(f"  SIGHUP reload: enabled")
