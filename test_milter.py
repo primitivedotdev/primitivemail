@@ -76,12 +76,13 @@ def milter():
     """Create a milter instance with mocked internals"""
     # Ensure webhook mode
     original_standalone = pm.STANDALONE_MODE
-    original_webhook_url = pm.WEBHOOK_URL
-    original_webhook_secret = pm.WEBHOOK_SECRET
+    original_rcfg = pm._rcfg
     original_dnsbl_domain = pm.SPAMHAUS_DNSBL_DOMAIN
     pm.STANDALONE_MODE = False
-    pm.WEBHOOK_URL = 'https://test.example.com/webhook'
-    pm.WEBHOOK_SECRET = 'test-secret'
+    pm._rcfg = pm.ReloadableConfig(
+        webhook_url='https://test.example.com/webhook',
+        webhook_secret='test-secret',
+    )
     pm.SPAMHAUS_DNSBL_DOMAIN = ''
 
     m = pm.PrimitiveMailMilter()
@@ -95,8 +96,7 @@ def milter():
     yield m
 
     pm.STANDALONE_MODE = original_standalone
-    pm.WEBHOOK_URL = original_webhook_url
-    pm.WEBHOOK_SECRET = original_webhook_secret
+    pm._rcfg = original_rcfg
     pm.SPAMHAUS_DNSBL_DOMAIN = original_dnsbl_domain
 
 
@@ -104,8 +104,10 @@ def milter():
 def standalone_milter():
     """Create a milter in standalone mode"""
     original_standalone = pm.STANDALONE_MODE
+    original_rcfg = pm._rcfg
     original_dnsbl_domain = pm.SPAMHAUS_DNSBL_DOMAIN
     pm.STANDALONE_MODE = True
+    pm._rcfg = pm.ReloadableConfig()
     pm.SPAMHAUS_DNSBL_DOMAIN = ''
 
     m = pm.PrimitiveMailMilter()
@@ -120,6 +122,7 @@ def standalone_milter():
     yield m
 
     pm.STANDALONE_MODE = original_standalone
+    pm._rcfg = original_rcfg
     pm.SPAMHAUS_DNSBL_DOMAIN = original_dnsbl_domain
 
 
@@ -693,9 +696,9 @@ class TestStorageUpload:
     def test_storage_uploaded_once_for_multiple_recipients(self, milter):
         """Large email: upload once, reference same storage_key in all webhooks"""
         original_threshold = pm.STORAGE_UPLOAD_THRESHOLD
-        original_storage_url = pm.STORAGE_URL
+        original_storage_url = pm._rcfg.storage_url
         pm.STORAGE_UPLOAD_THRESHOLD = 10  # tiny threshold
-        pm.STORAGE_URL = 'https://storage.example.com/bucket'
+        pm._rcfg.storage_url = 'https://storage.example.com/bucket'
 
         milter.envfrom('<sender@example.com>')
         milter.envrcpt('<alice@a.com>')
@@ -718,7 +721,7 @@ class TestStorageUpload:
             result = milter.eom()
 
         pm.STORAGE_UPLOAD_THRESHOLD = original_threshold
-        pm.STORAGE_URL = original_storage_url
+        pm._rcfg.storage_url = original_storage_url
 
         assert result == mock_milter.ACCEPT
         assert len(upload_calls) == 1, "Storage upload should happen exactly once"
@@ -728,9 +731,9 @@ class TestStorageUpload:
 
     def test_storage_failure_tempfails_before_any_webhook(self, milter):
         original_threshold = pm.STORAGE_UPLOAD_THRESHOLD
-        original_storage_url = pm.STORAGE_URL
+        original_storage_url = pm._rcfg.storage_url
         pm.STORAGE_UPLOAD_THRESHOLD = 10
-        pm.STORAGE_URL = 'https://storage.example.com/bucket'
+        pm._rcfg.storage_url = 'https://storage.example.com/bucket'
 
         milter.envfrom('<sender@example.com>')
         milter.envrcpt('<alice@a.com>')
@@ -750,7 +753,7 @@ class TestStorageUpload:
             result = milter.eom()
 
         pm.STORAGE_UPLOAD_THRESHOLD = original_threshold
-        pm.STORAGE_URL = original_storage_url
+        pm._rcfg.storage_url = original_storage_url
 
         assert result == mock_milter.TEMPFAIL
         assert not webhook_called[0], "Webhook should not be called if storage upload fails"
@@ -791,63 +794,57 @@ class TestMessageIdGeneration:
 
 @pytest.fixture
 def sender_filter(milter):
-    """Enable sender filtering and restore after test"""
-    originals = {
-        'SENDER_FILTERING_ENABLED': pm.SENDER_FILTERING_ENABLED,
-        'ALLOWED_SENDER_DOMAINS': pm.ALLOWED_SENDER_DOMAINS,
-        'ALLOWED_SENDERS': pm.ALLOWED_SENDERS,
-        'ALLOW_BOUNCES': pm.ALLOW_BOUNCES,
-    }
-    pm.SENDER_FILTERING_ENABLED = True
-    pm.ALLOWED_SENDER_DOMAINS = set()
-    pm.ALLOWED_SENDERS = set()
-    pm.ALLOW_BOUNCES = True
+    """Enable sender filtering and restore after test."""
+    original_rcfg = pm._rcfg
+    pm._rcfg = pm.ReloadableConfig(
+        webhook_url=original_rcfg.webhook_url,
+        webhook_secret=original_rcfg.webhook_secret,
+        allow_bounces=True,
+    )
     yield milter
-    for k, v in originals.items():
-        setattr(pm, k, v)
+    pm._rcfg = original_rcfg
 
 
 class TestSenderFiltering:
 
     def test_sender_allowed_by_domain(self, sender_filter):
-        pm.ALLOWED_SENDER_DOMAINS = {'example.com'}
+        pm._rcfg.allowed_sender_domains = {'example.com'}
         result = sender_filter.envfrom('<user@example.com>')
         assert result == mock_milter.CONTINUE
 
     def test_sender_allowed_by_address(self, sender_filter):
-        pm.ALLOWED_SENDERS = {'specific@gmail.com'}
+        pm._rcfg.allowed_senders = {'specific@gmail.com'}
         result = sender_filter.envfrom('<specific@gmail.com>')
         assert result == mock_milter.CONTINUE
 
     def test_sender_rejected_when_not_in_list(self, sender_filter):
-        pm.ALLOWED_SENDER_DOMAINS = {'trusted.org'}
+        pm._rcfg.allowed_sender_domains = {'trusted.org'}
         result = sender_filter.envfrom('<hacker@evil.com>')
         assert result == mock_milter.REJECT
         sender_filter.setreply.assert_called_with("550", "5.7.0", "Message rejected")
 
     def test_bounce_allowed_by_default(self, sender_filter):
-        pm.ALLOWED_SENDER_DOMAINS = {'trusted.org'}
+        pm._rcfg.allowed_sender_domains = {'trusted.org'}
         result = sender_filter.envfrom('<>')
         assert result == mock_milter.CONTINUE
 
     def test_bounce_rejected_when_disabled(self, sender_filter):
-        pm.ALLOWED_SENDER_DOMAINS = {'trusted.org'}
-        pm.ALLOW_BOUNCES = False
+        pm._rcfg.allowed_sender_domains = {'trusted.org'}
+        pm._rcfg.allow_bounces = False
         result = sender_filter.envfrom('<>')
         assert result == mock_milter.REJECT
         sender_filter.setreply.assert_called_with("550", "5.7.1", "Bounces not accepted")
 
     def test_sender_filtering_case_insensitive(self, sender_filter):
-        pm.ALLOWED_SENDER_DOMAINS = {'example.com'}
+        pm._rcfg.allowed_sender_domains = {'example.com'}
         result = sender_filter.envfrom('<User@EXAMPLE.COM>')
         assert result == mock_milter.CONTINUE
 
     def test_no_filtering_when_disabled(self, milter):
-        original = pm.SENDER_FILTERING_ENABLED
-        pm.SENDER_FILTERING_ENABLED = False
+        # milter fixture has empty allowed_sender_domains/allowed_senders
+        # so sender_filtering_enabled property is False
         result = milter.envfrom('<anyone@anywhere.com>')
         assert result == mock_milter.CONTINUE
-        pm.SENDER_FILTERING_ENABLED = original
 
 
 # ===========================================================================
@@ -857,15 +854,14 @@ class TestSenderFiltering:
 @pytest.fixture
 def rcpt_filter(milter):
     """Enable recipient filtering and restore after test"""
-    originals = {
-        'RECIPIENT_FILTERING_ENABLED': pm.RECIPIENT_FILTERING_ENABLED,
-        'ALLOWED_RECIPIENTS': pm.ALLOWED_RECIPIENTS,
-    }
-    pm.RECIPIENT_FILTERING_ENABLED = True
-    pm.ALLOWED_RECIPIENTS = {'inbox@example.com'}
+    original_rcfg = pm._rcfg
+    pm._rcfg = pm.ReloadableConfig(
+        webhook_url=original_rcfg.webhook_url,
+        webhook_secret=original_rcfg.webhook_secret,
+        allowed_recipients={'inbox@example.com'},
+    )
     yield milter
-    for k, v in originals.items():
-        setattr(pm, k, v)
+    pm._rcfg = original_rcfg
 
 
 class TestRecipientFiltering:
@@ -889,12 +885,11 @@ class TestRecipientFiltering:
         assert result == mock_milter.CONTINUE
 
     def test_no_filtering_when_disabled(self, milter):
-        original = pm.RECIPIENT_FILTERING_ENABLED
-        pm.RECIPIENT_FILTERING_ENABLED = False
+        # milter fixture has empty allowed_recipients
+        # so recipient_filtering_enabled property is False
         milter.envfrom('<sender@test.com>')
         result = milter.envrcpt('<anyone@anywhere.com>')
         assert result == mock_milter.CONTINUE
-        pm.RECIPIENT_FILTERING_ENABLED = original
 
 
 # ===========================================================================
@@ -970,10 +965,10 @@ class TestSpoofProtectionHelpers:
 @pytest.fixture
 def spoof_milter(standalone_milter):
     """Standalone milter with spoof protection enabled"""
-    original = pm.SPOOF_PROTECTION
-    pm.SPOOF_PROTECTION = 'strict'
+    original = pm._rcfg.spoof_protection
+    pm._rcfg.spoof_protection = 'strict'
     yield standalone_milter
-    pm.SPOOF_PROTECTION = original
+    pm._rcfg.spoof_protection = original
 
 
 class TestSPFEnforcement:
@@ -1025,13 +1020,13 @@ class TestSPFEnforcement:
 
     def test_spf_not_checked_in_monitor_mode(self, standalone_milter):
         """Monitor mode checks SPF but never rejects"""
-        original = pm.SPOOF_PROTECTION
-        pm.SPOOF_PROTECTION = 'monitor'
+        original = pm._rcfg.spoof_protection
+        pm._rcfg.spoof_protection = 'monitor'
         with patch.object(pm, 'SPF_AVAILABLE', True), \
              patch('primitivemail_milter.spfmod', create=True) as mock_spf:
             mock_spf.check2.return_value = ('fail', 'SPF fail')
             result = standalone_milter.envfrom('<user@example.com>')
-        pm.SPOOF_PROTECTION = original
+        pm._rcfg.spoof_protection = original
 
         assert result == mock_milter.CONTINUE
         assert standalone_milter.spf_result == 'fail'
@@ -1046,12 +1041,12 @@ class TestSPFEnforcement:
 
     def test_spf_skipped_when_off(self, standalone_milter):
         """SPF not checked when SPOOF_PROTECTION=off"""
-        original = pm.SPOOF_PROTECTION
-        pm.SPOOF_PROTECTION = 'off'
+        original = pm._rcfg.spoof_protection
+        pm._rcfg.spoof_protection = 'off'
         with patch.object(pm, 'SPF_AVAILABLE', True), \
              patch('primitivemail_milter.spfmod', create=True) as mock_spf:
             standalone_milter.envfrom('<user@example.com>')
-        pm.SPOOF_PROTECTION = original
+        pm._rcfg.spoof_protection = original
         mock_spf.check2.assert_not_called()
 
 
@@ -1085,8 +1080,8 @@ class TestDKIMDMARCEnforcement:
 
     def test_dmarc_reject_policy_enforced_in_standard_mode(self, standalone_milter):
         """Standard mode rejects when sender's DMARC policy says reject"""
-        original = pm.SPOOF_PROTECTION
-        pm.SPOOF_PROTECTION = 'standard'
+        original = pm._rcfg.spoof_protection
+        pm._rcfg.spoof_protection = 'standard'
 
         standalone_milter.envfrom('<sender@example.com>')
         standalone_milter.envrcpt('<user@example.com>')
@@ -1097,13 +1092,13 @@ class TestDKIMDMARCEnforcement:
                           return_value={'policy': 'reject', 'pass': False}):
             result = standalone_milter.eom()
 
-        pm.SPOOF_PROTECTION = original
+        pm._rcfg.spoof_protection = original
         assert result == mock_milter.REJECT
 
     def test_dmarc_quarantine_adds_header_in_standard_mode(self, standalone_milter):
         """Standard mode adds warning header for quarantine policy"""
-        original = pm.SPOOF_PROTECTION
-        pm.SPOOF_PROTECTION = 'standard'
+        original = pm._rcfg.spoof_protection
+        pm._rcfg.spoof_protection = 'standard'
 
         standalone_milter.envfrom('<sender@example.com>')
         standalone_milter.envrcpt('<user@example.com>')
@@ -1114,7 +1109,7 @@ class TestDKIMDMARCEnforcement:
                           return_value={'policy': 'quarantine', 'pass': False}):
             result = standalone_milter.eom()
 
-        pm.SPOOF_PROTECTION = original
+        pm._rcfg.spoof_protection = original
         assert result == mock_milter.ACCEPT
         # Check that a quarantine warning header was added
         standalone_milter.addheader.assert_any_call(
@@ -1123,8 +1118,8 @@ class TestDKIMDMARCEnforcement:
 
     def test_dmarc_none_policy_passes_in_standard_mode(self, standalone_milter):
         """Standard mode accepts when DMARC policy is none"""
-        original = pm.SPOOF_PROTECTION
-        pm.SPOOF_PROTECTION = 'standard'
+        original = pm._rcfg.spoof_protection
+        pm._rcfg.spoof_protection = 'standard'
 
         standalone_milter.envfrom('<sender@example.com>')
         standalone_milter.envrcpt('<user@example.com>')
@@ -1135,7 +1130,7 @@ class TestDKIMDMARCEnforcement:
                           return_value={'policy': 'none', 'pass': False}):
             result = standalone_milter.eom()
 
-        pm.SPOOF_PROTECTION = original
+        pm._rcfg.spoof_protection = original
         assert result == mock_milter.ACCEPT
 
     def test_dmarc_fail_rejected_in_strict_mode(self, spoof_milter):
@@ -1154,8 +1149,8 @@ class TestDKIMDMARCEnforcement:
 
     def test_monitor_mode_adds_headers_but_accepts(self, standalone_milter):
         """Monitor mode logs auth results but never rejects"""
-        original = pm.SPOOF_PROTECTION
-        pm.SPOOF_PROTECTION = 'monitor'
+        original = pm._rcfg.spoof_protection
+        pm._rcfg.spoof_protection = 'monitor'
 
         standalone_milter.envfrom('<sender@example.com>')
         standalone_milter.envrcpt('<user@example.com>')
@@ -1166,7 +1161,7 @@ class TestDKIMDMARCEnforcement:
                           return_value={'policy': 'reject', 'pass': False}):
             result = standalone_milter.eom()
 
-        pm.SPOOF_PROTECTION = original
+        pm._rcfg.spoof_protection = original
         assert result == mock_milter.ACCEPT
         # Auth headers should still be added
         standalone_milter.addheader.assert_any_call("X-PrimitiveMail-DKIM", "fail")
@@ -1819,6 +1814,498 @@ class TestMetaJsonSidecar:
         meta = json.loads(meta_file.read_text())  # should not raise
         assert 'smtp' in meta
         assert 'auth' in meta
+
+
+# ===========================================================================
+# Config file + SIGHUP reload
+# ===========================================================================
+
+class TestConfigFile:
+    """Config file loading with environment variable fallback."""
+
+    def test_read_config_file_valid(self, tmp_path):
+        cfg_path = tmp_path / "milter.json"
+        cfg_path.write_text(json.dumps({
+            "webhook_url": "https://file.example.com/hook",
+            "webhook_secret": "file-secret",
+        }))
+        data = pm._read_config_file(str(cfg_path))
+        assert data["webhook_url"] == "https://file.example.com/hook"
+        assert data["webhook_secret"] == "file-secret"
+
+    def test_read_config_file_missing(self):
+        data = pm._read_config_file("/nonexistent/path/milter.json")
+        assert data == {}
+
+    def test_read_config_file_invalid_json(self, tmp_path):
+        cfg_path = tmp_path / "bad.json"
+        cfg_path.write_text("not json {{{")
+        data = pm._read_config_file(str(cfg_path))
+        assert data == {}
+
+    def test_read_config_file_non_object(self, tmp_path):
+        cfg_path = tmp_path / "array.json"
+        cfg_path.write_text(json.dumps(["a", "b"]))
+        data = pm._read_config_file(str(cfg_path))
+        assert data == {}
+
+    def test_cfg_file_wins_over_env(self):
+        file_data = {"webhook_url": "https://from-file.com"}
+        with patch.dict(os.environ, {"WEBHOOK_URL": "https://from-env.com"}):
+            assert pm._cfg(file_data, "webhook_url", "WEBHOOK_URL") == "https://from-file.com"
+
+    def test_cfg_falls_back_to_env(self):
+        with patch.dict(os.environ, {"WEBHOOK_URL": "https://from-env.com"}):
+            assert pm._cfg({}, "webhook_url", "WEBHOOK_URL") == "https://from-env.com"
+
+    def test_cfg_falls_back_to_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            result = pm._cfg({}, "webhook_url", "WEBHOOK_URL_NONEXISTENT", "default-val")
+            assert result == "default-val"
+
+
+class TestParseHelpers:
+    """Helpers for comma-separated sets and extra headers."""
+
+    def test_parse_comma_set_string(self):
+        assert pm._parse_comma_set("a.com, b.com, c.com") == {"a.com", "b.com", "c.com"}
+
+    def test_parse_comma_set_list(self):
+        assert pm._parse_comma_set(["A.COM", "B.com"]) == {"a.com", "b.com"}
+
+    def test_parse_comma_set_empty(self):
+        assert pm._parse_comma_set("") == set()
+        assert pm._parse_comma_set(None) == set()
+
+    def test_parse_extra_headers_dict(self):
+        assert pm._parse_extra_headers({"x-foo": "bar"}) == {"x-foo": "bar"}
+
+    def test_parse_extra_headers_json_string(self):
+        assert pm._parse_extra_headers('{"x-foo": "bar"}') == {"x-foo": "bar"}
+
+    def test_parse_extra_headers_invalid(self):
+        assert pm._parse_extra_headers("not json") == {}
+        assert pm._parse_extra_headers("") == {}
+        assert pm._parse_extra_headers(None) == {}
+
+    def test_parse_extra_headers_non_object_json(self):
+        assert pm._parse_extra_headers('["a","b"]') == {}
+
+
+class TestApplyConfig:
+    """_apply_config sets globals from file data + env fallback."""
+
+    def _save_state(self):
+        return {
+            '_rcfg': pm._rcfg,
+            'MESSAGE_ID_DOMAIN': pm.MESSAGE_ID_DOMAIN,
+            'STANDALONE_MODE': pm.STANDALONE_MODE,
+            'MAIL_DIR': pm.MAIL_DIR,
+            'SPAMHAUS_DNSBL_DOMAIN': pm.SPAMHAUS_DNSBL_DOMAIN,
+            'STORAGE_UPLOAD_THRESHOLD': pm.STORAGE_UPLOAD_THRESHOLD,
+        }
+
+    def _restore_state(self, saved):
+        pm._rcfg = saved['_rcfg']
+        pm.MESSAGE_ID_DOMAIN = saved['MESSAGE_ID_DOMAIN']
+        pm.STANDALONE_MODE = saved['STANDALONE_MODE']
+        pm.MAIL_DIR = saved['MAIL_DIR']
+        pm.SPAMHAUS_DNSBL_DOMAIN = saved['SPAMHAUS_DNSBL_DOMAIN']
+        pm.STORAGE_UPLOAD_THRESHOLD = saved['STORAGE_UPLOAD_THRESHOLD']
+
+    def test_apply_from_file_data(self):
+        saved = self._save_state()
+        try:
+            pm._apply_config({
+                "webhook_url": "https://test-apply.com/hook",
+                "webhook_secret": "secret-apply",
+                "allowed_sender_domains": ["example.com", "test.com"],
+                "allowed_recipients": "user@a.com,admin@b.com",
+                "spoof_protection": "monitor",
+            }, reloadable_only=False)
+
+            assert pm._rcfg.webhook_url == "https://test-apply.com/hook"
+            assert pm._rcfg.webhook_secret == "secret-apply"
+            assert pm._rcfg.allowed_sender_domains == {"example.com", "test.com"}
+            assert pm._rcfg.sender_filtering_enabled is True
+            assert pm._rcfg.allowed_recipients == {"user@a.com", "admin@b.com"}
+            assert pm._rcfg.recipient_filtering_enabled is True
+            assert pm.STANDALONE_MODE is False
+        finally:
+            self._restore_state(saved)
+
+    def test_apply_reloadable_only_does_not_change_identity(self):
+        saved = self._save_state()
+        try:
+            # Start in webhook mode so reload doesn't hit mode-switch guard
+            pm._apply_config({
+                "webhook_url": "https://original-url.com",
+                "webhook_secret": "secret",
+                "mydomain": "primitivemail",
+            }, reloadable_only=False)
+            pm.MESSAGE_ID_DOMAIN = "original.com"
+            pm.MAIL_DIR = "/original/dir"
+
+            pm._apply_config({
+                "webhook_url": "https://new-url.com",
+                "webhook_secret": "secret",
+                "mydomain": "should-be-ignored.com",
+                "mail_dir": "/should/be/ignored",
+            }, reloadable_only=True)
+
+            assert pm._rcfg.webhook_url == "https://new-url.com"
+            assert pm.MESSAGE_ID_DOMAIN == "original.com"
+            assert pm.MAIL_DIR == "/original/dir"
+        finally:
+            self._restore_state(saved)
+
+    def test_apply_env_fallback_when_key_missing_from_file(self):
+        saved = self._save_state()
+        try:
+            with patch.dict(os.environ, {"WEBHOOK_URL": "https://env-fallback.com",
+                                          "WEBHOOK_SECRET": "env-secret"}):
+                pm._apply_config({}, reloadable_only=False)
+                assert pm._rcfg.webhook_url == "https://env-fallback.com"
+                assert pm._rcfg.webhook_secret == "env-secret"
+        finally:
+            self._restore_state(saved)
+
+    def test_standalone_mode_when_no_webhook_url(self):
+        saved = self._save_state()
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                # Remove WEBHOOK_URL from env to avoid leaking
+                env = {k: v for k, v in os.environ.items() if k != 'WEBHOOK_URL'}
+                with patch.dict(os.environ, env, clear=True):
+                    pm._apply_config({}, reloadable_only=False)
+                    assert pm.STANDALONE_MODE is True
+        finally:
+            self._restore_state(saved)
+
+    def test_allow_bounces_parsing(self):
+        saved = self._save_state()
+        try:
+            pm._apply_config({"allow_bounces": "false"}, reloadable_only=False)
+            assert pm._rcfg.allow_bounces is False
+
+            pm._apply_config({"allow_bounces": True}, reloadable_only=False)
+            assert pm._rcfg.allow_bounces is True
+
+            pm._apply_config({}, reloadable_only=False)
+            assert pm._rcfg.allow_bounces is True  # default
+        finally:
+            self._restore_state(saved)
+
+
+class TestSighupReload:
+    """SIGHUP-triggered config reload."""
+
+    def _save_state(self):
+        return {
+            '_rcfg': pm._rcfg,
+            'MESSAGE_ID_DOMAIN': pm.MESSAGE_ID_DOMAIN,
+            'STANDALONE_MODE': pm.STANDALONE_MODE,
+            'MAIL_DIR': pm.MAIL_DIR,
+            'SPAMHAUS_DNSBL_DOMAIN': pm.SPAMHAUS_DNSBL_DOMAIN,
+            'STORAGE_UPLOAD_THRESHOLD': pm.STORAGE_UPLOAD_THRESHOLD,
+        }
+
+    def _restore_state(self, saved):
+        pm._rcfg = saved['_rcfg']
+        pm.MESSAGE_ID_DOMAIN = saved['MESSAGE_ID_DOMAIN']
+        pm.STANDALONE_MODE = saved['STANDALONE_MODE']
+        pm.MAIL_DIR = saved['MAIL_DIR']
+        pm.SPAMHAUS_DNSBL_DOMAIN = saved['SPAMHAUS_DNSBL_DOMAIN']
+        pm.STORAGE_UPLOAD_THRESHOLD = saved['STORAGE_UPLOAD_THRESHOLD']
+
+    def test_reload_updates_webhook_url(self, tmp_path):
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://original.com/hook",
+                "webhook_secret": "original-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm._rcfg.webhook_url == "https://original.com/hook"
+
+            # Update config file and trigger reload
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://updated.com/hook",
+                "webhook_secret": "updated-secret",
+            }))
+            pm.reload_config()
+
+            assert pm._rcfg.webhook_url == "https://updated.com/hook"
+            assert pm._rcfg.webhook_secret == "updated-secret"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+    def test_reload_updates_filtering(self, tmp_path):
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com/hook",
+                "webhook_secret": "secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm._rcfg.sender_filtering_enabled is False
+            assert pm._rcfg.allowed_recipients == set()
+
+            # Add filtering via reload
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com/hook",
+                "webhook_secret": "secret",
+                "allowed_sender_domains": ["trusted.com"],
+                "allowed_recipients": ["inbox@myco.com"],
+            }))
+            pm.reload_config()
+
+            assert pm._rcfg.sender_filtering_enabled is True
+            assert pm._rcfg.allowed_sender_domains == {"trusted.com"}
+            assert pm._rcfg.recipient_filtering_enabled is True
+            assert pm._rcfg.allowed_recipients == {"inbox@myco.com"}
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+    def test_reload_does_not_change_identity(self, tmp_path):
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com",
+                "webhook_secret": "s",
+                "mydomain": "original.com",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm.MESSAGE_ID_DOMAIN == "original.com"
+
+            # Try to change mydomain via reload — should be ignored
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://test.com",
+                "webhook_secret": "s",
+                "mydomain": "sneaky-change.com",
+            }))
+            pm.reload_config()
+
+            assert pm.MESSAGE_ID_DOMAIN == "original.com"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+    def test_reload_survives_missing_config_file_never_existed(self, tmp_path):
+        """SIGHUP with no config file (never had one) falls back to env vars."""
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        original_initial = pm._initial_file_data
+        try:
+            pm._initial_file_data = {}  # simulate: no config file at startup
+            pm._rcfg = pm.ReloadableConfig(
+                webhook_url="https://before.com",
+                webhook_secret="s",
+            )
+            pm.STANDALONE_MODE = False
+            pm.CONFIG_FILE_PATH = str(tmp_path / "does-not-exist.json")
+
+            # Should not crash, falls back to env vars
+            pm.reload_config()
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            pm._initial_file_data = original_initial
+            self._restore_state(saved)
+
+    def test_reload_aborts_when_startup_file_disappears(self, tmp_path):
+        """If config file existed at startup but is now gone, reload is aborted."""
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        original_initial = pm._initial_file_data
+        try:
+            # Simulate: config file was present at startup
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://from-file.com",
+                "webhook_secret": "file-secret",
+                "allowed_sender_domains": ["trusted.com"],
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._initial_file_data = pm._read_config_file(str(cfg_path))
+            pm._apply_config(pm._initial_file_data, reloadable_only=False)
+            assert pm._rcfg.webhook_url == "https://from-file.com"
+            assert pm._rcfg.allowed_sender_domains == {"trusted.com"}
+
+            # Delete the file — simulates NFS unmount, accidental rm, etc.
+            cfg_path.unlink()
+
+            # Reload should abort, preserving current state
+            pm.reload_config()
+
+            assert pm._rcfg.webhook_url == "https://from-file.com"
+            assert pm._rcfg.allowed_sender_domains == {"trusted.com"}
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            pm._initial_file_data = original_initial
+            self._restore_state(saved)
+
+    def test_reload_survives_corrupt_config_file(self, tmp_path):
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "corrupt.json"
+            cfg_path.write_text("{{{invalid")
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._rcfg.webhook_url = "https://before-corrupt.com"
+
+            # Should not crash
+            pm.reload_config()
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+    def test_reload_rejects_mode_switch_webhook_to_standalone(self, tmp_path):
+        """Cannot switch from webhook to standalone mode via SIGHUP."""
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://webhook-mode.com",
+                "webhook_secret": "secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            assert pm.STANDALONE_MODE is False
+            assert pm._rcfg.webhook_url == "https://webhook-mode.com"
+
+            # Try to remove webhook_url via reload — should be rejected
+            cfg_path.write_text(json.dumps({}))
+            with patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                          if k != 'WEBHOOK_URL'}, clear=True):
+                pm.reload_config()
+
+            # Should still be the original URL
+            assert pm._rcfg.webhook_url == "https://webhook-mode.com"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+    def test_reload_rejects_missing_secret(self, tmp_path):
+        """Cannot reload with webhook_url but no webhook_secret."""
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://original.com",
+                "webhook_secret": "original-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+
+            # Reload with URL but no secret — should be rejected
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://new-url.com",
+            }))
+            with patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                          if k != 'WEBHOOK_SECRET'}, clear=True):
+                pm.reload_config()
+
+            # Should still be the original values
+            assert pm._rcfg.webhook_url == "https://original.com"
+            assert pm._rcfg.webhook_secret == "original-secret"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+    def test_reload_callable_as_signal_handler(self, tmp_path):
+        """reload_config accepts signum and frame args (signal handler signature)."""
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            # Start in webhook mode so reload doesn't hit mode-switch guard
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://initial.com",
+                "webhook_secret": "initial-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+
+            # Update config and reload with signal handler signature
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://signal-test.com",
+                "webhook_secret": "sig-secret",
+            }))
+            pm.reload_config(signum=1, frame=None)
+
+            assert pm._rcfg.webhook_url == "https://signal-test.com"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            self._restore_state(saved)
+
+
+class TestEndToEndConfigFile:
+    """Integration: config file → milter behaviour."""
+
+    def test_webhook_uses_config_file_url(self, tmp_path):
+        """A milter with config-file-sourced WEBHOOK_URL posts to the right place."""
+        saved_url = pm._rcfg.webhook_url
+        saved_secret = pm._rcfg.webhook_secret
+        saved_standalone = pm.STANDALONE_MODE
+        saved_dnsbl = pm.SPAMHAUS_DNSBL_DOMAIN
+        original_path = pm.CONFIG_FILE_PATH
+        try:
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://config-file-target.com/hook",
+                "webhook_secret": "cfg-secret",
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
+            pm.SPAMHAUS_DNSBL_DOMAIN = ''
+
+            m = pm.PrimitiveMailMilter()
+            m.setreply = MagicMock()
+            m.addheader = MagicMock()
+            m.chgheader = MagicMock()
+            m.client_ip = '127.0.0.1'
+            m.client_hostname = 'localhost'
+            m.helo = 'test.example.com'
+
+            m.envfrom('<sender@example.com>')
+            m.envrcpt('<user@example.com>')
+            m.header('From', 'sender@example.com')
+            m.header('To', 'user@example.com')
+            m.header('Subject', 'Config file test')
+            m.header('Message-ID', '<cfg-test@example.com>')
+            m.body(b'Config file test body')
+
+            captured_urls = []
+
+            def capture_request(request, timeout=None):
+                captured_urls.append(request.full_url)
+                return make_webhook_response('accepted')
+
+            with patch('urllib.request.urlopen', side_effect=capture_request):
+                result = m.eom()
+
+            assert result == mock_milter.ACCEPT
+            assert len(captured_urls) == 1
+            assert captured_urls[0] == "https://config-file-target.com/hook"
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            pm._rcfg.webhook_url = saved_url
+            pm._rcfg.webhook_secret = saved_secret
+            pm.STANDALONE_MODE = saved_standalone
+            pm.SPAMHAUS_DNSBL_DOMAIN = saved_dnsbl
 
 
 if __name__ == "__main__":
