@@ -7,9 +7,9 @@ Two modes:
 - Webhook mode: Calls a configured webhook URL and returns ACCEPT/REJECT based on response.
 - Standalone mode: Accepts all valid emails (when no WEBHOOK_URL is configured).
 
-Security features (all configurable):
-- Sender filtering: ALLOWED_SENDER_DOMAINS / ALLOWED_SENDERS
-- Recipient filtering: ALLOWED_RECIPIENTS
+Security features (all configurable via config file or environment variables):
+- Sender filtering: allowed_sender_domains / allowed_senders
+- Recipient filtering: allowed_recipients
 - Spoof protection: SPF / DKIM / DMARC verification
 """
 
@@ -482,21 +482,6 @@ if _initial_file_data:
 _apply_config(_initial_file_data, reloadable_only=False)
 _log_config_summary()
 
-# Module-level aliases for backward compatibility with tests and logging.
-# Handler code must NOT read these — use self._cfg (snapshot of _rcfg) instead.
-WEBHOOK_URL = _rcfg.webhook_url
-WEBHOOK_SECRET = _rcfg.webhook_secret
-WEBHOOK_EXTRA_HEADERS = _rcfg.webhook_extra_headers
-STORAGE_URL = _rcfg.storage_url
-STORAGE_KEY = _rcfg.storage_key
-STORAGE_AUTH_STYLE = _rcfg.storage_auth_style
-ALLOWED_SENDER_DOMAINS = _rcfg.allowed_sender_domains
-ALLOWED_SENDERS = _rcfg.allowed_senders
-ALLOW_BOUNCES = _rcfg.allow_bounces
-SENDER_FILTERING_ENABLED = _rcfg.sender_filtering_enabled
-ALLOWED_RECIPIENTS = _rcfg.allowed_recipients
-RECIPIENT_FILTERING_ENABLED = _rcfg.recipient_filtering_enabled
-SPOOF_PROTECTION = _rcfg.spoof_protection
 
 # DNS resolver timeout for SPF/DKIM/DMARC lookups
 DNS_TIMEOUT = 3

@@ -2102,17 +2102,57 @@ class TestSighupReload:
             pm.CONFIG_FILE_PATH = original_path
             self._restore_state(saved)
 
-    def test_reload_survives_missing_config_file(self, tmp_path):
+    def test_reload_survives_missing_config_file_never_existed(self, tmp_path):
+        """SIGHUP with no config file (never had one) falls back to env vars."""
         saved = self._save_state()
         original_path = pm.CONFIG_FILE_PATH
+        original_initial = pm._initial_file_data
         try:
-            pm._rcfg.webhook_url = "https://before.com"
+            pm._initial_file_data = {}  # simulate: no config file at startup
+            pm._rcfg = pm.ReloadableConfig(
+                webhook_url="https://before.com",
+                webhook_secret="s",
+            )
+            pm.STANDALONE_MODE = False
             pm.CONFIG_FILE_PATH = str(tmp_path / "does-not-exist.json")
 
             # Should not crash, falls back to env vars
             pm.reload_config()
         finally:
             pm.CONFIG_FILE_PATH = original_path
+            pm._initial_file_data = original_initial
+            self._restore_state(saved)
+
+    def test_reload_aborts_when_startup_file_disappears(self, tmp_path):
+        """If config file existed at startup but is now gone, reload is aborted."""
+        saved = self._save_state()
+        original_path = pm.CONFIG_FILE_PATH
+        original_initial = pm._initial_file_data
+        try:
+            # Simulate: config file was present at startup
+            cfg_path = tmp_path / "milter.json"
+            cfg_path.write_text(json.dumps({
+                "webhook_url": "https://from-file.com",
+                "webhook_secret": "file-secret",
+                "allowed_sender_domains": ["trusted.com"],
+            }))
+            pm.CONFIG_FILE_PATH = str(cfg_path)
+            pm._initial_file_data = pm._read_config_file(str(cfg_path))
+            pm._apply_config(pm._initial_file_data, reloadable_only=False)
+            assert pm._rcfg.webhook_url == "https://from-file.com"
+            assert pm._rcfg.allowed_sender_domains == {"trusted.com"}
+
+            # Delete the file — simulates NFS unmount, accidental rm, etc.
+            cfg_path.unlink()
+
+            # Reload should abort, preserving current state
+            pm.reload_config()
+
+            assert pm._rcfg.webhook_url == "https://from-file.com"
+            assert pm._rcfg.allowed_sender_domains == {"trusted.com"}
+        finally:
+            pm.CONFIG_FILE_PATH = original_path
+            pm._initial_file_data = original_initial
             self._restore_state(saved)
 
     def test_reload_survives_corrupt_config_file(self, tmp_path):
