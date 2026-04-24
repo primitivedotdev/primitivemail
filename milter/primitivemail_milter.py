@@ -49,6 +49,36 @@ except ImportError:
     DKIM_AVAILABLE = False
 
 try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+_s3_client = None
+
+def _get_s3_client():
+    """Get or create a cached S3 client with sensible timeouts.
+
+    Cached at module level — one connection pool shared across all uploads.
+    Region is read from AWS_DEFAULT_REGION on first call and locked thereafter.
+    Timeouts prevent a slow S3 upload from blocking a milter thread indefinitely.
+    """
+    global _s3_client
+    if _s3_client is None:
+        region = os.environ.get('AWS_DEFAULT_REGION', 'us-west-2')
+        _s3_client = boto3.client(
+            's3',
+            region_name=region,
+            config=BotoConfig(
+                connect_timeout=10,
+                read_timeout=15,
+                retries={'max_attempts': 2},
+            ),
+        )
+    return _s3_client
+
+try:
     import dns.resolver
     DNS_AVAILABLE = True
 except ImportError:
@@ -1308,27 +1338,16 @@ class PrimitiveMailMilter(Milter.Base):
             return Milter.ACCEPT
 
     def upload_to_storage(self, raw_bytes: bytes) -> Dict[str, Any]:
-        """Upload raw email to S3-compatible storage for large emails.
+        """Upload raw email to storage for large emails.
 
         Supports multiple auth styles via STORAGE_AUTH_STYLE:
-        - "supabase": Bearer token + apikey header (Supabase Storage)
-        - "s3": Bearer token only (generic S3-compatible)
+        - "s3": AWS S3 via boto3 (uses IAM task role on ECS, no explicit creds)
+        - "supabase": Bearer token + apikey header (Supabase Storage, legacy)
         """
         cfg = self._cfg
         upload_id = str(uuid.uuid4())
         sha256 = hashlib.sha256(raw_bytes).hexdigest()
         storage_key = f"incoming/{upload_id}.eml"
-        url = f"{cfg.storage_url.rstrip('/')}/{storage_key}"
-
-        # Build auth headers based on storage backend
-        headers = {
-            'Content-Type': 'message/rfc822',
-        }
-        if cfg.storage_auth_style == 'supabase':
-            headers['Authorization'] = f'Bearer {cfg.storage_key}'
-            headers['apikey'] = cfg.storage_key
-        else:
-            headers['Authorization'] = f'Bearer {cfg.storage_key}'
 
         storage_span = None
         if TRACING_ENABLED:
@@ -1340,41 +1359,14 @@ class PrimitiveMailMilter(Milter.Base):
             storage_span.set_tag("storage.upload_id", upload_id)
             storage_span.set_tag("storage.size_bytes", len(raw_bytes))
             storage_span.set_tag("storage.sha256", sha256)
+            storage_span.set_tag("storage.auth_style", cfg.storage_auth_style)
 
         start = time.time()
         try:
-            req = urllib.request.Request(
-                url,
-                data=raw_bytes,
-                headers=headers,
-                method='POST'
-            )
-
-            with urllib.request.urlopen(req, timeout=15) as response:
-                duration = time.time() - start
-                if response.status in (200, 201):
-                    record_metrics(lambda: (
-                        STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
-                        STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
-                    ))
-                    if storage_span:
-                        storage_span.set_tag('storage.status', 'success')
-                    return {
-                        'success': True,
-                        'upload_id': upload_id,
-                        'storage_key': storage_key,
-                        'sha256': sha256,
-                    }
-                else:
-                    record_metrics(lambda: (
-                        STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
-                        STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
-                        ERRORS_TOTAL.labels(stage='storage_upload').inc(),
-                    ))
-                    if storage_span:
-                        storage_span.set_tag('error', True)
-                        storage_span.set_tag('http.status_code', response.status)
-                    return {'success': False, 'error': f'HTTP {response.status}'}
+            if cfg.storage_auth_style == 's3':
+                return self._upload_to_s3(cfg, raw_bytes, upload_id, storage_key, sha256, start, storage_span)
+            else:
+                return self._upload_to_http(cfg, raw_bytes, upload_id, storage_key, sha256, start, storage_span)
 
         except Exception as e:
             duration = time.time() - start
@@ -1391,6 +1383,97 @@ class PrimitiveMailMilter(Milter.Base):
         finally:
             if storage_span:
                 storage_span.finish()
+
+    def _upload_to_s3(self, cfg, raw_bytes: bytes, upload_id: str,
+                      storage_key: str, sha256: str, start: float,
+                      storage_span) -> Dict[str, Any]:
+        """Upload to S3 using boto3 (IAM task role auth on ECS)."""
+        if not BOTO3_AVAILABLE:
+            duration = time.time() - start
+            record_metrics(lambda: (
+                STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
+                STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
+                ERRORS_TOTAL.labels(stage='storage_upload').inc(),
+            ))
+            return {'success': False, 'error': 'boto3 not installed'}
+
+        # Parse bucket from STORAGE_URL: accept "s3://bucket-name" or just "bucket-name"
+        bucket = cfg.storage_url
+        if bucket.startswith('s3://'):
+            bucket = bucket[5:]
+        bucket = bucket.strip('/')
+
+        s3 = _get_s3_client()
+        s3.put_object(
+            Bucket=bucket,
+            Key=storage_key,
+            Body=raw_bytes,
+            ContentType='message/rfc822',
+            Metadata={'sha256': sha256},
+        )
+
+        duration = time.time() - start
+        record_metrics(lambda: (
+            STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
+            STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
+        ))
+        if storage_span:
+            storage_span.set_tag('storage.status', 'success')
+            storage_span.set_tag('storage.bucket', bucket)
+        return {
+            'success': True,
+            'upload_id': upload_id,
+            'storage_key': storage_key,
+            'sha256': sha256,
+        }
+
+    def _upload_to_http(self, cfg, raw_bytes: bytes, upload_id: str,
+                        storage_key: str, sha256: str, start: float,
+                        storage_span) -> Dict[str, Any]:
+        """Upload via HTTP PUT (Supabase Storage or generic S3-compatible)."""
+        url = f"{cfg.storage_url.rstrip('/')}/{storage_key}"
+
+        headers = {
+            'Content-Type': 'message/rfc822',
+        }
+        if cfg.storage_auth_style == 'supabase':
+            headers['Authorization'] = f'Bearer {cfg.storage_key}'
+            headers['apikey'] = cfg.storage_key
+        else:
+            headers['Authorization'] = f'Bearer {cfg.storage_key}'
+
+        req = urllib.request.Request(
+            url,
+            data=raw_bytes,
+            headers=headers,
+            method='POST'
+        )
+
+        with urllib.request.urlopen(req, timeout=15) as response:
+            duration = time.time() - start
+            if response.status in (200, 201):
+                record_metrics(lambda: (
+                    STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
+                    STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
+                ))
+                if storage_span:
+                    storage_span.set_tag('storage.status', 'success')
+                return {
+                    'success': True,
+                    'upload_id': upload_id,
+                    'storage_key': storage_key,
+                    'sha256': sha256,
+                }
+            else:
+                record_metrics(lambda: (
+                    STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
+                    STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
+                    ERRORS_TOTAL.labels(stage='storage_upload').inc(),
+                ))
+                if storage_span:
+                    storage_span.set_tag('error', True)
+                    storage_span.set_tag('http.status_code', response.status)
+                return {'success': False, 'error': f'HTTP {response.status}'}
 
     def _call_webhook_for_recipient(self, recipient: str, domain: str,
                                      raw_bytes: Optional[bytes], size: int,
