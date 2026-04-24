@@ -50,6 +50,7 @@ except ImportError:
 
 try:
     import boto3
+    from botocore.config import Config as BotoConfig
     BOTO3_AVAILABLE = True
 except ImportError:
     BOTO3_AVAILABLE = False
@@ -57,9 +58,22 @@ except ImportError:
 _s3_client = None
 
 def _get_s3_client(region):
+    """Get or create a cached S3 client with sensible timeouts.
+
+    Cached at module level — one connection pool shared across all uploads.
+    Timeouts prevent a slow S3 upload from blocking a milter thread indefinitely.
+    """
     global _s3_client
     if _s3_client is None:
-        _s3_client = boto3.client('s3', region_name=region)
+        _s3_client = boto3.client(
+            's3',
+            region_name=region,
+            config=BotoConfig(
+                connect_timeout=10,
+                read_timeout=15,
+                retries={'max_attempts': 2},
+            ),
+        )
     return _s3_client
 
 try:
@@ -1394,6 +1408,7 @@ class PrimitiveMailMilter(Milter.Base):
             Key=storage_key,
             Body=raw_bytes,
             ContentType='message/rfc822',
+            Metadata={'sha256': sha256},
         )
 
         duration = time.time() - start
