@@ -697,8 +697,10 @@ class TestStorageUpload:
         """Large email: upload once, reference same storage_key in all webhooks"""
         original_threshold = pm.STORAGE_UPLOAD_THRESHOLD
         original_storage_url = pm._rcfg.storage_url
+        original_auth_style = pm._rcfg.storage_auth_style
         pm.STORAGE_UPLOAD_THRESHOLD = 10  # tiny threshold
         pm._rcfg.storage_url = 'https://storage.example.com/bucket'
+        pm._rcfg.storage_auth_style = 'supabase'  # use HTTP path so urllib mock works
 
         milter.envfrom('<sender@example.com>')
         milter.envrcpt('<alice@a.com>')
@@ -722,6 +724,7 @@ class TestStorageUpload:
 
         pm.STORAGE_UPLOAD_THRESHOLD = original_threshold
         pm._rcfg.storage_url = original_storage_url
+        pm._rcfg.storage_auth_style = original_auth_style
 
         assert result == mock_milter.ACCEPT
         assert len(upload_calls) == 1, "Storage upload should happen exactly once"
@@ -732,8 +735,10 @@ class TestStorageUpload:
     def test_storage_failure_tempfails_before_any_webhook(self, milter):
         original_threshold = pm.STORAGE_UPLOAD_THRESHOLD
         original_storage_url = pm._rcfg.storage_url
+        original_auth_style = pm._rcfg.storage_auth_style
         pm.STORAGE_UPLOAD_THRESHOLD = 10
         pm._rcfg.storage_url = 'https://storage.example.com/bucket'
+        pm._rcfg.storage_auth_style = 'supabase'  # use HTTP path so urllib mock works
 
         milter.envfrom('<sender@example.com>')
         milter.envrcpt('<alice@a.com>')
@@ -754,6 +759,7 @@ class TestStorageUpload:
 
         pm.STORAGE_UPLOAD_THRESHOLD = original_threshold
         pm._rcfg.storage_url = original_storage_url
+        pm._rcfg.storage_auth_style = original_auth_style
 
         assert result == mock_milter.TEMPFAIL
         assert not webhook_called[0], "Webhook should not be called if storage upload fails"
