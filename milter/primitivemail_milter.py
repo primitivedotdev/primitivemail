@@ -5,7 +5,7 @@ Intercepts emails DURING the SMTP transaction (before 250 OK).
 
 Two modes:
 - Webhook mode: Calls a configured webhook URL and returns ACCEPT/REJECT based on response.
-- Standalone mode: Accepts all valid emails (when no WEBHOOK_URL is configured).
+- Standalone mode: Accepts all valid emails (when no webhook_url is configured).
 
 Security features (all configurable via config file or environment variables):
 - Sender filtering: allowed_sender_domains / allowed_senders
