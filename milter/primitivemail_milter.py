@@ -1716,6 +1716,7 @@ def main():
 
         def _poll_smtpd_count():
             import subprocess
+            _logged_failure = False
             while True:
                 try:
                     result = subprocess.run(
@@ -1724,8 +1725,12 @@ def main():
                     )
                     count = int(result.stdout.strip()) if result.returncode == 0 else 0
                     SMTPD_ACTIVE.set(count)
-                except Exception:
-                    pass
+                    _logged_failure = False
+                except Exception as e:
+                    SMTPD_ACTIVE.set(-1)  # -1 = monitoring broken (distinguishable from 0 processes)
+                    if not _logged_failure:
+                        logger.warning(f"smtpd process monitor failed: {e}")
+                        _logged_failure = True
                 time.sleep(5)
 
         t = threading.Thread(target=_poll_smtpd_count, daemon=True)
