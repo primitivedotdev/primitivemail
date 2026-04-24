@@ -219,8 +219,8 @@ except Exception as e:
 # this is the original behaviour and remains fully supported.
 #
 # A subset of values can be reloaded at runtime by sending SIGHUP to the
-# process. See RELOADABLE_KEYS below for which values support hot reload
-# and _apply_config() for the reload logic.
+# process. See the ReloadableConfig class for which values support hot
+# reload, and _apply_config() for the reload logic.
 # ---------------------------------------------------------------------------
 
 CONFIG_FILE_PATH = os.environ.get('CONFIG_FILE', '/etc/primitive/milter.json')
