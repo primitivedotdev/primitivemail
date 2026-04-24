@@ -169,6 +169,15 @@ try:
         'milter_in_flight_emails',
         'Emails currently being processed in eom()',
     )
+    SMTPD_ACTIVE = Gauge(
+        'milter_postfix_smtpd_active',
+        'Active Postfix smtpd processes',
+    )
+    EOM_PARSE_DURATION = Histogram(
+        'milter_eom_parse_seconds',
+        'Time to parse and validate email before webhook',
+        buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+    )
     METRICS_ENABLED = True
 except ImportError:
     METRICS_ENABLED = False
@@ -1034,6 +1043,9 @@ class PrimitiveMailMilter(Milter.Base):
             self._trace_span.set_tag("email.subject", self.subject or "")
             self._trace_span.set_tag("email.message_id", self.message_id or "")
 
+        # --- Parse and validate phase (timed for bottleneck analysis) ---
+        parse_start = time.time()
+
         # Validate recipients
         if not self.recipients:
             self.log_error("No recipients - rejecting")
@@ -1109,6 +1121,10 @@ class PrimitiveMailMilter(Milter.Base):
         self.log(f"  To: {', '.join(valid_recipients)} ({len(valid_recipients)} recipients)")
         self.log(f"  Subject: {self.subject}")
         self.log(f"  Size: {size} bytes")
+
+        # Record parse/validate duration
+        parse_duration = time.time() - parse_start
+        record_metrics(lambda: EOM_PARSE_DURATION.observe(parse_duration))
 
         # Refine APM trace span now that recipients and size are known.
         # Span was opened at the top of _process_eom; here we set the tags
@@ -1693,6 +1709,33 @@ def main():
     logger.info(f"  Metrics: {'enabled' if METRICS_ENABLED else 'disabled'}")
     logger.info(f"  SIGHUP reload: enabled")
     logger.info("=" * 60)
+
+    # Start background thread to poll active smtpd process count
+    if METRICS_ENABLED:
+        import threading
+
+        def _poll_smtpd_count():
+            import subprocess
+            _logged_failure = False
+            while True:
+                try:
+                    result = subprocess.run(
+                        ['pgrep', '-c', 'smtpd'],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    count = int(result.stdout.strip()) if result.returncode == 0 else 0
+                    SMTPD_ACTIVE.set(count)
+                    _logged_failure = False
+                except Exception as e:
+                    SMTPD_ACTIVE.set(-1)  # -1 = monitoring broken (distinguishable from 0 processes)
+                    if not _logged_failure:
+                        logger.warning(f"smtpd process monitor failed: {e}")
+                        _logged_failure = True
+                time.sleep(5)
+
+        t = threading.Thread(target=_poll_smtpd_count, daemon=True)
+        t.start()
+        logger.info("Postfix smtpd process monitor started")
 
     # Set timeout (must be longer than webhook timeout)
     Milter.set_flags(Milter.CHGHDRS + Milter.ADDHDRS)
