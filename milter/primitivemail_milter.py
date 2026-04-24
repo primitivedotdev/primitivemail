@@ -57,14 +57,16 @@ except ImportError:
 
 _s3_client = None
 
-def _get_s3_client(region):
+def _get_s3_client():
     """Get or create a cached S3 client with sensible timeouts.
 
     Cached at module level — one connection pool shared across all uploads.
+    Region is read from AWS_DEFAULT_REGION on first call and locked thereafter.
     Timeouts prevent a slow S3 upload from blocking a milter thread indefinitely.
     """
     global _s3_client
     if _s3_client is None:
+        region = os.environ.get('AWS_DEFAULT_REGION', 'us-west-2')
         _s3_client = boto3.client(
             's3',
             region_name=region,
@@ -1401,8 +1403,7 @@ class PrimitiveMailMilter(Milter.Base):
             bucket = bucket[5:]
         bucket = bucket.strip('/')
 
-        region = os.environ.get('AWS_DEFAULT_REGION', 'us-west-2')
-        s3 = _get_s3_client(region)
+        s3 = _get_s3_client()
         s3.put_object(
             Bucket=bucket,
             Key=storage_key,
