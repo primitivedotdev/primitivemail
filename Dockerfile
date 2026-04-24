@@ -16,7 +16,7 @@ RUN apt-get update && \
       build-essential \
       libmilter-dev \
       iproute2 && \
-    pip3 install --no-cache-dir python-logging-loki pymilter prometheus_client 'pyspf>=2.0,<3' 'dnspython>=2.7,<3' 'dkimpy>=1.1,<2' 'tldextract>=5.0,<6' boto3 && \
+    pip3 install --no-cache-dir python-logging-loki pymilter prometheus_client 'pyspf>=2.0,<3' 'dnspython>=2.7,<3' 'dkimpy>=1.1,<2' 'tldextract>=5.0,<6' 'boto3>=1.35,<2' && \
     rm -rf /var/lib/apt/lists/*
 
 # Optional: Datadog APM tracing (enabled via DATADOG_TRACING_ENABLED=true at runtime)

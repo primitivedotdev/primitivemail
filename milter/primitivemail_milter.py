@@ -54,6 +54,14 @@ try:
 except ImportError:
     BOTO3_AVAILABLE = False
 
+_s3_client = None
+
+def _get_s3_client(region):
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client('s3', region_name=region)
+    return _s3_client
+
 try:
     import dns.resolver
     DNS_AVAILABLE = True
@@ -1365,6 +1373,12 @@ class PrimitiveMailMilter(Milter.Base):
                       storage_span) -> Dict[str, Any]:
         """Upload to S3 using boto3 (IAM task role auth on ECS)."""
         if not BOTO3_AVAILABLE:
+            duration = time.time() - start
+            record_metrics(lambda: (
+                STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
+                STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
+                ERRORS_TOTAL.labels(stage='storage_upload').inc(),
+            ))
             return {'success': False, 'error': 'boto3 not installed'}
 
         # Parse bucket from STORAGE_URL: accept "s3://bucket-name" or just "bucket-name"
@@ -1374,7 +1388,7 @@ class PrimitiveMailMilter(Milter.Base):
         bucket = bucket.strip('/')
 
         region = os.environ.get('AWS_DEFAULT_REGION', 'us-west-2')
-        s3 = boto3.client('s3', region_name=region)
+        s3 = _get_s3_client(region)
         s3.put_object(
             Bucket=bucket,
             Key=storage_key,
