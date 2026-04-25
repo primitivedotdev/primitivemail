@@ -589,6 +589,13 @@ def main() -> None:
         ip_literal=cfg["ip_literal"],
     )
 
+    # When --enable-letsencrypt (or any custom TLS path) was used, confirm
+    # the container can actually read the files. Cheap insurance against
+    # future certbot permission changes that would silently drop us back
+    # to the self-signed cert. Skipped on --no-start.
+    if not args.no_start and cfg.get("tls_cert") and cfg.get("tls_key"):
+        server.verify_tls_readable_in_container(cfg["tls_cert"], cfg["tls_key"])
+
     # After server is running (port 25 open), claim a free subdomain
     # if the user doesn't have their own domain or explicitly asked for one
     should_claim = (

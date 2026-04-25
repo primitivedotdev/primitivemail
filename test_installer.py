@@ -1844,3 +1844,87 @@ class TestInjectComposeMount:
         )
         assert le_lines[0] > pm_header_idx
 
+
+# ===========================================================================
+# verify_tls_readable_in_container: post-start cert readability smoke check
+# ===========================================================================
+
+class TestVerifyTlsReadableInContainer:
+    """When --enable-letsencrypt (or any custom TLS path) is used, confirm
+    the running container can read the cert + key. The check shells out to
+    `docker exec primitivemail test -r <path>` for each file and emits a
+    warning (not an error) on failure — install can otherwise have completed
+    cleanly."""
+
+    def setup_method(self):
+        from installer import server
+        server._DOCKER_CMD_CACHED = None
+
+    def test_returns_none_when_paths_empty(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+        assert server.verify_tls_readable_in_container("", "") is None
+
+    def test_returns_true_when_both_readable(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+
+        calls = []
+
+        class FakeProc:
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(server.subprocess, "run", fake_run)
+        result = server.verify_tls_readable_in_container(
+            "/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+            "/etc/letsencrypt/live/mx.example.com/privkey.pem",
+        )
+        assert result is True
+        # Two `docker exec primitivemail test -r ...` calls, one per path.
+        assert len(calls) == 2
+        for cmd in calls:
+            assert cmd[0] == "docker"
+            assert "exec" in cmd
+            assert "primitivemail" in cmd
+            assert "test" in cmd
+
+    def test_returns_false_when_one_unreadable(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+
+        class FakeProc:
+            def __init__(self, rc):
+                self.returncode = rc
+
+        # First call (cert) succeeds, second (key) fails.
+        results = iter([FakeProc(0), FakeProc(1)])
+
+        def fake_run(cmd, **kwargs):
+            return next(results)
+
+        monkeypatch.setattr(server.subprocess, "run", fake_run)
+        result = server.verify_tls_readable_in_container(
+            "/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+            "/etc/letsencrypt/live/mx.example.com/privkey.pem",
+        )
+        assert result is False
+
+    def test_returns_none_when_subprocess_raises(self, monkeypatch):
+        # Container not addressable, docker socket missing — fall back to
+        # None (skipped) rather than raising or reporting False.
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError("no docker")
+
+        monkeypatch.setattr(server.subprocess, "run", fake_run)
+        result = server.verify_tls_readable_in_container(
+            "/path/cert.pem", "/path/key.pem",
+        )
+        assert result is None
+
