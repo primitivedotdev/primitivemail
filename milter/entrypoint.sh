@@ -5,21 +5,51 @@ MYHOSTNAME="${MYHOSTNAME:-localhost}"
 MYDOMAIN="${MYDOMAIN:-localhost}"
 export MYHOSTNAME MYDOMAIN
 
-# Generate self-signed TLS cert if none exists
-TLS_CERT="${TLS_CERT:-/etc/postfix/tls/server.pem}"
-TLS_KEY="${TLS_KEY:-/etc/postfix/tls/server.key}"
-if [[ ! -f "$TLS_CERT" ]]; then
+# Default self-signed paths. Used both as the fallback when TLS_CERT/TLS_KEY
+# are unset and as the recovery target if a custom path is configured but
+# missing at startup (e.g. Let's Encrypt issuance has not run yet, or the
+# /etc/letsencrypt mount is not present).
+DEFAULT_TLS_CERT="/etc/postfix/tls/server.pem"
+DEFAULT_TLS_KEY="/etc/postfix/tls/server.key"
+
+TLS_CERT="${TLS_CERT:-$DEFAULT_TLS_CERT}"
+TLS_KEY="${TLS_KEY:-$DEFAULT_TLS_KEY}"
+
+# Defensive fallback: if a custom TLS_CERT was configured but the file is not
+# on disk, log a clear warning and fall back to the self-signed default rather
+# than crashing the container. The cert key is checked alongside the cert so
+# half-configured pairs do not silently load only one side.
+if [[ "$TLS_CERT" != "$DEFAULT_TLS_CERT" ]]; then
+    if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
+        echo "WARNING: TLS_CERT=${TLS_CERT} or TLS_KEY=${TLS_KEY} not found on disk." 1>&2
+        echo "WARNING: Falling back to self-signed certificate at ${DEFAULT_TLS_CERT}." 1>&2
+        echo "WARNING: This is usually transient (Let's Encrypt issuance pending, or volume mount missing)." 1>&2
+        TLS_CERT="$DEFAULT_TLS_CERT"
+        TLS_KEY="$DEFAULT_TLS_KEY"
+    fi
+fi
+
+# Generate self-signed TLS cert at the default path if none exists.
+# Always done at the default location so the fallback above has something
+# to land on, even when TLS_CERT was set to a custom path.
+if [[ ! -f "$DEFAULT_TLS_CERT" ]]; then
     mkdir -p /etc/postfix/tls
     openssl req -new -x509 -days 3650 -nodes \
-        -out "$TLS_CERT" \
-        -keyout "$TLS_KEY" \
+        -out "$DEFAULT_TLS_CERT" \
+        -keyout "$DEFAULT_TLS_KEY" \
         -subj "/CN=${MYHOSTNAME}" 2>/dev/null
-    chmod 600 "$TLS_KEY"
+    chmod 600 "$DEFAULT_TLS_KEY"
     echo "Generated self-signed TLS certificate for ${MYHOSTNAME}"
 fi
 
 # Render postfix main.cf
 envsubst '$MYHOSTNAME $MYDOMAIN' < /opt/mx-box/postfix-main.cf.template > /etc/postfix/main.cf
+
+# Propagate TLS_CERT/TLS_KEY into Postfix. The template hardcodes the default
+# self-signed paths so the no-env-set case keeps working unchanged; postconf
+# overrides them when a caller has configured custom paths (or after the
+# fallback above).
+postconf -e "smtpd_tls_cert_file=${TLS_CERT}" "smtpd_tls_key_file=${TLS_KEY}"
 
 # Enable IP literal support (receive mail at user@[1.2.3.4] without DNS)
 if [[ "${ENABLE_IP_LITERAL:-false}" == "true" && -n "${IP_LITERAL:-}" ]]; then

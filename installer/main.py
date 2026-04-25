@@ -31,6 +31,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allowed-senders", default="", dest="allowed_senders")
     parser.add_argument("--allowed-recipients", default="", dest="allowed_recipients")
     parser.add_argument("--spoof-protection", default="off", dest="spoof_protection")
+    # TLS cert/key paths. install.sh --enable-letsencrypt issues the cert
+    # before the Python installer runs and forwards the paths via these
+    # flags so generate_env_content writes them into .env. Operators can
+    # also pass these directly with their own cert paths. Empty (the
+    # default) preserves the existing self-signed-at-startup behavior.
+    parser.add_argument("--tls-cert", default="", dest="tls_cert")
+    parser.add_argument("--tls-key", default="", dest="tls_key")
     parser.add_argument("--no-prompt", "-y", action="store_true", dest="no_prompt")
     parser.add_argument("--no-start", action="store_true", dest="no_start")
     parser.add_argument("--json", action="store_true", dest="json_output")
@@ -269,6 +276,8 @@ def configure(args: argparse.Namespace) -> dict:
         "allowed_senders": allowed_senders,
         "allowed_recipients": allowed_recipients,
         "spoof_protection": spoof_protection,
+        "tls_cert": args.tls_cert,
+        "tls_key": args.tls_key,
     }
 
 
@@ -286,6 +295,8 @@ def write_env(install_dir: str, cfg: dict) -> None:
         allowed_senders=cfg["allowed_senders"],
         allowed_recipients=cfg["allowed_recipients"],
         spoof_protection=cfg["spoof_protection"],
+        tls_cert=cfg.get("tls_cert", ""),
+        tls_key=cfg.get("tls_key", ""),
     )
     env_path = os.path.join(install_dir, ".env")
     with open(env_path, "w") as f:

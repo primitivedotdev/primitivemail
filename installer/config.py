@@ -64,8 +64,18 @@ def generate_env_content(
     allowed_senders: str,
     allowed_recipients: str,
     spoof_protection: str,
+    tls_cert: str = "",
+    tls_key: str = "",
 ) -> str:
-    """Generate .env file content. Unquoted values, one key per line."""
+    """Generate .env file content. Unquoted values, one key per line.
+
+    `tls_cert` / `tls_key` are optional. When empty (the default) the keys
+    are omitted from the output so the existing 13-line baseline shape and
+    the documented behavior of "auto-generate a self-signed cert at startup"
+    are unchanged. When set (e.g. by install.sh --enable-letsencrypt), the
+    paths are written and the milter entrypoint propagates them into the
+    running Postfix config via postconf.
+    """
     enable = "true" if enable_ip_literal else "false"
     lines = [
         f"MYHOSTNAME={hostname}",
@@ -82,6 +92,10 @@ def generate_env_content(
         "ALLOW_BOUNCES=true",
         f"SPOOF_PROTECTION={spoof_protection}",
     ]
+    if tls_cert:
+        lines.append(f"TLS_CERT={tls_cert}")
+    if tls_key:
+        lines.append(f"TLS_KEY={tls_key}")
     return "\n".join(lines) + "\n"
 
 

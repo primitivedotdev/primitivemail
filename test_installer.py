@@ -136,6 +136,39 @@ class TestGenerateEnvContent:
         assert '"' not in result
         assert "'" not in result
 
+    def test_tls_cert_and_key_omitted_when_empty(self):
+        # No TLS args = self-signed startup behavior; the keys must NOT
+        # appear in .env at all so docker-compose's `${TLS_CERT:-}` default
+        # leaves the env var empty and the milter entrypoint takes the
+        # default-path branch.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        assert "TLS_CERT" not in result
+        assert "TLS_KEY" not in result
+
+    def test_tls_cert_and_key_written_when_set(self):
+        # install.sh --enable-letsencrypt forwards real paths via --tls-cert
+        # and --tls-key. Pin that they reach .env verbatim so the milter
+        # entrypoint's postconf step picks them up.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            tls_cert="/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+            tls_key="/etc/letsencrypt/live/mx.example.com/privkey.pem",
+        )
+        assert "TLS_CERT=/etc/letsencrypt/live/mx.example.com/fullchain.pem" in result
+        assert "TLS_KEY=/etc/letsencrypt/live/mx.example.com/privkey.pem" in result
+
 
 # ===========================================================================
 # Config summary
@@ -1315,6 +1348,31 @@ class TestParseArgsImplications:
         )
         args = parse_args()
         assert args.skip_verify is True
+
+    def test_tls_cert_and_key_default_empty(self, monkeypatch):
+        # Default behavior: no TLS paths set, entrypoint generates the
+        # self-signed cert at startup (existing behavior).
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer"])
+        args = parse_args()
+        assert args.tls_cert == ""
+        assert args.tls_key == ""
+
+    def test_tls_cert_and_key_captured(self, monkeypatch):
+        # install.sh --enable-letsencrypt forwards these explicitly so
+        # generate_env_content can write them to .env.
+        from installer.main import parse_args
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "installer",
+                "--tls-cert", "/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+                "--tls-key", "/etc/letsencrypt/live/mx.example.com/privkey.pem",
+            ],
+        )
+        args = parse_args()
+        assert args.tls_cert == "/etc/letsencrypt/live/mx.example.com/fullchain.pem"
+        assert args.tls_key == "/etc/letsencrypt/live/mx.example.com/privkey.pem"
 
 
 # ===========================================================================
