@@ -31,16 +31,20 @@ services:
       - postfix-logs:/var/log              # Shared with postfix-exporter
       # Conditional Let's Encrypt mount. Pattern: bind ${LETSENCRYPT_HOST_DIR}
       # into /etc/letsencrypt, defaulting to /var/empty when the env var is
-      # unset. /var/empty exists on every Linux distro and is harmless to
+      # unset. /var/empty exists on most Linux distros and is harmless to
       # mount; install.sh --enable-letsencrypt sets LETSENCRYPT_HOST_DIR to
       # /etc/letsencrypt so the cert tree shows up inside the container.
       # Using an env-var default beats rewriting this file per install: a
       # committed compose file stays clean across `git pull` and operator
-      # upgrades.
+      # upgrades. `create_host_path: true` ensures the default /var/empty is
+      # created if absent on minimal hosts (Docker Engine 25+ no longer
+      # auto-creates bind-mount sources).
       - type: bind
         source: ${LETSENCRYPT_HOST_DIR:-/var/empty}
         target: /etc/letsencrypt
         read_only: true
+        bind:
+          create_host_path: true
 
   watcher:
     build:
