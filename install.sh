@@ -28,6 +28,7 @@ JSON_MODE=0
 ENABLE_LETSENCRYPT=0
 LE_EMAIL=""
 LE_HOSTNAME=""
+LE_SKIP_VERIFY=0
 # Track whether the operator explicitly passed --tls-cert/--tls-key on this
 # invocation. When they did, their value wins over any preservation logic;
 # when they did not, preserve_existing_tls_paths may forward whatever the
@@ -96,6 +97,14 @@ while [[ $# -gt 0 ]]; do
             LE_EMAIL="${1#--le-email=}"
             shift
             ;;
+        --le-skip-verify)
+            # Default behavior runs `certbot renew --dry-run` after issuance,
+            # which adds 10-20s and can fail transiently on flaky networks.
+            # Opt-out flag for CI runs and pipelines that already test renewal
+            # out-of-band.
+            LE_SKIP_VERIFY=1
+            shift
+            ;;
         --hostname)
             # Captured for the LE preflight, which needs to know the public
             # DNS name before we hand control to the Python installer.
@@ -155,6 +164,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --enable-letsencrypt      Issue a Let's Encrypt cert for --hostname during install."
             echo "                            Requires public DNS pointing at this host and inbound :80."
             echo "  --le-email EMAIL          ACME account email (required with --enable-letsencrypt)"
+            echo "  --le-skip-verify          Skip the post-issuance 'certbot renew --dry-run' check"
+            echo "                            (default keeps it on; opt out for CI / flaky networks)."
+            echo ""
+            echo "TLS (Bring your own cert):"
+            echo "  --tls-cert PATH           Absolute path to a TLS certificate file readable"
+            echo "                            inside the container (e.g. corporate CA-issued cert)."
+            echo "  --tls-key PATH            Absolute path to the matching private key."
+            echo "                            Mount these into the container yourself; install.sh"
+            echo "                            does not auto-bind volumes for non-LE paths."
             echo ""
             echo "Output:"
             echo "  --json                    NDJSON progress events on stdout, human output on stderr."
@@ -641,6 +659,10 @@ EOF
 }
 
 verify_renewal() {
+    if [[ "$LE_SKIP_VERIFY" == "1" ]]; then
+        info "Skipping certbot renew --dry-run (--le-skip-verify)"
+        return
+    fi
     info "Verifying renewal config (certbot renew --dry-run)..."
     if sudo certbot renew --dry-run >/dev/null 2>&1; then
         success "Renewal dry-run succeeded"

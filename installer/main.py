@@ -329,6 +329,7 @@ def print_config_summary(cfg: dict) -> None:
         allowed_recipients=cfg["allowed_recipients"],
         spoof_protection=cfg["spoof_protection"],
         observability_enabled=observability_enabled,
+        tls_cert=cfg.get("tls_cert", ""),
     )
     print()
     ui.step("Configuration summary")

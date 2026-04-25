@@ -124,6 +124,7 @@ def build_config_summary(
     allowed_recipients: str,
     spoof_protection: str,
     observability_enabled: bool = False,
+    tls_cert: str = "",
 ) -> list:
     """Build config summary as plain text lines (no ANSI).
 
@@ -173,7 +174,16 @@ def build_config_summary(
         "strict": "Strict (reject on any failure)",
     }
     lines.append(f"Spoof protection:  {spoof_labels.get(spoof_protection, 'Off')}")
-    lines.append("TLS:               Self-signed (auto-generated)")
+
+    # TLS line reflects whatever .env will declare. The container's
+    # entrypoint applies the same fallback at startup if the file is
+    # missing on disk, so the summary describes intent, not runtime state.
+    if not tls_cert:
+        lines.append("TLS:               Self-signed (auto-generated)")
+    elif tls_cert.startswith("/etc/letsencrypt/live/"):
+        lines.append(f"TLS:               Let's Encrypt ({tls_cert})")
+    else:
+        lines.append(f"TLS:               Custom ({tls_cert})")
 
     if observability_enabled:
         lines.append("Observability:     enabled (Alloy + postfix-exporter)")

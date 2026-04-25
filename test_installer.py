@@ -256,7 +256,7 @@ class TestBuildConfigSummary:
         assert "trusted.org" in text
         assert "ceo@big.com" in text
 
-    def test_tls_always_shown(self):
+    def test_tls_default_self_signed(self):
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
@@ -266,7 +266,39 @@ class TestBuildConfigSummary:
             spoof_protection="off",
         )
         text = "\n".join(lines)
+        assert "TLS:" in text
         assert "Self-signed" in text
+
+    def test_tls_letsencrypt_path_shown(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
+            allowed_senders="", allowed_recipients="",
+            spoof_protection="off",
+            tls_cert="/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+        )
+        text = "\n".join(lines)
+        assert "Let's Encrypt" in text
+        assert "/etc/letsencrypt/live/mx.example.com/fullchain.pem" in text
+        assert "Self-signed" not in text
+
+    def test_tls_custom_path_shown(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
+            allowed_senders="", allowed_recipients="",
+            spoof_protection="off",
+            tls_cert="/opt/corp-ca/fullchain.pem",
+        )
+        text = "\n".join(lines)
+        assert "Custom" in text
+        assert "/opt/corp-ca/fullchain.pem" in text
+        assert "Self-signed" not in text
+        assert "Let's Encrypt" not in text
 
 
 # ===========================================================================
