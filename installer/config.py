@@ -64,8 +64,24 @@ def generate_env_content(
     allowed_senders: str,
     allowed_recipients: str,
     spoof_protection: str,
+    tls_cert: str = "",
+    tls_key: str = "",
+    letsencrypt_host_dir: str = "",
 ) -> str:
-    """Generate .env file content. Unquoted values, one key per line."""
+    """Generate .env file content. Unquoted values, one key per line.
+
+    `tls_cert` / `tls_key` are optional. When empty (the default) the keys
+    are omitted from the output so the existing 13-line baseline shape and
+    the documented behavior of "auto-generate a self-signed cert at startup"
+    are unchanged. When set (e.g. by install.sh --enable-letsencrypt), the
+    paths are written and the milter entrypoint propagates them into the
+    running Postfix config via postconf.
+
+    `letsencrypt_host_dir` is the host path that docker-compose binds to
+    /etc/letsencrypt inside the container. When empty, the key is omitted
+    and docker-compose's `${LETSENCRYPT_HOST_DIR:-/var/empty}` default
+    mounts an empty directory — harmless and equivalent to no mount.
+    """
     enable = "true" if enable_ip_literal else "false"
     lines = [
         f"MYHOSTNAME={hostname}",
@@ -82,6 +98,12 @@ def generate_env_content(
         "ALLOW_BOUNCES=true",
         f"SPOOF_PROTECTION={spoof_protection}",
     ]
+    if tls_cert:
+        lines.append(f"TLS_CERT={tls_cert}")
+    if tls_key:
+        lines.append(f"TLS_KEY={tls_key}")
+    if letsencrypt_host_dir:
+        lines.append(f"LETSENCRYPT_HOST_DIR={letsencrypt_host_dir}")
     return "\n".join(lines) + "\n"
 
 
@@ -110,6 +132,7 @@ def build_config_summary(
     allowed_recipients: str,
     spoof_protection: str,
     observability_enabled: bool = False,
+    tls_cert: str = "",
 ) -> list:
     """Build config summary as plain text lines (no ANSI).
 
@@ -159,7 +182,16 @@ def build_config_summary(
         "strict": "Strict (reject on any failure)",
     }
     lines.append(f"Spoof protection:  {spoof_labels.get(spoof_protection, 'Off')}")
-    lines.append("TLS:               Self-signed (auto-generated)")
+
+    # TLS line reflects whatever .env will declare. The container's
+    # entrypoint applies the same fallback at startup if the file is
+    # missing on disk, so the summary describes intent, not runtime state.
+    if not tls_cert:
+        lines.append("TLS:               Self-signed (auto-generated)")
+    elif tls_cert.startswith("/etc/letsencrypt/live/"):
+        lines.append(f"TLS:               Let's Encrypt ({tls_cert})")
+    else:
+        lines.append(f"TLS:               Custom ({tls_cert})")
 
     if observability_enabled:
         lines.append("Observability:     enabled (Alloy + postfix-exporter)")

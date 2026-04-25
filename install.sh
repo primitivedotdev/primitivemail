@@ -25,6 +25,22 @@ NC='\033[0m'
 # while operators watching the terminal still see progress.
 
 JSON_MODE=0
+ENABLE_LETSENCRYPT=0
+LE_EMAIL=""
+LE_HOSTNAME=""
+LE_SKIP_VERIFY=0
+# Track whether the operator explicitly passed --tls-cert/--tls-key on this
+# invocation. When they did, their value wins over any preservation logic;
+# when they did not, preserve_existing_tls_paths may forward whatever the
+# previous run wrote into .env so re-running the installer without
+# --enable-letsencrypt does not silently wipe the existing TLS config.
+TLS_CERT_EXPLICIT=0
+TLS_KEY_EXPLICIT=0
+# Tracks whether the operator passed --letsencrypt-host-dir explicitly.
+# When set, their value wins over preservation logic; when unset,
+# preserve_existing_tls_paths may forward whatever .env already declares
+# (so a re-run does not silently drop the bind-mount path).
+LETSENCRYPT_HOST_DIR_EXPLICIT=0
 _ui_out() {
     if [[ "$JSON_MODE" == "1" ]]; then
         echo -e "$1" 1>&2
@@ -74,6 +90,69 @@ while [[ $# -gt 0 ]]; do
             FORWARD_ARGS+=("$1")
             shift
             ;;
+        --enable-letsencrypt)
+            ENABLE_LETSENCRYPT=1
+            shift
+            ;;
+        --le-email)
+            LE_EMAIL="$2"
+            shift 2
+            ;;
+        --le-email=*)
+            LE_EMAIL="${1#--le-email=}"
+            shift
+            ;;
+        --le-skip-verify)
+            # Default behavior runs `certbot renew --dry-run` after issuance,
+            # which adds 10-20s and can fail transiently on flaky networks.
+            # Opt-out flag for CI runs and pipelines that already test renewal
+            # out-of-band.
+            LE_SKIP_VERIFY=1
+            shift
+            ;;
+        --hostname)
+            # Captured for the LE preflight, which needs to know the public
+            # DNS name before we hand control to the Python installer.
+            # Still forwarded to Python so the existing flow is unchanged.
+            LE_HOSTNAME="$2"
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --hostname=*)
+            LE_HOSTNAME="${1#--hostname=}"
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+        --tls-cert)
+            TLS_CERT_EXPLICIT=1
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --tls-cert=*)
+            TLS_CERT_EXPLICIT=1
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+        --tls-key)
+            TLS_KEY_EXPLICIT=1
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --tls-key=*)
+            TLS_KEY_EXPLICIT=1
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+        --letsencrypt-host-dir)
+            LETSENCRYPT_HOST_DIR_EXPLICIT=1
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --letsencrypt-host-dir=*)
+            LETSENCRYPT_HOST_DIR_EXPLICIT=1
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
         --help|-h)
             echo "PrimitiveMail Installer"
             echo ""
@@ -95,6 +174,24 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Security:"
             echo "  --spoof-protection LEVEL  off|monitor|standard|strict (default: off)"
+            echo ""
+            echo "TLS (Let's Encrypt):"
+            echo "  --enable-letsencrypt      Issue a Let's Encrypt cert for --hostname during install."
+            echo "                            Requires public DNS pointing at this host and inbound :80."
+            echo "  --le-email EMAIL          ACME account email (required with --enable-letsencrypt)"
+            echo "  --le-skip-verify          Skip the post-issuance 'certbot renew --dry-run' check"
+            echo "                            (default keeps it on; opt out for CI / flaky networks)."
+            echo ""
+            echo "TLS (Bring your own cert):"
+            echo "  --tls-cert PATH           Absolute path to a TLS certificate file readable"
+            echo "                            inside the container (e.g. corporate CA-issued cert)."
+            echo "  --tls-key PATH            Absolute path to the matching private key."
+            echo "                            Mount these into the container yourself, or pass"
+            echo "                            --letsencrypt-host-dir to bind a cert tree."
+            echo "  --letsencrypt-host-dir PATH"
+            echo "                            Host directory bound read-only at /etc/letsencrypt"
+            echo "                            inside the container. Set automatically by"
+            echo "                            --enable-letsencrypt; useful for BYO cert layouts."
             echo ""
             echo "Output:"
             echo "  --json                    NDJSON progress events on stdout, human output on stderr."
@@ -286,25 +383,359 @@ check_docker() {
 # --- Firewall ------------------------------------------------------------
 
 open_firewall() {
+    # Always open 25/tcp for inbound SMTP. Also open 80/tcp when Let's
+    # Encrypt is enabled: certbot --standalone needs inbound :80 for the
+    # HTTP-01 challenge, and renewals every ~60 days hit the same port via
+    # the systemd timer. The :80 rule stays in place after issuance — it
+    # is required for renewal and operators sometimes use it for
+    # health-check endpoints. We do not tear it down on subsequent runs.
+    local ports=("25/tcp")
+    if [[ "$ENABLE_LETSENCRYPT" == "1" ]]; then
+        ports+=("80/tcp")
+    fi
+
     if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ! ufw status | grep -q "25/tcp"; then
-            info "Opening port 25 in UFW firewall..."
-            sudo ufw allow 25/tcp >/dev/null 2>&1
-            success "Port 25 opened in UFW"
-        else
-            success "Port 25 already open in UFW"
-        fi
+        for port in "${ports[@]}"; do
+            if ! ufw status | grep -q "$port"; then
+                info "Opening port $port in UFW firewall..."
+                sudo ufw allow "$port" >/dev/null 2>&1
+                success "Port $port opened in UFW"
+            else
+                success "Port $port already open in UFW"
+            fi
+        done
     fi
 
     if command -v firewall-cmd &> /dev/null && firewall-cmd --state 2>/dev/null | grep -q "running"; then
-        if ! firewall-cmd --list-ports 2>/dev/null | grep -q "25/tcp"; then
-            info "Opening port 25 in firewalld..."
-            sudo firewall-cmd --permanent --add-port=25/tcp >/dev/null 2>&1
-            sudo firewall-cmd --reload >/dev/null 2>&1
-            success "Port 25 opened in firewalld"
-        else
-            success "Port 25 already open in firewalld"
+        for port in "${ports[@]}"; do
+            if ! firewall-cmd --list-ports 2>/dev/null | grep -q "$port"; then
+                info "Opening port $port in firewalld..."
+                sudo firewall-cmd --permanent --add-port="$port" >/dev/null 2>&1
+                sudo firewall-cmd --reload >/dev/null 2>&1
+                success "Port $port opened in firewalld"
+            else
+                success "Port $port already open in firewalld"
+            fi
+        done
+    fi
+}
+
+# --- Let's Encrypt -------------------------------------------------------
+#
+# Optional, opt-in via --enable-letsencrypt. Issues a real cert with HTTP-01
+# (port 80), wires it into .env, mounts /etc/letsencrypt into the
+# primitivemail container, and installs a renewal deploy hook so postfix
+# picks up renewed certs without operator intervention. Re-running with the
+# flag is a no-op when a cert already exists at the target path.
+
+letsencrypt_validate_args() {
+    if [[ "$ENABLE_LETSENCRYPT" != "1" ]]; then
+        return
+    fi
+    if [[ -z "$LE_EMAIL" ]]; then
+        error "--enable-letsencrypt requires --le-email <address>"
+        detail "Let's Encrypt requires an account email for expiration notices."
+        exit 1
+    fi
+    if [[ -z "$LE_HOSTNAME" ]]; then
+        error "--enable-letsencrypt requires --hostname <fqdn>"
+        detail "The cert is issued for the public hostname of this mail server."
+        exit 1
+    fi
+}
+
+letsencrypt_preflight() {
+    step "Let's Encrypt preflight"
+
+    # Public DNS resolution of MYHOSTNAME. Without this the HTTP-01 challenge
+    # cannot succeed, and certbot will fail several minutes into the run.
+    local resolved=""
+    if command -v getent &> /dev/null; then
+        resolved="$(getent hosts "$LE_HOSTNAME" 2>/dev/null | awk '{print $1}' | head -1 || true)"
+    fi
+    if [[ -z "$resolved" ]] && command -v dig &> /dev/null; then
+        resolved="$(dig +short A "$LE_HOSTNAME" 2>/dev/null | head -1 || true)"
+    fi
+    if [[ -z "$resolved" ]] && command -v host &> /dev/null; then
+        resolved="$(host -t A "$LE_HOSTNAME" 2>/dev/null | awk '/has address/ {print $4}' | head -1 || true)"
+    fi
+    if [[ -z "$resolved" ]]; then
+        error "Could not resolve $LE_HOSTNAME via public DNS"
+        detail "Add an A record pointing $LE_HOSTNAME at this server's public IPv4 first."
+        exit 1
+    fi
+    success "DNS: $LE_HOSTNAME resolves to $resolved"
+
+    # Port 80 reachability. HTTP-01 needs inbound :80; certbot --standalone
+    # will bind it during issuance, so it must be free on the host AND
+    # reachable from the public internet. We can verify free-on-host
+    # directly; reachability we can only attempt via a self-loopback test
+    # which is best-effort (cloud firewalls block from the host itself in
+    # some setups), so a failure here is a warning, not a hard error.
+    if ss -tln 2>/dev/null | grep -qE ':80[[:space:]]' || netstat -tln 2>/dev/null | grep -qE ':80[[:space:]]'; then
+        error "Port 80 is already in use on this host"
+        detail "Certbot --standalone needs to bind :80 for the HTTP-01 challenge."
+        detail "Stop whatever is listening on :80 (nginx, apache, another container) and retry."
+        exit 1
+    fi
+    success "Port 80 is free on the host"
+
+    # Soft check on port 25; the install opens it via UFW/firewalld, but a
+    # cloud firewall in front of the box may still block it. Don't block on
+    # this; the post-install verify path is the authoritative test.
+    info "Port 25 is configured by the installer's firewall step; cloud security groups are out of scope here."
+}
+
+install_certbot() {
+    if command -v certbot &> /dev/null; then
+        success "certbot already installed"
+        return
+    fi
+
+    info "Installing certbot..."
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+    fi
+
+    if command -v dnf &> /dev/null; then
+        # Amazon Linux 2023, Fedora, RHEL 8+
+        sudo dnf install -y certbot >/dev/null 2>&1 || {
+            error "Failed to install certbot via dnf"
+            exit 1
+        }
+    elif command -v yum &> /dev/null; then
+        # Amazon Linux 2, RHEL 7. EPEL is required for certbot on AL2.
+        if [[ "${ID:-}" == "amzn" ]]; then
+            sudo amazon-linux-extras install -y epel >/dev/null 2>&1 || true
         fi
+        sudo yum install -y certbot >/dev/null 2>&1 || {
+            error "Failed to install certbot via yum"
+            detail "On Amazon Linux 2, ensure EPEL is enabled."
+            exit 1
+        }
+    elif command -v apt-get &> /dev/null; then
+        sudo apt-get update -qq >/dev/null 2>&1 || true
+        sudo apt-get install -y -qq certbot >/dev/null 2>&1 || {
+            error "Failed to install certbot via apt-get"
+            exit 1
+        }
+    else
+        error "No supported package manager found (dnf, yum, apt-get)"
+        detail "Install certbot manually and re-run with --enable-letsencrypt."
+        exit 1
+    fi
+    success "certbot installed"
+}
+
+issue_letsencrypt_cert() {
+    local cert_path="/etc/letsencrypt/live/${LE_HOSTNAME}/fullchain.pem"
+
+    if sudo test -f "$cert_path"; then
+        success "Existing Let's Encrypt cert found at $cert_path; skipping issuance"
+        return
+    fi
+
+    info "Issuing Let's Encrypt certificate for $LE_HOSTNAME..."
+    if ! sudo certbot certonly --standalone \
+        -d "$LE_HOSTNAME" \
+        -m "$LE_EMAIL" \
+        --non-interactive --agree-tos \
+        --preferred-challenges http; then
+        error "certbot failed to issue a certificate"
+        detail "Common causes: DNS not pointing at this host, port 80 blocked, rate limits."
+        detail "See /var/log/letsencrypt/letsencrypt.log for details."
+        exit 1
+    fi
+    success "Issued certificate for $LE_HOSTNAME"
+}
+
+forward_letsencrypt_paths() {
+    # Forward the LE cert paths to the Python installer via --tls-cert /
+    # --tls-key, and the host directory that docker-compose should bind to
+    # /etc/letsencrypt via --letsencrypt-host-dir. The Python installer's
+    # generate_env_content writes all three into .env, which docker-compose
+    # reads to populate TLS_CERT / TLS_KEY and resolve the bind-mount source
+    # via the LETSENCRYPT_HOST_DIR env-var default in the volumes block.
+    # Doing it via the Python installer (instead of appending lines to .env
+    # after the fact) avoids the Python installer's write_env clobbering
+    # these values during normal operation.
+    local cert_path="/etc/letsencrypt/live/${LE_HOSTNAME}/fullchain.pem"
+    local key_path="/etc/letsencrypt/live/${LE_HOSTNAME}/privkey.pem"
+    FORWARD_ARGS+=(
+        "--tls-cert" "$cert_path"
+        "--tls-key" "$key_path"
+        "--letsencrypt-host-dir" "/etc/letsencrypt"
+    )
+    success "Forwarding TLS_CERT=$cert_path to installer"
+}
+
+install_renewal_hook() {
+    # Renewal deploy hook: certbot runs this after a successful renewal. We
+    # reload postfix in the running container so the new cert chain is read
+    # without dropping any in-flight SMTP connections.
+    #
+    # Implementation note: we use `docker exec primitivemail postfix reload`
+    # rather than `docker compose exec ...`. This sidesteps the compose
+    # v1/v2 split (older `docker-compose` boxes are still in the wild and
+    # check_docker accepts them) and removes the `cd ${INSTALL_DIR}`
+    # dependency, which was fragile if the operator later moved the install
+    # dir. The container_name `primitivemail` is hardcoded in
+    # docker-compose.yml, so addressing it directly is stable.
+    #
+    # Operator-edit safety: every hook we write carries the marker
+    # "Managed by primitivemail" in its header. On re-run, if the file
+    # exists but lacks the marker, we assume the operator hand-edited the
+    # hook and we leave it alone (printing a warning). Re-running with a
+    # marker-bearing hook overwrites it freely so future installer changes
+    # to the hook body propagate.
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    local hook_path="${hook_dir}/reload-postfix.sh"
+    local marker="Managed by primitivemail"
+
+    if sudo test -f "$hook_path" && ! sudo grep -q "$marker" "$hook_path"; then
+        warn "Existing renewal hook at $hook_path has no '$marker' marker; leaving it alone"
+        detail "Delete the file or restore the marker comment to let install.sh refresh it."
+        return
+    fi
+
+    sudo mkdir -p "$hook_dir"
+    sudo tee "$hook_path" > /dev/null <<'EOF'
+#!/bin/bash
+# Managed by primitivemail install.sh --enable-letsencrypt.
+# Reload postfix in the primitivemail container after Let's Encrypt renews.
+# Re-run install.sh --enable-letsencrypt to refresh this file. If you need
+# to customize it, remove the "Managed by primitivemail" marker line above
+# and the installer will leave your edits in place on subsequent runs.
+set -e
+
+# Distinguish "docker daemon down" from "container intentionally stopped".
+# The former should fail loudly so certbot's hook-failure surface catches
+# the misconfiguration; the latter should exit 0 because the cert renewed
+# fine and the operator chose to keep the container down.
+if ! docker info >/dev/null 2>&1; then
+    echo "reload-postfix.sh: docker daemon unreachable; postfix reload skipped" 1>&2
+    exit 1
+fi
+
+# `docker container inspect` is preferred over `docker ps -q -f` here:
+# the latter returns success even when the filter matches nothing.
+state="$(docker container inspect -f '{{.State.Running}}' primitivemail 2>/dev/null || true)"
+if [[ "$state" != "true" ]]; then
+    # Container does not exist or is stopped. Treat as intentional and exit 0.
+    exit 0
+fi
+
+docker exec primitivemail postfix reload
+EOF
+    sudo chmod +x "$hook_path"
+    success "Installed renewal hook at $hook_path"
+}
+
+verify_renewal() {
+    if [[ "$LE_SKIP_VERIFY" == "1" ]]; then
+        info "Skipping certbot renew --dry-run (--le-skip-verify)"
+        return
+    fi
+    info "Verifying renewal config (certbot renew --dry-run)..."
+    if sudo certbot renew --dry-run >/dev/null 2>&1; then
+        success "Renewal dry-run succeeded"
+    else
+        warn "Renewal dry-run reported issues. Run 'sudo certbot renew --dry-run' to investigate."
+    fi
+}
+
+setup_letsencrypt() {
+    if [[ "$ENABLE_LETSENCRYPT" != "1" ]]; then
+        return
+    fi
+    spacer
+    letsencrypt_preflight
+    install_certbot
+    issue_letsencrypt_cert
+    forward_letsencrypt_paths
+    install_renewal_hook
+    verify_renewal
+    spacer
+}
+
+# Preserve TLS_CERT / TLS_KEY / LETSENCRYPT_HOST_DIR across re-runs.
+#
+# The Python installer's write_env recreates .env from CLI args every run, so
+# an operator who set up Let's Encrypt last week and re-runs install.sh
+# (without --enable-letsencrypt and without explicit --tls-cert/--tls-key/
+# --letsencrypt-host-dir) would otherwise see those values silently dropped
+# from .env. The container would fall back to the self-signed cert on the
+# next restart, and the docker-compose LETSENCRYPT_HOST_DIR default would
+# bind /var/empty over /etc/letsencrypt.
+#
+# Behavior (each of cert / key / host_dir is evaluated INDEPENDENTLY so
+# passing only one of the flags does not silently drop the unflagged ones):
+#   - If --enable-letsencrypt is set, forward_letsencrypt_paths handles the
+#     forwarding and we do nothing here. LE owns all three.
+#   - For each of cert / key / host_dir independently:
+#       * If the corresponding --tls-cert / --tls-key /
+#         --letsencrypt-host-dir flag was explicit on this invocation,
+#         the operator's choice wins; do not preserve that side. Explicit
+#         empty string still counts as explicit (the operator is asking to
+#         clear that value), so we do not preserve over an empty arg.
+#       * Otherwise, if the existing .env value points at a file/dir that
+#         exists on disk, forward it via the matching --... flag.
+#
+# Pairing correctness (matching cert + key) is NOT enforced here; it never
+# was. An operator who passes --tls-cert /new/cert without --tls-key will
+# end up with /new/cert paired with the preserved old key, which may not
+# verify. That is the same contract as before this fix: install.sh
+# preserves values, the operator owns coherence between them.
+preserve_existing_tls_paths() {
+    if [[ "$ENABLE_LETSENCRYPT" == "1" ]]; then
+        return
+    fi
+    local env_path="${INSTALL_DIR}/.env"
+    if [[ ! -f "$env_path" ]]; then
+        return
+    fi
+
+    # `|| true` on the pipeline tail is load-bearing: under `set -euo
+    # pipefail`, grep's exit-1-on-no-match would propagate up and abort the
+    # script. Old installs predating this PR have a .env with no TLS_CERT /
+    # TLS_KEY lines at all, which is exactly the no-match case; without the
+    # guard, the first re-install on those boxes exits before reaching the
+    # Python installer.
+    local existing_cert existing_key existing_host_dir
+    existing_cert="$(grep -E '^TLS_CERT=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    existing_key="$(grep -E '^TLS_KEY=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    existing_host_dir="$(grep -E '^LETSENCRYPT_HOST_DIR=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+
+    # Use sudo for the on-disk check because /etc/letsencrypt/live/<host>/
+    # is mode 700 root:root by default; a non-root operator running
+    # install.sh under sudo would otherwise see the file as missing and we
+    # would silently drop the LE config.
+    local preserved_cert=""
+    local preserved_key=""
+    local preserved_host_dir=""
+
+    if [[ "$TLS_CERT_EXPLICIT" != "1" && -n "$existing_cert" ]] && sudo test -f "$existing_cert"; then
+        FORWARD_ARGS+=("--tls-cert" "$existing_cert")
+        preserved_cert="$existing_cert"
+    fi
+
+    if [[ "$TLS_KEY_EXPLICIT" != "1" && -n "$existing_key" ]] && sudo test -f "$existing_key"; then
+        FORWARD_ARGS+=("--tls-key" "$existing_key")
+        preserved_key="$existing_key"
+    fi
+
+    # LETSENCRYPT_HOST_DIR is the bind-mount source resolved by docker-compose
+    # at start time. Preserve independently so an operator who set up LE
+    # previously does not lose the cert mount on a re-run that omits the
+    # flag. Existence check uses sudo for the same reason as cert/key above.
+    if [[ "$LETSENCRYPT_HOST_DIR_EXPLICIT" != "1" && -n "$existing_host_dir" ]] && sudo test -d "$existing_host_dir"; then
+        FORWARD_ARGS+=("--letsencrypt-host-dir" "$existing_host_dir")
+        preserved_host_dir="$existing_host_dir"
+    fi
+
+    if [[ -n "$preserved_cert" || -n "$preserved_key" || -n "$preserved_host_dir" ]]; then
+        info "Preserving existing TLS config: cert=${preserved_cert:-<unchanged>}, key=${preserved_key:-<unchanged>}, host_dir=${preserved_host_dir:-<unchanged>}"
     fi
 }
 
@@ -456,6 +887,10 @@ main() {
         run_preflight
     fi
 
+    # Validate Let's Encrypt args early so an obviously bad invocation
+    # fails before we install Docker / open the firewall / clone the repo.
+    letsencrypt_validate_args
+
     print_banner
     check_docker
     open_firewall
@@ -464,6 +899,19 @@ main() {
     INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
     export PRIMITIVEMAIL_DIR="$INSTALL_DIR"
     cd "$INSTALL_DIR"
+
+    # Let's Encrypt provisioning runs after the clone (so docker-compose.yml
+    # exists for the mount injection) but before the Python installer
+    # (so the .env we write is the one the Python installer extends, and so
+    # the cert is in place by the time `docker compose up` reads .env).
+    setup_letsencrypt
+
+    # If --enable-letsencrypt was not on the CLI this run but an existing
+    # .env already declares a TLS_CERT path that exists on disk, forward
+    # those paths so the re-run does not silently drop the previous run's
+    # TLS config. setup_letsencrypt's own forward_letsencrypt_paths short-
+    # circuits the preservation path when it already added --tls-cert.
+    preserve_existing_tls_paths
 
     if [[ ! -d "installer" ]]; then
         error "Installer package not found. Your copy may be outdated."

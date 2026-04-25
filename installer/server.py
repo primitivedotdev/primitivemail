@@ -418,6 +418,56 @@ def start_server(
             ui.json_event("step", name="port25_check", status="warn", reachability="closed_local")
 
 
+def verify_tls_readable_in_container(tls_cert: str, tls_key: str) -> Optional[bool]:
+    """Confirm the running primitivemail container can read the TLS files.
+
+    --enable-letsencrypt mounts /etc/letsencrypt:ro into the container and
+    points TLS_CERT/TLS_KEY at the live/<host>/ paths. The expected mode is
+    644 root for fullchain.pem and 640 root:postfix for privkey.pem (via
+    LE's pre-existing groups-of-postfix machinery), so the in-container
+    Postfix process should be able to read both. If a future certbot
+    permission change drifts that, the container falls back to self-signed
+    silently. This smoke check makes the breakage visible at install time.
+
+    Returns True on read OK, False on read FAIL, None when we cannot run
+    the check (custom paths the operator manages, container not addressable
+    by name, etc.). False is reported as a warning, not a fatal: the
+    install otherwise completed and the operator may want to keep going.
+    """
+    if not tls_cert or not tls_key:
+        return None
+    docker = _docker_cmd()
+    failures = []
+    for path in (tls_cert, tls_key):
+        try:
+            r = subprocess.run(
+                docker + ["exec", "primitivemail", "test", "-r", path],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            return None
+        if r.returncode != 0:
+            failures.append(path)
+    if failures:
+        ui.warn(
+            "TLS readability check failed inside the container for: "
+            + ", ".join(failures)
+        )
+        ui.info(
+            "Postfix may fall back to its self-signed cert at startup. "
+            "Check ownership/permissions on the host and that "
+            "/etc/letsencrypt is mounted into the container."
+        )
+        ui.json_event(
+            "step", name="tls_readable", status="warn",
+            unreadable=failures,
+        )
+        return False
+    ui.success("TLS cert and key are readable inside the primitivemail container")
+    ui.json_event("step", name="tls_readable", status="ok")
+    return True
+
+
 def _ensure_local_bin_on_path() -> None:
     """Ensure ~/.local/bin exists and is on PATH (current session + shell configs)."""
     local_bin = os.path.expanduser("~/.local/bin")

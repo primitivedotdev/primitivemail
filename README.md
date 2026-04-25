@@ -62,6 +62,43 @@ primitive emails test
 
 `primitive.dev` sends a test email to your claimed subdomain and the CLI waits for it to land in the local journal (default 30s). A successful run exercises DNS, inbound port 25, postfix, the watcher, and the journal writer in one call.
 
+### TLS
+
+By default, Postfix uses an auto-generated self-signed certificate, which is fine for receiving mail (most senders accept any cert on port 25). If you want a publicly trusted certificate, you have two options.
+
+**Let's Encrypt** (issued during install):
+
+```bash
+curl -fsSL https://get.primitive.dev | bash -s -- \
+  --hostname mx.example.com \
+  --domain example.com \
+  --enable-letsencrypt --le-email you@example.com
+```
+
+Prerequisites:
+
+- Public DNS A record for `--hostname` pointing at this server's IPv4.
+- Inbound TCP 80 reachable (HTTP-01 challenge). The installer opens it in UFW or firewalld where active. Cloud security groups are out of scope; open them yourself.
+- The hostname in DNS must match `--hostname`.
+
+The installer issues the cert with certbot's `--standalone` plugin, writes `LETSENCRYPT_HOST_DIR=/etc/letsencrypt` to `.env` so `docker-compose` bind-mounts the host's cert tree read-only into the container, sets `TLS_CERT` and `TLS_KEY` in `.env`, and installs a deploy hook at `/etc/letsencrypt/renewal-hooks/deploy/reload-postfix.sh` that reloads Postfix after every renewal. Renewals run automatically through certbot's systemd timer; no operator action is required.
+
+The committed `docker-compose.yml` is never modified by the installer. The bind mount uses `${LETSENCRYPT_HOST_DIR:-/var/empty}` so an unset value mounts an empty directory (a harmless no-op), and `git pull` updates stay clean across re-installs.
+
+Add `--le-skip-verify` to skip the post-issuance `certbot renew --dry-run` (saves 10-20s on slow / CI networks).
+
+**Bring your own cert** (corporate CA, hand-managed bundle):
+
+```bash
+curl -fsSL https://get.primitive.dev | bash -s -- \
+  --tls-cert /opt/certs/fullchain.pem \
+  --tls-key  /opt/certs/privkey.pem
+```
+
+Mount the cert files into the container yourself, or pass `--letsencrypt-host-dir <path>` so `docker-compose` bind-mounts your cert directory at `/etc/letsencrypt` read-only. The same paths must be readable by the running container.
+
+Re-running `install.sh` later without `--enable-letsencrypt` or `--tls-cert` preserves the existing TLS configuration when the file at `TLS_CERT` still exists on disk.
+
 ## Running on AWS (EC2, Lightsail)
 
 PrimitiveMail works fine on AWS for its stated use case. Two things to know:

@@ -136,6 +136,69 @@ class TestGenerateEnvContent:
         assert '"' not in result
         assert "'" not in result
 
+    def test_tls_cert_and_key_omitted_when_empty(self):
+        # No TLS args = self-signed startup behavior; the keys must NOT
+        # appear in .env at all so docker-compose's `${TLS_CERT:-}` default
+        # leaves the env var empty and the milter entrypoint takes the
+        # default-path branch.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        assert "TLS_CERT" not in result
+        assert "TLS_KEY" not in result
+
+    def test_tls_cert_and_key_written_when_set(self):
+        # install.sh --enable-letsencrypt forwards real paths via --tls-cert
+        # and --tls-key. Pin that they reach .env verbatim so the milter
+        # entrypoint's postconf step picks them up.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            tls_cert="/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+            tls_key="/etc/letsencrypt/live/mx.example.com/privkey.pem",
+        )
+        assert "TLS_CERT=/etc/letsencrypt/live/mx.example.com/fullchain.pem" in result
+        assert "TLS_KEY=/etc/letsencrypt/live/mx.example.com/privkey.pem" in result
+
+    def test_letsencrypt_host_dir_omitted_when_empty(self):
+        # No host dir = docker-compose's `${LETSENCRYPT_HOST_DIR:-/var/empty}`
+        # default kicks in and the bind mount points at an empty directory,
+        # which is a harmless no-op. The key must NOT appear so re-runs
+        # without --letsencrypt-host-dir do not lock in a stale value.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        assert "LETSENCRYPT_HOST_DIR" not in result
+
+    def test_letsencrypt_host_dir_written_when_set(self):
+        # install.sh --enable-letsencrypt forwards --letsencrypt-host-dir
+        # /etc/letsencrypt so docker-compose's bind-mount source resolves
+        # to the host's cert tree.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            letsencrypt_host_dir="/etc/letsencrypt",
+        )
+        assert "LETSENCRYPT_HOST_DIR=/etc/letsencrypt" in result
+
 
 # ===========================================================================
 # Config summary
@@ -223,7 +286,7 @@ class TestBuildConfigSummary:
         assert "trusted.org" in text
         assert "ceo@big.com" in text
 
-    def test_tls_always_shown(self):
+    def test_tls_default_self_signed(self):
         lines = build_config_summary(
             hostname="mx.example.com", domain="example.com",
             ip_literal="", has_domain=True,
@@ -233,7 +296,39 @@ class TestBuildConfigSummary:
             spoof_protection="off",
         )
         text = "\n".join(lines)
+        assert "TLS:" in text
         assert "Self-signed" in text
+
+    def test_tls_letsencrypt_path_shown(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
+            allowed_senders="", allowed_recipients="",
+            spoof_protection="off",
+            tls_cert="/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+        )
+        text = "\n".join(lines)
+        assert "Let's Encrypt" in text
+        assert "/etc/letsencrypt/live/mx.example.com/fullchain.pem" in text
+        assert "Self-signed" not in text
+
+    def test_tls_custom_path_shown(self):
+        lines = build_config_summary(
+            hostname="mx.example.com", domain="example.com",
+            ip_literal="", has_domain=True,
+            webhook_url="", event_webhook_url="",
+            allowed_sender_domains="",
+            allowed_senders="", allowed_recipients="",
+            spoof_protection="off",
+            tls_cert="/opt/corp-ca/fullchain.pem",
+        )
+        text = "\n".join(lines)
+        assert "Custom" in text
+        assert "/opt/corp-ca/fullchain.pem" in text
+        assert "Self-signed" not in text
+        assert "Let's Encrypt" not in text
 
 
 # ===========================================================================
@@ -1316,6 +1411,52 @@ class TestParseArgsImplications:
         args = parse_args()
         assert args.skip_verify is True
 
+    def test_tls_cert_and_key_default_empty(self, monkeypatch):
+        # Default behavior: no TLS paths set, entrypoint generates the
+        # self-signed cert at startup (existing behavior).
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer"])
+        args = parse_args()
+        assert args.tls_cert == ""
+        assert args.tls_key == ""
+
+    def test_tls_cert_and_key_captured(self, monkeypatch):
+        # install.sh --enable-letsencrypt forwards these explicitly so
+        # generate_env_content can write them to .env.
+        from installer.main import parse_args
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "installer",
+                "--tls-cert", "/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+                "--tls-key", "/etc/letsencrypt/live/mx.example.com/privkey.pem",
+            ],
+        )
+        args = parse_args()
+        assert args.tls_cert == "/etc/letsencrypt/live/mx.example.com/fullchain.pem"
+        assert args.tls_key == "/etc/letsencrypt/live/mx.example.com/privkey.pem"
+
+    def test_letsencrypt_host_dir_default_empty(self, monkeypatch):
+        # Default behavior: no host dir set, docker-compose's
+        # ${LETSENCRYPT_HOST_DIR:-/var/empty} default mounts a harmless
+        # empty directory and the container does not see a cert tree.
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer"])
+        args = parse_args()
+        assert args.letsencrypt_host_dir == ""
+
+    def test_letsencrypt_host_dir_captured(self, monkeypatch):
+        # install.sh --enable-letsencrypt forwards --letsencrypt-host-dir
+        # /etc/letsencrypt so generate_env_content writes the value to
+        # .env and docker-compose binds the host cert tree at start time.
+        from installer.main import parse_args
+        monkeypatch.setattr(
+            "sys.argv",
+            ["installer", "--letsencrypt-host-dir", "/etc/letsencrypt"],
+        )
+        args = parse_args()
+        assert args.letsencrypt_host_dir == "/etc/letsencrypt"
+
 
 # ===========================================================================
 # _observability_is_enabled helper
@@ -1604,3 +1745,334 @@ class TestRunWithProgressNonTty:
         assert "Building failed" in combined
         assert "tail_line_one" in combined
         assert "tail_line_two" in combined
+
+
+# ===========================================================================
+# preserve_existing_tls_paths (install.sh)
+# ===========================================================================
+#
+# Subprocess-driven tests of the bash function that re-forwards TLS_CERT /
+# TLS_KEY from a previous .env into the Python installer when the operator
+# re-runs install.sh without explicit --tls-cert / --tls-key. The regression
+# we are guarding is "asymmetric dropping": passing only one of the two
+# flags used to early-return and silently drop the unflagged partner.
+
+class TestPreserveExistingTlsPaths:
+    INSTALL_SH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "install.sh",
+    )
+
+    def _setup_paths(self, tmp_path, *, create_cert=True, create_key=True):
+        """Create install dir, cert/key tmpfiles. Returns (install_dir,
+        cert_path, key_path). install_dir is unique per call so tests can
+        invoke this multiple times."""
+        import uuid
+        install_dir = tmp_path / f"install-{uuid.uuid4().hex[:8]}"
+        install_dir.mkdir()
+        cert_path = install_dir / "cert.pem"
+        key_path = install_dir / "key.pem"
+        if create_cert:
+            cert_path.write_text("fake-cert")
+        if create_key:
+            key_path.write_text("fake-key")
+        return install_dir, str(cert_path), str(key_path)
+
+    def _env(self, cert=None, key=None, host_dir=None):
+        # Render a minimal .env with TLS_CERT / TLS_KEY / LETSENCRYPT_HOST_DIR
+        # lines. Each is independently optional so tests can probe each
+        # preservation branch in isolation.
+        lines = ["SOMETHING=other"]
+        if cert is not None:
+            lines.append(f"TLS_CERT={cert}")
+        if key is not None:
+            lines.append(f"TLS_KEY={key}")
+        if host_dir is not None:
+            lines.append(f"LETSENCRYPT_HOST_DIR={host_dir}")
+        return "\n".join(lines) + "\n"
+
+    def _invoke(self, install_dir, *, env_contents,
+                tls_cert_explicit="0", tls_key_explicit="0",
+                letsencrypt_host_dir_explicit="0", enable_le="0"):
+        """Source install.sh (with trailing `main` call stripped), stub
+        sudo to passthrough, set globals, call the function, and emit
+        FORWARD_ARGS one-per-line on stdout.
+
+        Returns (returncode, forward_args_list, stderr).
+        """
+        import subprocess
+        (install_dir / ".env").write_text(env_contents)
+
+        # Strip the trailing bare `main` so sourcing does not run the full
+        # installer.
+        script = f"""
+set -e
+src="$(sed -e 's/^main$/: # stripped for testing/' {self.INSTALL_SH!r})"
+sudo() {{ command "$@"; }}
+export -f sudo
+eval "$src"
+INSTALL_DIR={str(install_dir)!r}
+TLS_CERT_EXPLICIT={tls_cert_explicit!r}
+TLS_KEY_EXPLICIT={tls_key_explicit!r}
+LETSENCRYPT_HOST_DIR_EXPLICIT={letsencrypt_host_dir_explicit!r}
+ENABLE_LETSENCRYPT={enable_le!r}
+FORWARD_ARGS=()
+preserve_existing_tls_paths >/dev/null 2>&1
+# Guard the FORWARD_ARGS expansion with the standard `[@]+...` idiom so an
+# empty array does not produce a single empty element under `set -u` / the
+# default printf-with-no-args repeats one empty line.
+if [[ ${{#FORWARD_ARGS[@]}} -gt 0 ]]; then
+    printf 'FORWARD_ARG: %s\\n' "${{FORWARD_ARGS[@]}}"
+fi
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+        )
+        forward_args = [
+            line[len("FORWARD_ARG: "):]
+            for line in result.stdout.splitlines()
+            if line.startswith("FORWARD_ARG: ")
+        ]
+        return result.returncode, forward_args, result.stderr
+
+    def test_only_tls_cert_explicit_preserves_existing_tls_key(self, tmp_path):
+        # Operator passed --tls-cert /new/cert without --tls-key. The old
+        # TLS_KEY from .env must still be forwarded; previously the early
+        # return dropped it and Postfix fell back to self-signed.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_cert_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        # Cert side: NOT preserved (operator is providing one explicitly).
+        assert "--tls-cert" not in args
+        # Key side: preserved from .env.
+        assert "--tls-key" in args
+        assert args[args.index("--tls-key") + 1] == key
+
+    def test_only_tls_key_explicit_preserves_existing_tls_cert(self, tmp_path):
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_key_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-key" not in args
+        assert "--tls-cert" in args
+        assert args[args.index("--tls-cert") + 1] == cert
+
+    def test_both_explicit_preserves_neither(self, tmp_path):
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_cert_explicit="1", tls_key_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" not in args
+        assert "--tls-key" not in args
+
+    def test_neither_explicit_preserves_both(self, tmp_path):
+        # Existing behavior: re-running install.sh with no TLS flags
+        # should forward both .env values when both files exist on disk.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" in args and "--tls-key" in args
+        assert args[args.index("--tls-cert") + 1] == cert
+        assert args[args.index("--tls-key") + 1] == key
+
+    def test_enable_letsencrypt_short_circuits(self, tmp_path):
+        # LE owns both cert and key via forward_letsencrypt_paths; this
+        # function must do nothing when --enable-letsencrypt is set, even
+        # if .env already declares paths.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            enable_le="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert args == []
+
+    def test_cert_file_missing_skips_only_cert(self, tmp_path):
+        # Cert path in .env points at a file that no longer exists; the
+        # cert side is NOT preserved (we will not forward a path that
+        # docker-compose cannot mount), but the key side is checked
+        # independently and preserved when its file is present.
+        install_dir, cert, key = self._setup_paths(tmp_path, create_cert=False)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" not in args
+        assert "--tls-key" in args
+
+    def test_explicit_empty_cert_preserves_only_key(self, tmp_path):
+        # Pinning the explicit-empty-string contract: if the operator
+        # passed --tls-cert "" (TLS_CERT_EXPLICIT=1, intent: clear it),
+        # the cert side is not preserved. The key side is independent and
+        # is still preserved from .env when its file exists. This is a
+        # behavior change from the old "either explicit -> drop both"
+        # logic; nail it down so future regressions show up.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_cert_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" not in args
+        assert "--tls-key" in args
+
+    def test_letsencrypt_host_dir_preserved_when_dir_exists(self, tmp_path):
+        # Re-run path: existing .env declares LETSENCRYPT_HOST_DIR pointing
+        # at a real directory on disk; we must forward it via
+        # --letsencrypt-host-dir so the mount source survives the .env
+        # rewrite the Python installer does.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        host_dir = install_dir / "letsencrypt-tree"
+        host_dir.mkdir()
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(cert=cert, key=key, host_dir=str(host_dir)),
+        )
+        assert rc == 0, err
+        assert "--letsencrypt-host-dir" in args
+        assert args[args.index("--letsencrypt-host-dir") + 1] == str(host_dir)
+
+    def test_letsencrypt_host_dir_not_preserved_when_dir_missing(self, tmp_path):
+        # If the dir from .env no longer exists on disk, do not forward it;
+        # docker-compose would fail to mount a non-existent path.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(
+                cert=cert, key=key,
+                host_dir=str(install_dir / "does-not-exist"),
+            ),
+        )
+        assert rc == 0, err
+        assert "--letsencrypt-host-dir" not in args
+
+    def test_letsencrypt_host_dir_explicit_skips_preservation(self, tmp_path):
+        # When the operator passes --letsencrypt-host-dir explicitly, the
+        # CLI value wins and we do not preserve the .env value on top.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        host_dir = install_dir / "letsencrypt-tree"
+        host_dir.mkdir()
+        rc, args, err = self._invoke(
+            install_dir,
+            letsencrypt_host_dir_explicit="1",
+            env_contents=self._env(cert=cert, key=key, host_dir=str(host_dir)),
+        )
+        assert rc == 0, err
+        # Cert/key still preserved (they have their own explicit flags),
+        # but the host dir is left to whatever the CLI flag carried.
+        assert "--letsencrypt-host-dir" not in args
+
+    def test_env_without_tls_lines_does_not_crash_under_pipefail(self, tmp_path):
+        # Regression: install.sh runs under `set -euo pipefail`. When .env
+        # has neither TLS_CERT= nor TLS_KEY= lines (e.g. an old install
+        # predating the TLS env-var support), `grep` returns 1 on no-match
+        # and the pipeline's non-zero status would abort the script before
+        # reaching the Python installer. The fix appends `|| true` to each
+        # pipeline; this test pins it.
+        install_dir, _, _ = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents="SOMETHING=other\nUNRELATED=value\n",
+        )
+        assert rc == 0, err
+        assert args == []
+
+
+# ===========================================================================
+# verify_tls_readable_in_container: post-start cert readability smoke check
+# ===========================================================================
+
+class TestVerifyTlsReadableInContainer:
+    """When --enable-letsencrypt (or any custom TLS path) is used, confirm
+    the running container can read the cert + key. The check shells out to
+    `docker exec primitivemail test -r <path>` for each file and emits a
+    warning (not an error) on failure — install can otherwise have completed
+    cleanly."""
+
+    def setup_method(self):
+        from installer import server
+        server._DOCKER_CMD_CACHED = None
+
+    def test_returns_none_when_paths_empty(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+        assert server.verify_tls_readable_in_container("", "") is None
+
+    def test_returns_true_when_both_readable(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+
+        calls = []
+
+        class FakeProc:
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(server.subprocess, "run", fake_run)
+        result = server.verify_tls_readable_in_container(
+            "/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+            "/etc/letsencrypt/live/mx.example.com/privkey.pem",
+        )
+        assert result is True
+        # Two `docker exec primitivemail test -r ...` calls, one per path.
+        assert len(calls) == 2
+        for cmd in calls:
+            assert cmd[0] == "docker"
+            assert "exec" in cmd
+            assert "primitivemail" in cmd
+            assert "test" in cmd
+
+    def test_returns_false_when_one_unreadable(self, monkeypatch):
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+
+        class FakeProc:
+            def __init__(self, rc):
+                self.returncode = rc
+
+        # First call (cert) succeeds, second (key) fails.
+        results = iter([FakeProc(0), FakeProc(1)])
+
+        def fake_run(cmd, **kwargs):
+            return next(results)
+
+        monkeypatch.setattr(server.subprocess, "run", fake_run)
+        result = server.verify_tls_readable_in_container(
+            "/etc/letsencrypt/live/mx.example.com/fullchain.pem",
+            "/etc/letsencrypt/live/mx.example.com/privkey.pem",
+        )
+        assert result is False
+
+    def test_returns_none_when_subprocess_raises(self, monkeypatch):
+        # Container not addressable, docker socket missing — fall back to
+        # None (skipped) rather than raising or reporting False.
+        from installer import server
+        monkeypatch.setenv("DOCKER_CMD", "docker")
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError("no docker")
+
+        monkeypatch.setattr(server.subprocess, "run", fake_run)
+        result = server.verify_tls_readable_in_container(
+            "/path/cert.pem", "/path/key.pem",
+        )
+        assert result is None
+
