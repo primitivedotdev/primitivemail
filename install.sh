@@ -670,8 +670,16 @@ ensure_certbot_timer_enabled() {
 # it says nothing about whether anything is scheduled to call renew.
 verify_renewal_timer() {
     local next
+    # NOTE: do not use `awk '... ; exit'` here. When awk exits after the
+    # first match it closes the pipe; systemctl then takes SIGPIPE and
+    # returns 141. Combined with `set -euo pipefail` at the top of this
+    # script, that 141 propagates and aborts the entire installer
+    # mid-run, after the timer is enabled but before the Python
+    # installer step gets to write .env or start the container.
+    # Read all of systemctl's output and pick the first matching line
+    # in awk instead, which never closes the pipe early.
     next=$(systemctl list-timers certbot.timer certbot-renew.timer --no-pager 2>/dev/null \
-           | awk '/certbot/ {print $1, $2, $3, $4; exit}')
+           | awk '/certbot/ && !found {print $1, $2, $3, $4; found=1}')
     if [[ -n "$next" ]]; then
         success "Renewal timer scheduled. Next fire: $next"
     else
