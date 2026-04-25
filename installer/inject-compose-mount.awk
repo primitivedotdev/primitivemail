@@ -20,6 +20,12 @@
 # we are inside the primitivemail service block. Single-pass would re-insert
 # whenever the existing mount line came AFTER the ./maildata anchor.
 #
+# Pass-1 detection is scoped to the primitivemail block (mirroring pass 2's
+# in_pm tracking via a separate pass1_in_pm flag) so a /etc/letsencrypt
+# mount sitting in some OTHER service's volumes block (e.g. an operator
+# wired it into the watcher service) does not falsely trip the idempotency
+# check and cause us to skip injecting into primitivemail.
+#
 # Anchoring: we insert AFTER the `./maildata:/mail/incoming` line and only
 # while the in_pm flag is set. The flag turns on at the line that matches
 # `^  primitivemail:` (two-space indent, exact name, colon, optional spaces)
@@ -34,11 +40,21 @@ BEGIN {
     inserted = 0
     seen_pm_header = 0
     already_present = 0
+    pass1_in_pm = 0
 }
 
-# Pass 1: scan for an existing mount line, do not emit anything.
+# Pass 1: scan for an existing mount line INSIDE the primitivemail block,
+# do not emit anything. pass1_in_pm tracks the same service-header logic as
+# pass 2's in_pm; keep them as separate variables so pass 2 stays readable.
 NR == FNR {
-    if ($0 ~ /^[[:space:]]*-[[:space:]]*\/etc\/letsencrypt:\/etc\/letsencrypt(:ro)?[[:space:]]*$/) {
+    if ($0 ~ /^[[:space:]]{2}[A-Za-z0-9_-]+:[[:space:]]*$/) {
+        if ($0 ~ /^[[:space:]]{2}primitivemail:[[:space:]]*$/) {
+            pass1_in_pm = 1
+        } else {
+            pass1_in_pm = 0
+        }
+    }
+    if (pass1_in_pm && $0 ~ /^[[:space:]]*-[[:space:]]*\/etc\/letsencrypt:\/etc\/letsencrypt(:ro)?[[:space:]]*$/) {
         already_present = 1
     }
     next

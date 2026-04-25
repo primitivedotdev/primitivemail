@@ -1844,6 +1844,44 @@ class TestInjectComposeMount:
         )
         assert le_lines[0] > pm_header_idx
 
+    def test_injects_when_le_mount_lives_in_other_service_only(self, tmp_path):
+        # Regression: pass-1 idempotency detection used to be file-global,
+        # so a /etc/letsencrypt mount sitting in any other service's volumes
+        # (here: watcher) caused us to skip injection into primitivemail and
+        # the container silently fell back to self-signed. Pass 1 must scope
+        # already_present to lines inside the primitivemail block.
+        fixture = (
+            "services:\n"
+            "  watcher:\n"
+            "    image: y\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+            "      - /etc/letsencrypt:/etc/letsencrypt:ro\n"
+            "  primitivemail:\n"
+            "    image: x\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+        )
+        rc, out, _ = self._run(fixture, tmp_path)
+        assert rc == 0, f"expected injection (rc=0), got rc={rc}"
+        lines = out.splitlines()
+        le_lines = [i for i, line in enumerate(lines) if "/etc/letsencrypt" in line]
+        # Two LE mount lines now: the operator's pre-existing one in
+        # watcher, and the one we just injected into primitivemail.
+        assert len(le_lines) == 2
+        pm_header_idx = next(
+            i for i, line in enumerate(lines) if line.strip() == "primitivemail:"
+        )
+        # The injected LE line must sit after the primitivemail header.
+        assert any(idx > pm_header_idx for idx in le_lines)
+        # And the watcher's existing LE line is preserved verbatim.
+        watcher_header_idx = next(
+            i for i, line in enumerate(lines) if line.strip() == "watcher:"
+        )
+        assert any(
+            watcher_header_idx < idx < pm_header_idx for idx in le_lines
+        )
+
 
 # ===========================================================================
 # verify_tls_readable_in_container: post-start cert readability smoke check
