@@ -27,8 +27,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Dict, Any
-import urllib.request
-import urllib.error
+import urllib3
 
 import Milter
 from Milter.utils import parse_addr
@@ -224,6 +223,15 @@ logging.basicConfig(
     handlers=handlers
 )
 logger = logging.getLogger(__name__)
+
+# Shared HTTP client. PoolManager is thread-safe and amortises socket setup
+# across requests. retries=False keeps the existing single-shot behavior —
+# the milter decides what to do on errors based on its own classification.
+_HTTP = urllib3.PoolManager(
+    maxsize=10,
+    block=False,
+    retries=False,
+)
 
 # Deferred tracing log (after basicConfig so the message is visible)
 if TRACING_ENABLED:
@@ -1458,38 +1466,37 @@ class PrimitiveMailMilter(Milter.Base):
         else:
             headers['Authorization'] = f'Bearer {cfg.storage_key}'
 
-        req = urllib.request.Request(
+        response = _HTTP.request(
+            'POST',
             url,
-            data=raw_bytes,
+            body=raw_bytes,
             headers=headers,
-            method='POST'
+            timeout=urllib3.Timeout(connect=15.0, read=15.0),
         )
-
-        with urllib.request.urlopen(req, timeout=15) as response:
-            duration = time.time() - start
-            if response.status in (200, 201):
-                record_metrics(lambda: (
-                    STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
-                    STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
-                ))
-                if storage_span:
-                    storage_span.set_tag('storage.status', 'success')
-                return {
-                    'success': True,
-                    'upload_id': upload_id,
-                    'storage_key': storage_key,
-                    'sha256': sha256,
-                }
-            else:
-                record_metrics(lambda: (
-                    STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
-                    STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
-                    ERRORS_TOTAL.labels(stage='storage_upload').inc(),
-                ))
-                if storage_span:
-                    storage_span.set_tag('error', True)
-                    storage_span.set_tag('http.status_code', response.status)
-                return {'success': False, 'error': f'HTTP {response.status}'}
+        duration = time.time() - start
+        if response.status in (200, 201):
+            record_metrics(lambda: (
+                STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
+                STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
+            ))
+            if storage_span:
+                storage_span.set_tag('storage.status', 'success')
+            return {
+                'success': True,
+                'upload_id': upload_id,
+                'storage_key': storage_key,
+                'sha256': sha256,
+            }
+        else:
+            record_metrics(lambda: (
+                STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
+                STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
+                ERRORS_TOTAL.labels(stage='storage_upload').inc(),
+            ))
+            if storage_span:
+                storage_span.set_tag('error', True)
+                storage_span.set_tag('http.status_code', response.status)
+            return {'success': False, 'error': f'HTTP {response.status}'}
 
     def _call_webhook_for_recipient(self, recipient: str, domain: str,
                                      raw_bytes: Optional[bytes], size: int,
@@ -1545,18 +1552,18 @@ class PrimitiveMailMilter(Milter.Base):
             if TRACING_ENABLED and webhook_span and HTTPPropagator:
                 HTTPPropagator.inject(webhook_span.context, webhook_headers)
 
-            req = urllib.request.Request(
+            response = _HTTP.request(
+                'POST',
                 cfg.webhook_url,
-                data=json.dumps(payload).encode('utf-8'),
+                body=json.dumps(payload).encode('utf-8'),
                 headers=webhook_headers,
-                method='POST'
+                timeout=urllib3.Timeout(connect=float(timeout), read=float(timeout)),
             )
+            latency_ms = (time.time() - start_time) * 1000
+            response_body = response.data.decode('utf-8')
+            webhook_path = 'storage_first' if storage_result else 'inline'
 
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                latency_ms = (time.time() - start_time) * 1000
-                response_body = response.read().decode('utf-8')
-                webhook_path = 'storage_first' if storage_result else 'inline'
-
+            if 200 <= response.status < 300:
                 result = _interpret_webhook_response(response.status, response_body)
                 self.log(
                     f"Webhook responded: {result.get('status', 'N/A')} "
@@ -1568,33 +1575,24 @@ class PrimitiveMailMilter(Milter.Base):
                 ))
                 return result
 
-        except urllib.error.HTTPError as e:
-            latency_ms = (time.time() - start_time) * 1000
-            webhook_path = 'storage_first' if storage_result else 'inline'
-            error_body = ''
-            try:
-                error_body = e.read().decode('utf-8') if e.fp else ''
-            except Exception:
-                error_body = '<unreadable>'
+            # Non-2xx: interpret body, mirror the previous HTTPError branch.
+            result = _interpret_webhook_response(response.status, response_body)
 
-            result = _interpret_webhook_response(e.code, error_body)
-
-            # Log based on the interpreted result, not the HTTP status
             if result.get('success') and result.get('status') == 'accepted':
                 self.log(
                     f"Webhook responded: accepted "
-                    f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
+                    f"(HTTP {response.status}, latency: {latency_ms:.0f}ms)"
                 )
             elif result.get('success'):
                 logger.warning(
                     f"[{self.id}] Webhook responded: {result.get('status')} "
-                    f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
+                    f"(HTTP {response.status}, latency: {latency_ms:.0f}ms)"
                 )
             else:
                 self.log_error(
                     f"WEBHOOK_HTTP_ERROR recipient={recipient} "
-                    f"http_status={e.code} latency_ms={latency_ms:.0f} "
-                    f"body={error_body[:500]}"
+                    f"http_status={response.status} latency_ms={latency_ms:.0f} "
+                    f"body={response_body[:500]}"
                 )
 
             metrics_status = 'success' if result.get('success') else 'error'
@@ -1606,12 +1604,18 @@ class PrimitiveMailMilter(Milter.Base):
                 record_metrics(lambda: ERRORS_TOTAL.labels(stage='webhook').inc())
             return result
 
-        except urllib.error.URLError as e:
+        except (
+            urllib3.exceptions.ConnectTimeoutError,
+            urllib3.exceptions.ReadTimeoutError,
+            urllib3.exceptions.NewConnectionError,
+            urllib3.exceptions.ProtocolError,
+            urllib3.exceptions.SSLError,
+            urllib3.exceptions.HTTPError,
+        ) as e:
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
-            reason = str(e.reason)
-            # Classify the network error for easier searching
-            if 'timed out' in reason.lower() or 'timeout' in reason.lower():
+            reason = str(e)
+            if isinstance(e, (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError)):
                 error_type = 'timeout'
             elif 'refused' in reason.lower():
                 error_type = 'connection_refused'
