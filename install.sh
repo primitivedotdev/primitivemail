@@ -500,22 +500,31 @@ mount_letsencrypt_in_compose() {
         return
     fi
 
-    # Insert after the `./maildata:/mail/incoming` line within the
-    # primitivemail service. That line is anchor-stable (the watcher service
-    # has the same line, but the primitivemail service comes first in the
-    # file, so the first match is the right one). If anchor moves or both
-    # services need it, this code will need to grow up; for now, single
-    # match is correct and safe.
+    # Insert after the `./maildata:/mail/incoming` line, but only within the
+    # primitivemail service block. We track whether we are inside that
+    # service by watching for service header lines (two-space indent ending
+    # in a colon under `services:`); the flag turns on at `primitivemail:`
+    # and back off at the next service header. This way, reordering
+    # services or other services adding the same maildata mount cannot
+    # cause the injection to land in the wrong place.
     awk '
-        BEGIN { inserted=0 }
+        BEGIN { in_pm=0; inserted=0 }
         {
+            # Service header: two-space indent, identifier, trailing colon.
+            if ($0 ~ /^[[:space:]]{2}[A-Za-z0-9_-]+:[[:space:]]*$/) {
+                if ($0 ~ /^[[:space:]]{2}primitivemail:[[:space:]]*$/) {
+                    in_pm = 1
+                } else {
+                    in_pm = 0
+                }
+            }
             print $0
-            if (!inserted && $0 ~ /^[[:space:]]*-[[:space:]]*\.\/maildata:\/mail\/incoming[[:space:]]*$/) {
+            if (in_pm && !inserted && $0 ~ /^[[:space:]]*-[[:space:]]*\.\/maildata:\/mail\/incoming[[:space:]]*$/) {
                 # Match indentation of the matched line so YAML stays valid.
                 match($0, /^[[:space:]]*/)
                 indent = substr($0, RSTART, RLENGTH)
                 printf "%s- /etc/letsencrypt:/etc/letsencrypt:ro\n", indent
-                inserted=1
+                inserted = 1
             }
         }
     ' "$compose_path" > "${compose_path}.tmp" && mv "${compose_path}.tmp" "$compose_path"
