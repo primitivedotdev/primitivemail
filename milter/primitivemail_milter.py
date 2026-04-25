@@ -560,15 +560,25 @@ def _sighup_handler(signum=None, frame=None):
     _reload_event.set()
 
 
+def _run_one_reload():
+    """Wait for the next reload signal and perform one reload.
+
+    Extracted from the worker loop so tests can drive a single iteration
+    on a thread that then exits cleanly, avoiding orphan threads that
+    might wake up on later test events.
+    """
+    _reload_event.wait()
+    _reload_event.clear()
+    try:
+        reload_config()
+    except Exception:
+        logger.exception("Config reload failed")
+
+
 def _reload_worker():
     """Background thread that performs config reloads when SIGHUP fires."""
     while True:
-        _reload_event.wait()
-        _reload_event.clear()
-        try:
-            reload_config()
-        except Exception as e:
-            logger.error(f"Config reload failed: {e}")
+        _run_one_reload()
 
 
 def reload_config(signum=None, frame=None):
@@ -1801,8 +1811,6 @@ def main():
 
     # Start background thread to poll active smtpd process count
     if METRICS_ENABLED:
-        import threading
-
         def _poll_smtpd_count():
             import subprocess
             _logged_failure = False

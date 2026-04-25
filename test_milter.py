@@ -2289,9 +2289,15 @@ class TestSighupHandler:
         pm.reload_config = fake_reload
         pm._reload_event.clear()
         try:
-            threading.Thread(target=pm._reload_worker, daemon=True).start()
+            # Run a single iteration so the worker thread exits cleanly
+            # after the test instead of orphaning a daemon that could
+            # wake on _reload_event in a later test.
+            t = threading.Thread(target=pm._run_one_reload, daemon=True)
+            t.start()
             pm._reload_event.set()
             assert fake_done.wait(timeout=1.0), "reloader thread did not call reload_config"
+            t.join(timeout=1.0)
+            assert not t.is_alive(), "reload iteration did not exit"
         finally:
             pm.reload_config = original_reload
             pm._reload_event.clear()
