@@ -28,6 +28,13 @@ JSON_MODE=0
 ENABLE_LETSENCRYPT=0
 LE_EMAIL=""
 LE_HOSTNAME=""
+# Track whether the operator explicitly passed --tls-cert/--tls-key on this
+# invocation. When they did, their value wins over any preservation logic;
+# when they did not, preserve_existing_tls_paths may forward whatever the
+# previous run wrote into .env so re-running the installer without
+# --enable-letsencrypt does not silently wipe the existing TLS config.
+TLS_CERT_EXPLICIT=0
+TLS_KEY_EXPLICIT=0
 _ui_out() {
     if [[ "$JSON_MODE" == "1" ]]; then
         echo -e "$1" 1>&2
@@ -99,6 +106,26 @@ while [[ $# -gt 0 ]]; do
             ;;
         --hostname=*)
             LE_HOSTNAME="${1#--hostname=}"
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+        --tls-cert)
+            TLS_CERT_EXPLICIT=1
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --tls-cert=*)
+            TLS_CERT_EXPLICIT=1
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
+        --tls-key)
+            TLS_KEY_EXPLICIT=1
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --tls-key=*)
+            TLS_KEY_EXPLICIT=1
             FORWARD_ARGS+=("$1")
             shift
             ;;
@@ -579,6 +606,59 @@ setup_letsencrypt() {
     spacer
 }
 
+# Preserve TLS_CERT/TLS_KEY across re-runs.
+#
+# The Python installer's write_env recreates .env from CLI args every run, so
+# an operator who set up Let's Encrypt last week and re-runs install.sh
+# (without --enable-letsencrypt and without explicit --tls-cert/--tls-key)
+# would otherwise see their cert paths silently dropped from .env, and the
+# container would fall back to the self-signed cert on the next restart.
+#
+# Behavior:
+#   - If --tls-cert / --tls-key were passed on THIS invocation, the operator's
+#     explicit choice wins (including the explicit empty string, e.g. to opt
+#     back into self-signed) and we do nothing.
+#   - If --enable-letsencrypt is set, forward_letsencrypt_paths handles the
+#     forwarding and we do nothing here.
+#   - Otherwise, read the existing .env. If TLS_CERT points at a file that
+#     exists on disk, forward that path (and the matching TLS_KEY when it
+#     also exists) into the Python installer. This preserves both
+#     /etc/letsencrypt/live/... paths AND custom paths (corporate CA certs,
+#     hand-managed bundles) symmetrically: the contract is "the file must
+#     exist", not "the file must be under /etc/letsencrypt/".
+preserve_existing_tls_paths() {
+    if [[ "$TLS_CERT_EXPLICIT" == "1" || "$TLS_KEY_EXPLICIT" == "1" ]]; then
+        return
+    fi
+    if [[ "$ENABLE_LETSENCRYPT" == "1" ]]; then
+        return
+    fi
+    local env_path="${INSTALL_DIR}/.env"
+    if [[ ! -f "$env_path" ]]; then
+        return
+    fi
+
+    local existing_cert existing_key
+    existing_cert="$(grep -E '^TLS_CERT=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    existing_key="$(grep -E '^TLS_KEY=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2-)"
+
+    if [[ -z "$existing_cert" && -z "$existing_key" ]]; then
+        return
+    fi
+
+    # Use sudo for the on-disk check because /etc/letsencrypt/live/<host>/
+    # is mode 700 root:root by default; a non-root operator running
+    # install.sh under sudo would otherwise see the file as missing and we
+    # would silently drop the LE config.
+    if [[ -n "$existing_cert" ]] && sudo test -f "$existing_cert"; then
+        FORWARD_ARGS+=("--tls-cert" "$existing_cert")
+        if [[ -n "$existing_key" ]] && sudo test -f "$existing_key"; then
+            FORWARD_ARGS+=("--tls-key" "$existing_key")
+        fi
+        info "Preserving existing TLS config: TLS_CERT=$existing_cert"
+    fi
+}
+
 # --- Clone ---------------------------------------------------------------
 
 clone_repo() {
@@ -745,6 +825,13 @@ main() {
     # (so the .env we write is the one the Python installer extends, and so
     # the cert is in place by the time `docker compose up` reads .env).
     setup_letsencrypt
+
+    # If --enable-letsencrypt was not on the CLI this run but an existing
+    # .env already declares a TLS_CERT path that exists on disk, forward
+    # those paths so the re-run does not silently drop the previous run's
+    # TLS config. setup_letsencrypt's own forward_letsencrypt_paths short-
+    # circuits the preservation path when it already added --tls-cert.
+    preserve_existing_tls_paths
 
     if [[ ! -d "installer" ]]; then
         error "Installer package not found. Your copy may be outdated."
