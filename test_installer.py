@@ -1884,6 +1884,185 @@ class TestInjectComposeMount:
 
 
 # ===========================================================================
+# preserve_existing_tls_paths (install.sh)
+# ===========================================================================
+#
+# Subprocess-driven tests of the bash function that re-forwards TLS_CERT /
+# TLS_KEY from a previous .env into the Python installer when the operator
+# re-runs install.sh without explicit --tls-cert / --tls-key. The regression
+# we are guarding is "asymmetric dropping": passing only one of the two
+# flags used to early-return and silently drop the unflagged partner.
+
+class TestPreserveExistingTlsPaths:
+    INSTALL_SH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "install.sh",
+    )
+
+    def _setup_paths(self, tmp_path, *, create_cert=True, create_key=True):
+        """Create install dir, cert/key tmpfiles. Returns (install_dir,
+        cert_path, key_path). install_dir is unique per call so tests can
+        invoke this multiple times."""
+        import uuid
+        install_dir = tmp_path / f"install-{uuid.uuid4().hex[:8]}"
+        install_dir.mkdir()
+        cert_path = install_dir / "cert.pem"
+        key_path = install_dir / "key.pem"
+        if create_cert:
+            cert_path.write_text("fake-cert")
+        if create_key:
+            key_path.write_text("fake-key")
+        return install_dir, str(cert_path), str(key_path)
+
+    def _env(self, cert=None, key=None):
+        # Render a minimal .env with TLS_CERT / TLS_KEY lines.
+        lines = ["SOMETHING=other"]
+        if cert is not None:
+            lines.append(f"TLS_CERT={cert}")
+        if key is not None:
+            lines.append(f"TLS_KEY={key}")
+        return "\n".join(lines) + "\n"
+
+    def _invoke(self, install_dir, *, env_contents,
+                tls_cert_explicit="0", tls_key_explicit="0", enable_le="0"):
+        """Source install.sh (with trailing `main` call stripped), stub
+        sudo to passthrough, set globals, call the function, and emit
+        FORWARD_ARGS one-per-line on stdout.
+
+        Returns (returncode, forward_args_list, stderr).
+        """
+        import subprocess
+        (install_dir / ".env").write_text(env_contents)
+
+        # Strip the trailing bare `main` so sourcing does not run the full
+        # installer.
+        script = f"""
+set -e
+src="$(sed -e 's/^main$/: # stripped for testing/' {self.INSTALL_SH!r})"
+sudo() {{ command "$@"; }}
+export -f sudo
+eval "$src"
+INSTALL_DIR={str(install_dir)!r}
+TLS_CERT_EXPLICIT={tls_cert_explicit!r}
+TLS_KEY_EXPLICIT={tls_key_explicit!r}
+ENABLE_LETSENCRYPT={enable_le!r}
+FORWARD_ARGS=()
+preserve_existing_tls_paths >/dev/null 2>&1
+# Guard the FORWARD_ARGS expansion with the standard `[@]+...` idiom so an
+# empty array does not produce a single empty element under `set -u` / the
+# default printf-with-no-args repeats one empty line.
+if [[ ${{#FORWARD_ARGS[@]}} -gt 0 ]]; then
+    printf 'FORWARD_ARG: %s\\n' "${{FORWARD_ARGS[@]}}"
+fi
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+        )
+        forward_args = [
+            line[len("FORWARD_ARG: "):]
+            for line in result.stdout.splitlines()
+            if line.startswith("FORWARD_ARG: ")
+        ]
+        return result.returncode, forward_args, result.stderr
+
+    def test_only_tls_cert_explicit_preserves_existing_tls_key(self, tmp_path):
+        # Operator passed --tls-cert /new/cert without --tls-key. The old
+        # TLS_KEY from .env must still be forwarded; previously the early
+        # return dropped it and Postfix fell back to self-signed.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_cert_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        # Cert side: NOT preserved (operator is providing one explicitly).
+        assert "--tls-cert" not in args
+        # Key side: preserved from .env.
+        assert "--tls-key" in args
+        assert args[args.index("--tls-key") + 1] == key
+
+    def test_only_tls_key_explicit_preserves_existing_tls_cert(self, tmp_path):
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_key_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-key" not in args
+        assert "--tls-cert" in args
+        assert args[args.index("--tls-cert") + 1] == cert
+
+    def test_both_explicit_preserves_neither(self, tmp_path):
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_cert_explicit="1", tls_key_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" not in args
+        assert "--tls-key" not in args
+
+    def test_neither_explicit_preserves_both(self, tmp_path):
+        # Existing behavior: re-running install.sh with no TLS flags
+        # should forward both .env values when both files exist on disk.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" in args and "--tls-key" in args
+        assert args[args.index("--tls-cert") + 1] == cert
+        assert args[args.index("--tls-key") + 1] == key
+
+    def test_enable_letsencrypt_short_circuits(self, tmp_path):
+        # LE owns both cert and key via forward_letsencrypt_paths; this
+        # function must do nothing when --enable-letsencrypt is set, even
+        # if .env already declares paths.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            enable_le="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert args == []
+
+    def test_cert_file_missing_skips_only_cert(self, tmp_path):
+        # Cert path in .env points at a file that no longer exists; the
+        # cert side is NOT preserved (we will not forward a path that
+        # docker-compose cannot mount), but the key side is checked
+        # independently and preserved when its file is present.
+        install_dir, cert, key = self._setup_paths(tmp_path, create_cert=False)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" not in args
+        assert "--tls-key" in args
+
+    def test_explicit_empty_cert_preserves_only_key(self, tmp_path):
+        # Pinning the explicit-empty-string contract: if the operator
+        # passed --tls-cert "" (TLS_CERT_EXPLICIT=1, intent: clear it),
+        # the cert side is not preserved. The key side is independent and
+        # is still preserved from .env when its file exists. This is a
+        # behavior change from the old "either explicit -> drop both"
+        # logic; nail it down so future regressions show up.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            tls_cert_explicit="1",
+            env_contents=self._env(cert=cert, key=key),
+        )
+        assert rc == 0, err
+        assert "--tls-cert" not in args
+        assert "--tls-key" in args
+
+
+# ===========================================================================
 # verify_tls_readable_in_container: post-start cert readability smoke check
 # ===========================================================================
 

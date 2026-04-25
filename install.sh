@@ -694,22 +694,24 @@ setup_letsencrypt() {
 # would otherwise see their cert paths silently dropped from .env, and the
 # container would fall back to the self-signed cert on the next restart.
 #
-# Behavior:
-#   - If --tls-cert / --tls-key were passed on THIS invocation, the operator's
-#     explicit choice wins (including the explicit empty string, e.g. to opt
-#     back into self-signed) and we do nothing.
+# Behavior (cert and key are evaluated INDEPENDENTLY so passing only one of
+# the two flags does not silently drop the unflagged partner):
 #   - If --enable-letsencrypt is set, forward_letsencrypt_paths handles the
-#     forwarding and we do nothing here.
-#   - Otherwise, read the existing .env. If TLS_CERT points at a file that
-#     exists on disk, forward that path (and the matching TLS_KEY when it
-#     also exists) into the Python installer. This preserves both
-#     /etc/letsencrypt/live/... paths AND custom paths (corporate CA certs,
-#     hand-managed bundles) symmetrically: the contract is "the file must
-#     exist", not "the file must be under /etc/letsencrypt/".
+#     forwarding and we do nothing here. LE owns both cert and key.
+#   - For each of cert / key independently:
+#       * If --tls-cert (or --tls-key) was explicit on this invocation,
+#         the operator's choice wins; do not preserve that side. Explicit
+#         empty string still counts as explicit (the operator is asking to
+#         clear that value), so we do not preserve over an empty arg.
+#       * Otherwise, if the existing .env value points at a file that
+#         exists on disk, forward it via --tls-cert / --tls-key.
+#
+# Pairing correctness (matching cert + key) is NOT enforced here; it never
+# was. An operator who passes --tls-cert /new/cert without --tls-key will
+# end up with /new/cert paired with the preserved old key, which may not
+# verify. That is the same contract as before this fix: install.sh
+# preserves values, the operator owns coherence between them.
 preserve_existing_tls_paths() {
-    if [[ "$TLS_CERT_EXPLICIT" == "1" || "$TLS_KEY_EXPLICIT" == "1" ]]; then
-        return
-    fi
     if [[ "$ENABLE_LETSENCRYPT" == "1" ]]; then
         return
     fi
@@ -722,20 +724,25 @@ preserve_existing_tls_paths() {
     existing_cert="$(grep -E '^TLS_CERT=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2-)"
     existing_key="$(grep -E '^TLS_KEY=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2-)"
 
-    if [[ -z "$existing_cert" && -z "$existing_key" ]]; then
-        return
-    fi
-
     # Use sudo for the on-disk check because /etc/letsencrypt/live/<host>/
     # is mode 700 root:root by default; a non-root operator running
     # install.sh under sudo would otherwise see the file as missing and we
     # would silently drop the LE config.
-    if [[ -n "$existing_cert" ]] && sudo test -f "$existing_cert"; then
+    local preserved_cert=""
+    local preserved_key=""
+
+    if [[ "$TLS_CERT_EXPLICIT" != "1" && -n "$existing_cert" ]] && sudo test -f "$existing_cert"; then
         FORWARD_ARGS+=("--tls-cert" "$existing_cert")
-        if [[ -n "$existing_key" ]] && sudo test -f "$existing_key"; then
-            FORWARD_ARGS+=("--tls-key" "$existing_key")
-        fi
-        info "Preserving existing TLS config: TLS_CERT=$existing_cert"
+        preserved_cert="$existing_cert"
+    fi
+
+    if [[ "$TLS_KEY_EXPLICIT" != "1" && -n "$existing_key" ]] && sudo test -f "$existing_key"; then
+        FORWARD_ARGS+=("--tls-key" "$existing_key")
+        preserved_key="$existing_key"
+    fi
+
+    if [[ -n "$preserved_cert" || -n "$preserved_key" ]]; then
+        info "Preserving existing TLS config: cert=${preserved_cert:-<unchanged>}, key=${preserved_key:-<unchanged>}"
     fi
 }
 
