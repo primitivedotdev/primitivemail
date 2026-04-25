@@ -453,7 +453,7 @@ letsencrypt_preflight() {
     # directly; reachability we can only attempt via a self-loopback test
     # which is best-effort (cloud firewalls block from the host itself in
     # some setups), so a failure here is a warning, not a hard error.
-    if ss -tln 2>/dev/null | grep -qE ':80\s' || netstat -tln 2>/dev/null | grep -qE ':80\s'; then
+    if ss -tln 2>/dev/null | grep -qE ':80[[:space:]]' || netstat -tln 2>/dev/null | grep -qE ':80[[:space:]]'; then
         error "Port 80 is already in use on this host"
         detail "Certbot --standalone needs to bind :80 for the HTTP-01 challenge."
         detail "Stop whatever is listening on :80 (nginx, apache, another container) and retry."
