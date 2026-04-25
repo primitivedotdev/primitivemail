@@ -15,14 +15,18 @@ DEFAULT_TLS_KEY="/etc/postfix/tls/server.key"
 TLS_CERT="${TLS_CERT:-$DEFAULT_TLS_CERT}"
 TLS_KEY="${TLS_KEY:-$DEFAULT_TLS_KEY}"
 
-# Defensive fallback: if a custom TLS_CERT was configured but the file is not
-# on disk, log a clear warning and fall back to the self-signed default rather
-# than crashing the container. The cert key is checked alongside the cert so
-# half-configured pairs do not silently load only one side.
-if [[ "$TLS_CERT" != "$DEFAULT_TLS_CERT" ]]; then
-    if [[ ! -f "$TLS_CERT" || ! -f "$TLS_KEY" ]]; then
-        echo "WARNING: TLS_CERT=${TLS_CERT} or TLS_KEY=${TLS_KEY} not found on disk." 1>&2
-        echo "WARNING: Falling back to self-signed certificate at ${DEFAULT_TLS_CERT}." 1>&2
+# Defensive fallback: if a custom TLS_CERT or TLS_KEY was configured but the
+# file is not on disk, log a clear warning and fall back to the self-signed
+# default rather than crashing the container. Both paths are checked together
+# so half-configured pairs do not silently load only one side, and the guard
+# is symmetric: overriding either variable triggers the on-disk check.
+if [[ "$TLS_CERT" != "$DEFAULT_TLS_CERT" || "$TLS_KEY" != "$DEFAULT_TLS_KEY" ]]; then
+    missing=()
+    [[ ! -f "$TLS_CERT" ]] && missing+=("TLS_CERT=${TLS_CERT}")
+    [[ ! -f "$TLS_KEY" ]] && missing+=("TLS_KEY=${TLS_KEY}")
+    if (( ${#missing[@]} > 0 )); then
+        echo "WARNING: ${missing[*]} not found on disk." 1>&2
+        echo "WARNING: Falling back to self-signed certificate at ${DEFAULT_TLS_CERT} and key at ${DEFAULT_TLS_KEY}." 1>&2
         echo "WARNING: This is usually transient (Let's Encrypt issuance pending, or volume mount missing)." 1>&2
         TLS_CERT="$DEFAULT_TLS_CERT"
         TLS_KEY="$DEFAULT_TLS_KEY"
