@@ -27,7 +27,9 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Dict, Any
+import urllib.parse
 import urllib3
+import urllib3.connection
 
 import Milter
 from Milter.utils import parse_addr
@@ -139,6 +141,48 @@ try:
         ['status', 'path'],
         buckets=DURATION_BUCKETS,
     )
+    # Per-stage breakdown of the outbound webhook call. Together with
+    # WEBHOOK_DURATION (the total), these answer "where did the time go?"
+    # under load — surfacing connect-side cost (handshakes the client paid)
+    # vs server-side cost (TTFB once the request is in-flight) vs body
+    # transfer. The host label distinguishes webhook from storage uploads
+    # so we don't conflate two different remotes.
+    HTTP_CONNECT_DURATION = Histogram(
+        'milter_outbound_connect_seconds',
+        'TCP+TLS handshake time on outbound HTTP (only recorded for fresh '
+        'connections; reused pooled connections are excluded by definition)',
+        ['host', 'scheme'],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    )
+    HTTP_TTFB_DURATION = Histogram(
+        'milter_outbound_ttfb_seconds',
+        'Time from request start to first response byte. Includes connect '
+        'time on cold calls; near-zero (sub-ms) request transit + remote '
+        'processing on warm calls. Compare to remote-reported processing '
+        'time to localise transit vs queueing.',
+        ['host', 'scheme'],
+        buckets=DURATION_BUCKETS,
+    )
+    HTTP_BODY_READ_DURATION = Histogram(
+        'milter_outbound_body_read_seconds',
+        'Time spent reading the response body after headers arrived. '
+        'Typically sub-ms for small JSON responses; growth here points '
+        'at egress-side network problems.',
+        ['host', 'scheme'],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+    )
+    HTTP_CONNECTIONS_NEW = Counter(
+        'milter_outbound_new_connections_total',
+        'Count of fresh TCP+TLS connections opened (i.e. pool misses). '
+        'Compare against milter_outbound_requests_total to derive pool '
+        'reuse rate.',
+        ['host', 'scheme'],
+    )
+    HTTP_REQUESTS_TOTAL = Counter(
+        'milter_outbound_requests_total',
+        'Count of outbound HTTP requests issued, regardless of pool reuse.',
+        ['host', 'scheme'],
+    )
     EMAIL_SIZE = Histogram(
         'milter_email_size_bytes',
         'Email size distribution',
@@ -225,6 +269,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Outbound HTTP timing instrumentation
+# ----------------------------------------------------------------------------
+# We split the previously-opaque "webhook latency" measurement into three
+# stages so we can answer "where did the time go?" under concurrency:
+#
+#   connect — DNS + TCP + TLS handshake (only recorded for fresh sockets;
+#             reused pooled connections skip this entirely)
+#   ttfb    — request start → first response byte (request transit + remote
+#             processing; on cold calls this also subsumes connect)
+#   body    — response body read (typically sub-ms for small JSON responses)
+#
+# This is the original motivation for moving off urllib.request: we can
+# subclass urllib3's connection class to time connect() in place, while
+# the ttfb/body split is taken at each call site via preload_content=False.
+class _TimingHTTPSConnection(urllib3.connection.HTTPSConnection):
+    """HTTPS connection that records its handshake duration on connect()."""
+
+    def connect(self):
+        t0 = time.monotonic()
+        super().connect()
+        elapsed = time.monotonic() - t0
+        host = self.host
+        record_metrics(lambda: (
+            HTTP_CONNECT_DURATION.labels(host=host, scheme='https').observe(elapsed),
+            HTTP_CONNECTIONS_NEW.labels(host=host, scheme='https').inc(),
+        ))
+
+
+class _TimingHTTPConnection(urllib3.connection.HTTPConnection):
+    """HTTP connection that records its TCP-only connect duration."""
+
+    def connect(self):
+        t0 = time.monotonic()
+        super().connect()
+        elapsed = time.monotonic() - t0
+        host = self.host
+        record_metrics(lambda: (
+            HTTP_CONNECT_DURATION.labels(host=host, scheme='http').observe(elapsed),
+            HTTP_CONNECTIONS_NEW.labels(host=host, scheme='http').inc(),
+        ))
+
+
+class _TimingHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    ConnectionCls = _TimingHTTPSConnection
+
+
+class _TimingHTTPConnectionPool(urllib3.HTTPConnectionPool):
+    ConnectionCls = _TimingHTTPConnection
+
+
 # Shared HTTP client used by both the webhook and (non-S3) storage uploads.
 # PoolManager is thread-safe and amortises socket setup across requests.
 # The pool — and the cached boto3 S3 client — are dropped on SIGHUP (see
@@ -259,6 +353,30 @@ _HTTP = urllib3.PoolManager(
         raise_on_status=False,
     ),
 )
+# Substitute timing-aware pool classes so connect() is observed every time
+# urllib3 opens a fresh socket. Reused connections never re-enter connect(),
+# which is exactly what we want — the histogram represents pool-miss cost.
+_HTTP.pool_classes_by_scheme = {
+    'http': _TimingHTTPConnectionPool,
+    'https': _TimingHTTPSConnectionPool,
+}
+
+
+def _outbound_host_label(url: str) -> tuple:
+    """Extract (host, scheme) for outbound-HTTP metric labels.
+
+    Returns ('unknown', 'unknown') on parse failure so a malformed URL
+    never crashes the metric path. Port is stripped from the host so the
+    label cardinality stays bounded by distinct webhook/storage targets,
+    not by accidentally varying ports.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or 'unknown'
+        scheme = parsed.scheme or 'unknown'
+        return host, scheme
+    except Exception:
+        return 'unknown', 'unknown'
 
 
 def _reset_outbound_http_clients():
@@ -1511,13 +1629,29 @@ class PrimitiveMailMilter(Milter.Base):
         else:
             headers['Authorization'] = f'Bearer {cfg.storage_key}'
 
+        host_label, scheme_label = _outbound_host_label(url)
+        # preload_content=False so headers and body are observed separately:
+        # the request() call returns once headers are in, .data triggers the body read.
+        t_send = time.monotonic()
         response = _HTTP.request(
             'POST',
             url,
             body=raw_bytes,
             headers=headers,
             timeout=urllib3.Timeout(connect=15.0, read=15.0),
+            preload_content=False,
         )
+        t_headers = time.monotonic()
+        try:
+            _ = response.data  # forces body read into memory
+        finally:
+            t_done = time.monotonic()
+            response.release_conn()
+        record_metrics(lambda: (
+            HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
+            HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
+            HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
+        ))
         duration = time.time() - start
         if response.status in (200, 201):
             record_metrics(lambda: (
@@ -1597,15 +1731,33 @@ class PrimitiveMailMilter(Milter.Base):
             if TRACING_ENABLED and webhook_span and HTTPPropagator:
                 HTTPPropagator.inject(webhook_span.context, webhook_headers)
 
+            host_label, scheme_label = _outbound_host_label(cfg.webhook_url)
+            # preload_content=False so we observe TTFB (time-to-first-byte —
+            # the metric that exposes the gap between local dispatch and
+            # remote function entry under load) separately from the body
+            # read. The connect-time histogram lives one level deeper, on
+            # the timing-aware HTTPSConnection subclass.
+            t_send = time.monotonic()
             response = _HTTP.request(
                 'POST',
                 cfg.webhook_url,
                 body=json.dumps(payload).encode('utf-8'),
                 headers=webhook_headers,
                 timeout=urllib3.Timeout(connect=float(timeout), read=float(timeout)),
+                preload_content=False,
             )
+            t_headers = time.monotonic()
+            try:
+                response_body = response.data.decode('utf-8')
+            finally:
+                t_done = time.monotonic()
+                response.release_conn()
+            record_metrics(lambda: (
+                HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
+                HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
+                HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
+            ))
             latency_ms = (time.time() - start_time) * 1000
-            response_body = response.data.decode('utf-8')
             webhook_path = 'storage_first' if storage_result else 'inline'
 
             if 200 <= response.status < 300:
