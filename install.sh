@@ -582,21 +582,59 @@ install_renewal_hook() {
     # Renewal deploy hook: certbot runs this after a successful renewal. We
     # reload postfix in the running container so the new cert chain is read
     # without dropping any in-flight SMTP connections.
+    #
+    # Implementation note: we use `docker exec primitivemail postfix reload`
+    # rather than `docker compose exec ...`. This sidesteps the compose
+    # v1/v2 split (older `docker-compose` boxes are still in the wild and
+    # check_docker accepts them) and removes the `cd ${INSTALL_DIR}`
+    # dependency, which was fragile if the operator later moved the install
+    # dir. The container_name `primitivemail` is hardcoded in
+    # docker-compose.yml, so addressing it directly is stable.
+    #
+    # Operator-edit safety: every hook we write carries the marker
+    # "Managed by primitivemail" in its header. On re-run, if the file
+    # exists but lacks the marker, we assume the operator hand-edited the
+    # hook and we leave it alone (printing a warning). Re-running with a
+    # marker-bearing hook overwrites it freely so future installer changes
+    # to the hook body propagate.
     local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
     local hook_path="${hook_dir}/reload-postfix.sh"
+    local marker="Managed by primitivemail"
+
+    if sudo test -f "$hook_path" && ! sudo grep -q "$marker" "$hook_path"; then
+        warn "Existing renewal hook at $hook_path has no '$marker' marker; leaving it alone"
+        detail "Delete the file or restore the marker comment to let install.sh refresh it."
+        return
+    fi
 
     sudo mkdir -p "$hook_dir"
-    sudo tee "$hook_path" > /dev/null <<EOF
+    sudo tee "$hook_path" > /dev/null <<'EOF'
 #!/bin/bash
+# Managed by primitivemail install.sh --enable-letsencrypt.
 # Reload postfix in the primitivemail container after Let's Encrypt renews.
-# Installed by primitivemail's install.sh --enable-letsencrypt.
+# Re-run install.sh --enable-letsencrypt to refresh this file. If you need
+# to customize it, remove the "Managed by primitivemail" marker line above
+# and the installer will leave your edits in place on subsequent runs.
 set -e
-cd "${INSTALL_DIR}"
-# Skip cleanly if the container is intentionally stopped, otherwise
-# certbot logs a hook failure even though the cert renewed fine. The
-# -T flag disables TTY allocation for the non-interactive cron context.
-docker compose ps --status running primitivemail | grep -q primitivemail || exit 0
-docker compose exec -T primitivemail postfix reload
+
+# Distinguish "docker daemon down" from "container intentionally stopped".
+# The former should fail loudly so certbot's hook-failure surface catches
+# the misconfiguration; the latter should exit 0 because the cert renewed
+# fine and the operator chose to keep the container down.
+if ! docker info >/dev/null 2>&1; then
+    echo "reload-postfix.sh: docker daemon unreachable; postfix reload skipped" 1>&2
+    exit 1
+fi
+
+# `docker container inspect` is preferred over `docker ps -q -f` here:
+# the latter returns success even when the filter matches nothing.
+state="$(docker container inspect -f '{{.State.Running}}' primitivemail 2>/dev/null || true)"
+if [[ "$state" != "true" ]]; then
+    # Container does not exist or is stopped. Treat as intentional and exit 0.
+    exit 0
+fi
+
+docker exec primitivemail postfix reload
 EOF
     sudo chmod +x "$hook_path"
     success "Installed renewal hook at $hook_path"
