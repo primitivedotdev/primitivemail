@@ -671,7 +671,7 @@ ensure_certbot_timer_enabled() {
 verify_renewal_timer() {
     local next
     next=$(systemctl list-timers certbot.timer certbot-renew.timer --no-pager 2>/dev/null \
-           | awk '/certbot/ {print $1, $2; exit}')
+           | awk '/certbot/ {print $1, $2, $3, $4; exit}')
     if [[ -n "$next" ]]; then
         success "Renewal timer scheduled. Next fire: $next"
     else

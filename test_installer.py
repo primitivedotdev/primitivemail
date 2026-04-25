@@ -2257,9 +2257,13 @@ verify_renewal_timer
         assert rc == 0, err
         combined = out + err
         assert "Next fire" in combined
-        # First two whitespace-delimited fields of the matching line are
-        # "Mon" and "2026-04-27"; verify at least one shows up.
-        assert "Mon" in combined or "2026-04-27" in combined
+        # The NEXT column is "DayName YYYY-MM-DD HH:MM:SS TZ" (4 fields);
+        # all four must surface so the operator sees the actual fire time
+        # and timezone, not just the date.
+        assert "Mon" in combined
+        assert "2026-04-27" in combined
+        assert "03:42:00" in combined
+        assert "UTC" in combined
 
     def test_warns_when_no_timer_found(self):
         # Empty output (no certbot timer registered) must produce a warning
