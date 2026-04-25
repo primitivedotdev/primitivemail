@@ -36,6 +36,10 @@ fi
 # Generate self-signed TLS cert at the default path if none exists.
 # Always done at the default location so the fallback above has something
 # to land on, even when TLS_CERT was set to a custom path.
+# Two log branches: when TLS_CERT points at the default path, the generated
+# cert is the active one (original behavior). When TLS_CERT points elsewhere
+# (e.g. Let's Encrypt), the generated cert is a dormant safety-net fallback
+# and the log line says so explicitly to avoid confusion about TLS posture.
 if [[ ! -f "$DEFAULT_TLS_CERT" ]]; then
     mkdir -p /etc/postfix/tls
     openssl req -new -x509 -days 3650 -nodes \
@@ -43,7 +47,11 @@ if [[ ! -f "$DEFAULT_TLS_CERT" ]]; then
         -keyout "$DEFAULT_TLS_KEY" \
         -subj "/CN=${MYHOSTNAME}" 2>/dev/null
     chmod 600 "$DEFAULT_TLS_KEY"
-    echo "Generated self-signed TLS certificate for ${MYHOSTNAME}"
+    if [[ "$TLS_CERT" == "$DEFAULT_TLS_CERT" ]]; then
+        echo "Generated self-signed TLS certificate for ${MYHOSTNAME}"
+    else
+        echo "Generated fallback self-signed certificate at ${DEFAULT_TLS_CERT} (not in use; active cert: ${TLS_CERT})"
+    fi
 fi
 
 # Render postfix main.cf
