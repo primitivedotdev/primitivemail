@@ -10,6 +10,7 @@ import pytest
 import json
 import os
 import sys
+import threading
 from unittest.mock import patch, MagicMock, PropertyMock
 from urllib.error import HTTPError, URLError
 from io import BytesIO
@@ -2176,8 +2177,8 @@ class TestSighupReload:
             pm.CONFIG_FILE_PATH = original_path
             self._restore_state(saved)
 
-    def test_reload_rejects_mode_switch_webhook_to_standalone(self, tmp_path):
-        """Cannot switch from webhook to standalone mode via SIGHUP."""
+    def test_reload_preserves_webhook_on_mode_switch_attempt(self, tmp_path):
+        """Mode switch via SIGHUP preserves webhook fields, applies the rest."""
         saved = self._save_state()
         original_path = pm.CONFIG_FILE_PATH
         try:
@@ -2189,22 +2190,28 @@ class TestSighupReload:
             pm.CONFIG_FILE_PATH = str(cfg_path)
             pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
             assert pm.STANDALONE_MODE is False
-            assert pm._rcfg.webhook_url == "https://webhook-mode.com"
 
-            # Try to remove webhook_url via reload — should be rejected
-            cfg_path.write_text(json.dumps({}))
+            # File now drops webhook_url (mode switch) but adds filtering.
+            cfg_path.write_text(json.dumps({
+                "allowed_recipients": ["inbox@myco.com"],
+            }))
             with patch.dict(os.environ, {k: v for k, v in os.environ.items()
-                                          if k != 'WEBHOOK_URL'}, clear=True):
+                                          if k not in ('WEBHOOK_URL', 'WEBHOOK_SECRET',
+                                                       'ALLOWED_RECIPIENTS')}, clear=True):
                 pm.reload_config()
 
-            # Should still be the original URL
+            # Webhook fields preserved.
             assert pm._rcfg.webhook_url == "https://webhook-mode.com"
+            assert pm._rcfg.webhook_secret == "secret"
+            # Non-webhook reloadable values still applied.
+            assert pm._rcfg.allowed_recipients == {"inbox@myco.com"}
+            assert pm._rcfg.recipient_filtering_enabled is True
         finally:
             pm.CONFIG_FILE_PATH = original_path
             self._restore_state(saved)
 
-    def test_reload_rejects_missing_secret(self, tmp_path):
-        """Cannot reload with webhook_url but no webhook_secret."""
+    def test_reload_preserves_webhook_on_missing_secret(self, tmp_path):
+        """Reload with webhook_url but no secret preserves webhook, applies the rest."""
         saved = self._save_state()
         original_path = pm.CONFIG_FILE_PATH
         try:
@@ -2216,27 +2223,30 @@ class TestSighupReload:
             pm.CONFIG_FILE_PATH = str(cfg_path)
             pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
 
-            # Reload with URL but no secret — should be rejected
+            # Bad webhook (no secret) plus a valid filtering edit in the same file.
             cfg_path.write_text(json.dumps({
                 "webhook_url": "https://new-url.com",
+                "allowed_sender_domains": ["trusted.com"],
             }))
             with patch.dict(os.environ, {k: v for k, v in os.environ.items()
-                                          if k != 'WEBHOOK_SECRET'}, clear=True):
+                                          if k not in ('WEBHOOK_SECRET',
+                                                       'ALLOWED_SENDER_DOMAINS')}, clear=True):
                 pm.reload_config()
 
-            # Should still be the original values
+            # Webhook preserved.
             assert pm._rcfg.webhook_url == "https://original.com"
             assert pm._rcfg.webhook_secret == "original-secret"
+            # Non-webhook edit still applied.
+            assert pm._rcfg.allowed_sender_domains == {"trusted.com"}
         finally:
             pm.CONFIG_FILE_PATH = original_path
             self._restore_state(saved)
 
-    def test_reload_callable_as_signal_handler(self, tmp_path):
-        """reload_config accepts signum and frame args (signal handler signature)."""
+    def test_reload_callable_directly(self, tmp_path):
+        """reload_config is callable directly and accepts the legacy signal kwargs."""
         saved = self._save_state()
         original_path = pm.CONFIG_FILE_PATH
         try:
-            # Start in webhook mode so reload doesn't hit mode-switch guard
             cfg_path = tmp_path / "milter.json"
             cfg_path.write_text(json.dumps({
                 "webhook_url": "https://initial.com",
@@ -2245,17 +2255,75 @@ class TestSighupReload:
             pm.CONFIG_FILE_PATH = str(cfg_path)
             pm._apply_config(pm._read_config_file(str(cfg_path)), reloadable_only=False)
 
-            # Update config and reload with signal handler signature
             cfg_path.write_text(json.dumps({
-                "webhook_url": "https://signal-test.com",
-                "webhook_secret": "sig-secret",
+                "webhook_url": "https://reloaded.com",
+                "webhook_secret": "reloaded-secret",
             }))
             pm.reload_config(signum=1, frame=None)
 
-            assert pm._rcfg.webhook_url == "https://signal-test.com"
+            assert pm._rcfg.webhook_url == "https://reloaded.com"
         finally:
             pm.CONFIG_FILE_PATH = original_path
             self._restore_state(saved)
+
+
+class TestSighupHandler:
+    """The signal handler itself does no real work; the reloader thread does."""
+
+    def test_handler_only_sets_event(self):
+        pm._reload_event.clear()
+        try:
+            pm._sighup_handler(signum=1, frame=None)
+            assert pm._reload_event.is_set()
+        finally:
+            pm._reload_event.clear()
+
+    def test_reload_worker_consumes_event_and_reloads(self, tmp_path):
+        """The reloader thread waits on the event and runs reload_config."""
+        fake_done = threading.Event()
+        original_reload = pm.reload_config
+
+        def fake_reload(*args, **kwargs):
+            fake_done.set()
+
+        pm.reload_config = fake_reload
+        pm._reload_event.clear()
+        try:
+            threading.Thread(target=pm._reload_worker, daemon=True).start()
+            pm._reload_event.set()
+            assert fake_done.wait(timeout=1.0), "reloader thread did not call reload_config"
+        finally:
+            pm.reload_config = original_reload
+            pm._reload_event.clear()
+
+
+class TestSafeInt:
+    def test_safe_int_valid(self):
+        assert pm._safe_int("42", 100, "x") == 42
+        assert pm._safe_int(42, 100, "x") == 42
+
+    def test_safe_int_falls_back_on_garbage(self):
+        assert pm._safe_int("not-a-number", 100, "x") == 100
+        assert pm._safe_int(None, 100, "x") == 100
+        assert pm._safe_int([], 100, "x") == 100
+
+
+class TestConfigFilePerms:
+    def test_world_readable_config_logs_warning(self, tmp_path, caplog):
+        cfg_path = tmp_path / "milter.json"
+        cfg_path.write_text(json.dumps({"webhook_url": "https://x.com"}))
+        os.chmod(str(cfg_path), 0o644)
+        with caplog.at_level("WARNING"):
+            pm._read_config_file(str(cfg_path))
+        assert any("group/world-readable" in r.message for r in caplog.records)
+
+    def test_owner_only_config_no_warning(self, tmp_path, caplog):
+        cfg_path = tmp_path / "milter.json"
+        cfg_path.write_text(json.dumps({"webhook_url": "https://x.com"}))
+        os.chmod(str(cfg_path), 0o600)
+        with caplog.at_level("WARNING"):
+            pm._read_config_file(str(cfg_path))
+        assert not any("group/world-readable" in r.message for r in caplog.records)
 
 
 class TestEndToEndConfigFile:

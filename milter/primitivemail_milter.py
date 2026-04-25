@@ -20,6 +20,7 @@ import json
 import base64
 import logging
 import signal
+import threading
 import time
 import hashlib
 import ipaddress
@@ -312,21 +313,48 @@ class ReloadableConfig:
 _rcfg = ReloadableConfig()
 
 
+def _warn_if_world_readable(path: str) -> None:
+    """Warn when the config file is group/world-readable.
+
+    The file may hold webhook_secret and storage_key, so 0600 is the
+    expected mode.  Non-fatal: we just log.
+    """
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        logger.warning(
+            f"Config file {path} is group/world-readable (mode {mode:o}); "
+            f"recommend `chmod 0600` since it may contain webhook_secret/storage_key"
+        )
+
+
 def _read_config_file(path: str) -> dict:
     """Read a JSON config file.  Returns {} if the file does not exist or
     is not valid JSON (with a warning)."""
     try:
         with open(path) as f:
             data = json.load(f)
-            if not isinstance(data, dict):
-                logger.warning(f"Config file {path} is not a JSON object, ignoring")
-                return {}
-            return data
     except FileNotFoundError:
         return {}
     except (json.JSONDecodeError, ValueError, OSError) as e:
         logger.warning(f"Failed to read config file {path}: {e}")
         return {}
+    if not isinstance(data, dict):
+        logger.warning(f"Config file {path} is not a JSON object, ignoring")
+        return {}
+    _warn_if_world_readable(path)
+    return data
+
+
+def _safe_int(value, default: int, name: str) -> int:
+    """Coerce value to int; on failure log and return default."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid {name} value {value!r}; using default {default}")
+        return default
 
 
 def _cfg(file_data: dict, key: str, env_var: str, default=None):
@@ -429,22 +457,47 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     new_cfg = _build_reloadable_config(file_data)
 
     if reloadable_only:
-        # Guard: don't allow reload to flip between standalone and webhook mode.
+        # If webhook fields can't be safely applied, preserve them from the
+        # current config but still apply the other reloadable values.  The
+        # previous "reject the whole reload" behaviour silently dropped
+        # unrelated edits (e.g. allowed_recipients) made in the same file.
         was_webhook = not STANDALONE_MODE
         would_be_webhook = bool(new_cfg.webhook_url)
+        preserve_webhook = False
+
         if was_webhook != would_be_webhook:
-            logger.error(f"Config reload rejected: cannot switch modes via SIGHUP "
-                         f"(current: {'webhook' if was_webhook else 'standalone'}, "
-                         f"new config would be: {'webhook' if would_be_webhook else 'standalone'}). "
-                         f"Restart the milter to change modes.")
-            return
+            logger.error(
+                f"Cannot switch modes via SIGHUP "
+                f"(current: {'webhook' if was_webhook else 'standalone'}, "
+                f"new config would be: {'webhook' if would_be_webhook else 'standalone'}). "
+                f"Webhook fields preserved; other reloadable values applied. "
+                f"Restart the milter to change modes."
+            )
+            preserve_webhook = True
+        elif would_be_webhook and not new_cfg.webhook_secret:
+            logger.error(
+                "webhook_url is set but webhook_secret is missing. "
+                "Webhook fields preserved; other reloadable values applied."
+            )
+            preserve_webhook = True
 
-        # Guard: webhook mode requires a secret
-        if would_be_webhook and not new_cfg.webhook_secret:
-            logger.error("Config reload rejected: webhook_url is set but webhook_secret is missing")
-            return
+        if preserve_webhook:
+            old = _rcfg
+            new_cfg = ReloadableConfig(
+                webhook_url=old.webhook_url,
+                webhook_secret=old.webhook_secret,
+                webhook_extra_headers=old.webhook_extra_headers,
+                storage_url=new_cfg.storage_url,
+                storage_key=new_cfg.storage_key,
+                storage_auth_style=new_cfg.storage_auth_style,
+                allowed_sender_domains=new_cfg.allowed_sender_domains,
+                allowed_senders=new_cfg.allowed_senders,
+                allow_bounces=new_cfg.allow_bounces,
+                allowed_recipients=new_cfg.allowed_recipients,
+                spoof_protection=new_cfg.spoof_protection,
+            )
 
-    # Atomic swap — one pointer assignment, GIL-atomic.  Handler threads
+    # Atomic swap, one pointer assignment, GIL-atomic.  Handler threads
     # that already hold a reference to the old _rcfg continue using it
     # for the current message; new messages will pick up this new object.
     _rcfg = new_cfg
@@ -455,8 +508,9 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     # --- Non-reloadable values (startup only) ---
     MESSAGE_ID_DOMAIN = _cfg(file_data, 'mydomain', 'MYDOMAIN', 'primitivemail')
     MAIL_DIR = _cfg(file_data, 'mail_dir', 'MAIL_DIR', '/mail/incoming')
-    STORAGE_UPLOAD_THRESHOLD = int(_cfg(file_data, 'storage_upload_threshold',
-                                        'STORAGE_UPLOAD_THRESHOLD', '3000000'))
+    STORAGE_UPLOAD_THRESHOLD = _safe_int(
+        _cfg(file_data, 'storage_upload_threshold', 'STORAGE_UPLOAD_THRESHOLD', '3000000'),
+        3_000_000, 'storage_upload_threshold')
 
     STANDALONE_MODE = not _rcfg.webhook_url
 
@@ -489,18 +543,50 @@ def _log_config_summary():
         logger.info(f"Spamhaus DNSBL enabled: {SPAMHAUS_DNSBL_DOMAIN} (enforcing {SPAMHAUS_DROP_CODE})")
 
 
+# Signalled by the SIGHUP handler; the reloader thread waits on this and
+# performs the actual reload work off the signal-handler stack.
+_reload_event = threading.Event()
+
+
+def _sighup_handler(signum=None, frame=None):
+    """SIGHUP handler.  Sets the reload event and returns immediately.
+
+    Reason: signal handlers run on the main thread between bytecodes.
+    Doing file I/O, JSON parsing, or `logger.info` from inside a handler
+    can stall (or, with handlers that take locks like the Loki/file
+    logging handlers, deadlock) when a worker thread is mid-emit on the
+    same handler.  Keep this minimal; let `_reload_worker` do the work.
+    """
+    _reload_event.set()
+
+
+def _reload_worker():
+    """Background thread that performs config reloads when SIGHUP fires."""
+    while True:
+        _reload_event.wait()
+        _reload_event.clear()
+        try:
+            reload_config()
+        except Exception as e:
+            logger.error(f"Config reload failed: {e}")
+
+
 def reload_config(signum=None, frame=None):
     """Reload hot-reloadable config values from the config file.
 
-    Called on SIGHUP. Re-reads the config file and builds a new
-    ReloadableConfig, then swaps it atomically.  Non-reloadable values
-    (mydomain, mail_dir, etc.) are left unchanged.
+    Re-reads the config file and builds a new ReloadableConfig, then
+    swaps it atomically.  Non-reloadable values (mydomain, mail_dir,
+    etc.) are left unchanged.
 
     If the config file was present at startup but is now missing or
     unreadable, the reload is aborted to prevent accidentally clearing
     file-only settings.
+
+    Safe to call directly (e.g. from tests).  In production it runs on
+    the reloader thread, signalled by `_sighup_handler`; the
+    `signum`/`frame` kwargs are accepted for legacy callers.
     """
-    logger.info("SIGHUP received - reloading configuration")
+    logger.info("Reloading configuration")
     file_data = _read_config_file(CONFIG_FILE_PATH)
     if not file_data and _initial_file_data:
         logger.warning("Config file is missing or unreadable; "
@@ -1670,8 +1756,11 @@ def main():
     """Start the milter"""
     global METRICS_ENABLED
 
-    # Register SIGHUP handler for config reload
-    signal.signal(signal.SIGHUP, reload_config)
+    # Register SIGHUP handler for config reload.  The handler itself only
+    # sets an event; the reloader thread does the actual work so file I/O
+    # and logging don't run on the signal-handler stack.
+    signal.signal(signal.SIGHUP, _sighup_handler)
+    threading.Thread(target=_reload_worker, daemon=True, name='config-reloader').start()
 
     # Socket configuration
     # Use TCP socket for easier Docker networking
