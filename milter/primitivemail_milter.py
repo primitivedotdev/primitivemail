@@ -225,12 +225,31 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Shared HTTP client. PoolManager is thread-safe and amortises socket setup
-# across requests. retries=False keeps the existing single-shot behavior —
-# the milter decides what to do on errors based on its own classification.
+# across requests. The pool is cleared on SIGHUP (see reload_config) so that
+# webhook_url / storage_url changes don't leave stale connections holding
+# DNS pinning to the old endpoint.
+#
+# retries: a single transparent retry on connection-level errors only. This
+# is the urllib3-specific failure mode where the server has closed our
+# keep-aliveconnection between calls — without a retry we'd surface a spurious
+# network error on the first request to use the stale connection. The retry
+# does NOT apply to read errors or non-2xx responses (status_forcelist=()),
+# preserving the existing single-attempt semantics for application-level
+# failures: the milter still decides REJECT vs TEMPFAIL on each response.
 _HTTP = urllib3.PoolManager(
     maxsize=10,
     block=False,
-    retries=False,
+    retries=urllib3.util.Retry(
+        total=1,
+        connect=1,
+        read=False,
+        redirect=False,
+        status=False,
+        other=0,
+        status_forcelist=(),
+        backoff_factor=0,
+        raise_on_status=False,
+    ),
 )
 
 # Deferred tracing log (after basicConfig so the message is visible)
@@ -515,6 +534,10 @@ def reload_config(signum=None, frame=None):
                        "aborting reload to preserve current state")
         return
     _apply_config(file_data, reloadable_only=True)
+    # Drop pooled HTTP connections so a webhook_url change doesn't leave
+    # idle connections holding DNS pinning to the old endpoint. Cheap —
+    # the pool refills naturally on the next request.
+    _HTTP.clear()
     cfg = _rcfg
     logger.info(f"Config reloaded (webhook_url={cfg.webhook_url}, "
                 f"sender_filter={cfg.sender_filtering_enabled}, "
