@@ -661,7 +661,7 @@ ensure_certbot_timer_enabled() {
         warn "Could not find or enable a certbot renewal timer."
         warn "Automatic renewal is NOT scheduled. Your cert will expire in 90 days."
         detail "As a fallback, add a cron entry:"
-        detail "  0 4,16 * * * /usr/bin/certbot renew --quiet"
+        detail "  0 4,16 * * * $(command -v certbot || echo certbot) renew --quiet"
     fi
 }
 
