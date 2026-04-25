@@ -528,49 +528,54 @@ forward_letsencrypt_paths() {
 
 mount_letsencrypt_in_compose() {
     # Add a read-only /etc/letsencrypt mount to the primitivemail service so
-    # the container can read the renewed cert chain. Idempotent: if the
-    # mount line is already present, leave the file alone.
+    # the container can read the renewed cert chain. Delegates the YAML
+    # rewriting to installer/inject-compose-mount.awk so failure modes have
+    # explicit exit codes (no silent no-op when the compose file's shape
+    # has drifted from what the awk expects).
     local compose_path="${INSTALL_DIR}/docker-compose.yml"
+    local awk_script="${INSTALL_DIR}/installer/inject-compose-mount.awk"
 
     if [[ ! -f "$compose_path" ]]; then
         warn "docker-compose.yml not found at $compose_path; skipping mount injection"
         return
     fi
-
-    if grep -qE '^\s*-\s*/etc/letsencrypt:/etc/letsencrypt' "$compose_path"; then
-        success "docker-compose.yml already mounts /etc/letsencrypt"
-        return
+    if [[ ! -f "$awk_script" ]]; then
+        error "Mount injection helper not found at $awk_script"
+        detail "Your checkout may be incomplete. Re-clone the repo and try again."
+        exit 1
     fi
 
-    # Insert after the `./maildata:/mail/incoming` line, but only within the
-    # primitivemail service block. We track whether we are inside that
-    # service by watching for service header lines (two-space indent ending
-    # in a colon under `services:`); the flag turns on at `primitivemail:`
-    # and back off at the next service header. This way, reordering
-    # services or other services adding the same maildata mount cannot
-    # cause the injection to land in the wrong place.
-    awk '
-        BEGIN { in_pm=0; inserted=0 }
-        {
-            # Service header: two-space indent, identifier, trailing colon.
-            if ($0 ~ /^[[:space:]]{2}[A-Za-z0-9_-]+:[[:space:]]*$/) {
-                if ($0 ~ /^[[:space:]]{2}primitivemail:[[:space:]]*$/) {
-                    in_pm = 1
-                } else {
-                    in_pm = 0
-                }
-            }
-            print $0
-            if (in_pm && !inserted && $0 ~ /^[[:space:]]*-[[:space:]]*\.\/maildata:\/mail\/incoming[[:space:]]*$/) {
-                # Match indentation of the matched line so YAML stays valid.
-                match($0, /^[[:space:]]*/)
-                indent = substr($0, RSTART, RLENGTH)
-                printf "%s- /etc/letsencrypt:/etc/letsencrypt:ro\n", indent
-                inserted = 1
-            }
-        }
-    ' "$compose_path" > "${compose_path}.tmp" && mv "${compose_path}.tmp" "$compose_path"
-    success "Added /etc/letsencrypt:ro mount to primitivemail service"
+    # The awk helper expects the compose file passed twice (two-pass) so it
+    # can detect an existing mount line without emitting a duplicate.
+    local rc=0
+    awk -f "$awk_script" "$compose_path" "$compose_path" > "${compose_path}.tmp" || rc=$?
+    case "$rc" in
+        0)
+            mv "${compose_path}.tmp" "$compose_path"
+            success "Added /etc/letsencrypt:ro mount to primitivemail service"
+            ;;
+        2)
+            rm -f "${compose_path}.tmp"
+            success "docker-compose.yml already mounts /etc/letsencrypt"
+            ;;
+        3)
+            rm -f "${compose_path}.tmp"
+            error "Could not inject /etc/letsencrypt mount: primitivemail service block not found in docker-compose.yml"
+            detail "If you renamed the service or restructured the file, mount /etc/letsencrypt:/etc/letsencrypt:ro into the postfix container manually and re-run."
+            exit 1
+            ;;
+        4)
+            rm -f "${compose_path}.tmp"
+            error "Could not inject /etc/letsencrypt mount: ./maildata:/mail/incoming anchor missing inside primitivemail service block"
+            detail "The injector anchors after the maildata mount; restore the standard volumes shape or mount /etc/letsencrypt manually."
+            exit 1
+            ;;
+        *)
+            rm -f "${compose_path}.tmp"
+            error "Mount injection failed with unexpected awk exit code $rc"
+            exit 1
+            ;;
+    esac
 }
 
 install_renewal_hook() {

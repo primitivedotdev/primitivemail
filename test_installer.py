@@ -1662,3 +1662,153 @@ class TestRunWithProgressNonTty:
         assert "Building failed" in combined
         assert "tail_line_one" in combined
         assert "tail_line_two" in combined
+
+
+# ===========================================================================
+# Compose mount injection (installer/inject-compose-mount.awk)
+# ===========================================================================
+#
+# Subprocess tests of the awk helper that injects a /etc/letsencrypt mount
+# into docker-compose.yml. We feed it adversarial layouts and assert exit
+# codes; the regression we are guarding is "silent no-op when the awk's
+# assumptions break", which previously caused the container to fall back to
+# self-signed without any signal at install time.
+
+class TestInjectComposeMount:
+    AWK_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "installer",
+        "inject-compose-mount.awk",
+    )
+
+    def _run(self, fixture, tmp_path):
+        """Write fixture to a tmp file, invoke awk -f script file file.
+
+        Returns (returncode, stdout, stderr). The compose path is doubled
+        so the awk's two-pass logic can detect existing mount lines.
+        """
+        import subprocess
+        compose = tmp_path / "docker-compose.yml"
+        compose.write_text(fixture)
+        result = subprocess.run(
+            ["awk", "-f", self.AWK_PATH, str(compose), str(compose)],
+            capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    def test_injection_happens_when_anchor_present(self, tmp_path):
+        fixture = (
+            "services:\n"
+            "  primitivemail:\n"
+            "    image: x\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+            "  watcher:\n"
+            "    image: y\n"
+        )
+        rc, out, _ = self._run(fixture, tmp_path)
+        assert rc == 0
+        assert "- /etc/letsencrypt:/etc/letsencrypt:ro" in out
+        # Inserted right after the maildata anchor, not at end of file.
+        lines = out.splitlines()
+        anchor_idx = lines.index("      - ./maildata:/mail/incoming")
+        assert lines[anchor_idx + 1] == "      - /etc/letsencrypt:/etc/letsencrypt:ro"
+
+    def test_idempotent_when_mount_already_present(self, tmp_path):
+        fixture = (
+            "services:\n"
+            "  primitivemail:\n"
+            "    image: x\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+            "      - /etc/letsencrypt:/etc/letsencrypt:ro\n"
+        )
+        rc, out, _ = self._run(fixture, tmp_path)
+        # Exit 2 = already present, no-op success. Output equals input.
+        assert rc == 2
+        assert out == fixture
+        # Crucially: only one occurrence, no duplicate insertion.
+        assert out.count("/etc/letsencrypt:/etc/letsencrypt") == 1
+
+    def test_fails_when_primitivemail_service_missing(self, tmp_path):
+        fixture = (
+            "services:\n"
+            "  watcher:\n"
+            "    image: y\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+        )
+        rc, _, err = self._run(fixture, tmp_path)
+        assert rc == 3
+        assert "primitivemail service block not found" in err
+
+    def test_fails_when_anchor_missing_inside_pm_block(self, tmp_path):
+        fixture = (
+            "services:\n"
+            "  primitivemail:\n"
+            "    image: x\n"
+            "    volumes:\n"
+            "      - ./other:/somewhere\n"
+        )
+        rc, _, err = self._run(fixture, tmp_path)
+        assert rc == 4
+        assert "no ./maildata:/mail/incoming anchor" in err
+
+    def test_fails_on_tab_indented_yaml(self, tmp_path):
+        # Tabs are not legal indentation in YAML, but operators sometimes
+        # paste reformatted compose files. The awk anchors on two-space
+        # indents; this is the "shape changed, fail loudly" case.
+        fixture = (
+            "services:\n"
+            "\tprimitivemail:\n"
+            "\t\timage: x\n"
+            "\t\tvolumes:\n"
+            "\t\t\t- ./maildata:/mail/incoming\n"
+        )
+        rc, _, err = self._run(fixture, tmp_path)
+        # Falls into "service block not found" because the regex requires
+        # exact two-space indent.
+        assert rc == 3
+        assert "primitivemail service block not found" in err
+
+    def test_fails_on_flow_style_volumes(self, tmp_path):
+        # Compose accepts flow style for volumes lists. Our awk does not;
+        # injection would land on the wrong line, so we refuse to touch it.
+        fixture = (
+            "services:\n"
+            "  primitivemail:\n"
+            "    image: x\n"
+            "    volumes: [./maildata:/mail/incoming]\n"
+        )
+        rc, _, err = self._run(fixture, tmp_path)
+        assert rc == 4
+        assert "no ./maildata:/mail/incoming anchor" in err
+
+    def test_does_not_inject_into_other_service_with_same_anchor(self, tmp_path):
+        # Both services mount ./maildata:/mail/incoming. The injection
+        # must land in primitivemail's block only.
+        fixture = (
+            "services:\n"
+            "  watcher:\n"
+            "    image: y\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+            "  primitivemail:\n"
+            "    image: x\n"
+            "    volumes:\n"
+            "      - ./maildata:/mail/incoming\n"
+        )
+        rc, out, _ = self._run(fixture, tmp_path)
+        assert rc == 0
+        # Expected: exactly one /etc/letsencrypt mount line, and it sits
+        # under primitivemail (i.e. after the second maildata anchor).
+        lines = out.splitlines()
+        le_lines = [i for i, line in enumerate(lines) if "/etc/letsencrypt" in line]
+        assert len(le_lines) == 1
+        # Find the primitivemail header position; the LE line must come
+        # after it. Watcher's block must remain untouched.
+        pm_header_idx = next(
+            i for i, line in enumerate(lines) if line.strip() == "primitivemail:"
+        )
+        assert le_lines[0] > pm_header_idx
+
