@@ -536,6 +536,10 @@ install_renewal_hook() {
 # Installed by primitivemail's install.sh --enable-letsencrypt.
 set -e
 cd "${INSTALL_DIR}"
+# Skip cleanly if the container is intentionally stopped, otherwise
+# certbot logs a hook failure even though the cert renewed fine. The
+# -T flag disables TTY allocation for the non-interactive cron context.
+docker compose ps --status running primitivemail | grep -q primitivemail || exit 0
 docker compose exec -T primitivemail postfix reload
 EOF
     sudo chmod +x "$hook_path"
