@@ -169,6 +169,36 @@ class TestGenerateEnvContent:
         assert "TLS_CERT=/etc/letsencrypt/live/mx.example.com/fullchain.pem" in result
         assert "TLS_KEY=/etc/letsencrypt/live/mx.example.com/privkey.pem" in result
 
+    def test_letsencrypt_host_dir_omitted_when_empty(self):
+        # No host dir = docker-compose's `${LETSENCRYPT_HOST_DIR:-/var/empty}`
+        # default kicks in and the bind mount points at an empty directory,
+        # which is a harmless no-op. The key must NOT appear so re-runs
+        # without --letsencrypt-host-dir do not lock in a stale value.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+        )
+        assert "LETSENCRYPT_HOST_DIR" not in result
+
+    def test_letsencrypt_host_dir_written_when_set(self):
+        # install.sh --enable-letsencrypt forwards --letsencrypt-host-dir
+        # /etc/letsencrypt so docker-compose's bind-mount source resolves
+        # to the host's cert tree.
+        result = generate_env_content(
+            hostname="mx.example.com", domain="example.com",
+            enable_ip_literal=False, ip_literal="",
+            webhook_url="", webhook_secret="",
+            event_webhook_url="", event_webhook_secret="",
+            allowed_sender_domains="", allowed_senders="",
+            allowed_recipients="", spoof_protection="off",
+            letsencrypt_host_dir="/etc/letsencrypt",
+        )
+        assert "LETSENCRYPT_HOST_DIR=/etc/letsencrypt" in result
+
 
 # ===========================================================================
 # Config summary
@@ -1406,6 +1436,27 @@ class TestParseArgsImplications:
         assert args.tls_cert == "/etc/letsencrypt/live/mx.example.com/fullchain.pem"
         assert args.tls_key == "/etc/letsencrypt/live/mx.example.com/privkey.pem"
 
+    def test_letsencrypt_host_dir_default_empty(self, monkeypatch):
+        # Default behavior: no host dir set, docker-compose's
+        # ${LETSENCRYPT_HOST_DIR:-/var/empty} default mounts a harmless
+        # empty directory and the container does not see a cert tree.
+        from installer.main import parse_args
+        monkeypatch.setattr("sys.argv", ["installer"])
+        args = parse_args()
+        assert args.letsencrypt_host_dir == ""
+
+    def test_letsencrypt_host_dir_captured(self, monkeypatch):
+        # install.sh --enable-letsencrypt forwards --letsencrypt-host-dir
+        # /etc/letsencrypt so generate_env_content writes the value to
+        # .env and docker-compose binds the host cert tree at start time.
+        from installer.main import parse_args
+        monkeypatch.setattr(
+            "sys.argv",
+            ["installer", "--letsencrypt-host-dir", "/etc/letsencrypt"],
+        )
+        args = parse_args()
+        assert args.letsencrypt_host_dir == "/etc/letsencrypt"
+
 
 # ===========================================================================
 # _observability_is_enabled helper
@@ -1697,193 +1748,6 @@ class TestRunWithProgressNonTty:
 
 
 # ===========================================================================
-# Compose mount injection (installer/inject-compose-mount.awk)
-# ===========================================================================
-#
-# Subprocess tests of the awk helper that injects a /etc/letsencrypt mount
-# into docker-compose.yml. We feed it adversarial layouts and assert exit
-# codes; the regression we are guarding is "silent no-op when the awk's
-# assumptions break", which previously caused the container to fall back to
-# self-signed without any signal at install time.
-
-class TestInjectComposeMount:
-    AWK_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "installer",
-        "inject-compose-mount.awk",
-    )
-
-    def _run(self, fixture, tmp_path):
-        """Write fixture to a tmp file, invoke awk -f script file file.
-
-        Returns (returncode, stdout, stderr). The compose path is doubled
-        so the awk's two-pass logic can detect existing mount lines.
-        """
-        import subprocess
-        compose = tmp_path / "docker-compose.yml"
-        compose.write_text(fixture)
-        result = subprocess.run(
-            ["awk", "-f", self.AWK_PATH, str(compose), str(compose)],
-            capture_output=True, text=True,
-        )
-        return result.returncode, result.stdout, result.stderr
-
-    def test_injection_happens_when_anchor_present(self, tmp_path):
-        fixture = (
-            "services:\n"
-            "  primitivemail:\n"
-            "    image: x\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-            "  watcher:\n"
-            "    image: y\n"
-        )
-        rc, out, _ = self._run(fixture, tmp_path)
-        assert rc == 0
-        assert "- /etc/letsencrypt:/etc/letsencrypt:ro" in out
-        # Inserted right after the maildata anchor, not at end of file.
-        lines = out.splitlines()
-        anchor_idx = lines.index("      - ./maildata:/mail/incoming")
-        assert lines[anchor_idx + 1] == "      - /etc/letsencrypt:/etc/letsencrypt:ro"
-
-    def test_idempotent_when_mount_already_present(self, tmp_path):
-        fixture = (
-            "services:\n"
-            "  primitivemail:\n"
-            "    image: x\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-            "      - /etc/letsencrypt:/etc/letsencrypt:ro\n"
-        )
-        rc, out, _ = self._run(fixture, tmp_path)
-        # Exit 2 = already present, no-op success. Output equals input.
-        assert rc == 2
-        assert out == fixture
-        # Crucially: only one occurrence, no duplicate insertion.
-        assert out.count("/etc/letsencrypt:/etc/letsencrypt") == 1
-
-    def test_fails_when_primitivemail_service_missing(self, tmp_path):
-        fixture = (
-            "services:\n"
-            "  watcher:\n"
-            "    image: y\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-        )
-        rc, _, err = self._run(fixture, tmp_path)
-        assert rc == 3
-        assert "primitivemail service block not found" in err
-
-    def test_fails_when_anchor_missing_inside_pm_block(self, tmp_path):
-        fixture = (
-            "services:\n"
-            "  primitivemail:\n"
-            "    image: x\n"
-            "    volumes:\n"
-            "      - ./other:/somewhere\n"
-        )
-        rc, _, err = self._run(fixture, tmp_path)
-        assert rc == 4
-        assert "no ./maildata:/mail/incoming anchor" in err
-
-    def test_fails_on_tab_indented_yaml(self, tmp_path):
-        # Tabs are not legal indentation in YAML, but operators sometimes
-        # paste reformatted compose files. The awk anchors on two-space
-        # indents; this is the "shape changed, fail loudly" case.
-        fixture = (
-            "services:\n"
-            "\tprimitivemail:\n"
-            "\t\timage: x\n"
-            "\t\tvolumes:\n"
-            "\t\t\t- ./maildata:/mail/incoming\n"
-        )
-        rc, _, err = self._run(fixture, tmp_path)
-        # Falls into "service block not found" because the regex requires
-        # exact two-space indent.
-        assert rc == 3
-        assert "primitivemail service block not found" in err
-
-    def test_fails_on_flow_style_volumes(self, tmp_path):
-        # Compose accepts flow style for volumes lists. Our awk does not;
-        # injection would land on the wrong line, so we refuse to touch it.
-        fixture = (
-            "services:\n"
-            "  primitivemail:\n"
-            "    image: x\n"
-            "    volumes: [./maildata:/mail/incoming]\n"
-        )
-        rc, _, err = self._run(fixture, tmp_path)
-        assert rc == 4
-        assert "no ./maildata:/mail/incoming anchor" in err
-
-    def test_does_not_inject_into_other_service_with_same_anchor(self, tmp_path):
-        # Both services mount ./maildata:/mail/incoming. The injection
-        # must land in primitivemail's block only.
-        fixture = (
-            "services:\n"
-            "  watcher:\n"
-            "    image: y\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-            "  primitivemail:\n"
-            "    image: x\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-        )
-        rc, out, _ = self._run(fixture, tmp_path)
-        assert rc == 0
-        # Expected: exactly one /etc/letsencrypt mount line, and it sits
-        # under primitivemail (i.e. after the second maildata anchor).
-        lines = out.splitlines()
-        le_lines = [i for i, line in enumerate(lines) if "/etc/letsencrypt" in line]
-        assert len(le_lines) == 1
-        # Find the primitivemail header position; the LE line must come
-        # after it. Watcher's block must remain untouched.
-        pm_header_idx = next(
-            i for i, line in enumerate(lines) if line.strip() == "primitivemail:"
-        )
-        assert le_lines[0] > pm_header_idx
-
-    def test_injects_when_le_mount_lives_in_other_service_only(self, tmp_path):
-        # Regression: pass-1 idempotency detection used to be file-global,
-        # so a /etc/letsencrypt mount sitting in any other service's volumes
-        # (here: watcher) caused us to skip injection into primitivemail and
-        # the container silently fell back to self-signed. Pass 1 must scope
-        # already_present to lines inside the primitivemail block.
-        fixture = (
-            "services:\n"
-            "  watcher:\n"
-            "    image: y\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-            "      - /etc/letsencrypt:/etc/letsencrypt:ro\n"
-            "  primitivemail:\n"
-            "    image: x\n"
-            "    volumes:\n"
-            "      - ./maildata:/mail/incoming\n"
-        )
-        rc, out, _ = self._run(fixture, tmp_path)
-        assert rc == 0, f"expected injection (rc=0), got rc={rc}"
-        lines = out.splitlines()
-        le_lines = [i for i, line in enumerate(lines) if "/etc/letsencrypt" in line]
-        # Two LE mount lines now: the operator's pre-existing one in
-        # watcher, and the one we just injected into primitivemail.
-        assert len(le_lines) == 2
-        pm_header_idx = next(
-            i for i, line in enumerate(lines) if line.strip() == "primitivemail:"
-        )
-        # The injected LE line must sit after the primitivemail header.
-        assert any(idx > pm_header_idx for idx in le_lines)
-        # And the watcher's existing LE line is preserved verbatim.
-        watcher_header_idx = next(
-            i for i, line in enumerate(lines) if line.strip() == "watcher:"
-        )
-        assert any(
-            watcher_header_idx < idx < pm_header_idx for idx in le_lines
-        )
-
-
-# ===========================================================================
 # preserve_existing_tls_paths (install.sh)
 # ===========================================================================
 #
@@ -1913,17 +1777,22 @@ class TestPreserveExistingTlsPaths:
             key_path.write_text("fake-key")
         return install_dir, str(cert_path), str(key_path)
 
-    def _env(self, cert=None, key=None):
-        # Render a minimal .env with TLS_CERT / TLS_KEY lines.
+    def _env(self, cert=None, key=None, host_dir=None):
+        # Render a minimal .env with TLS_CERT / TLS_KEY / LETSENCRYPT_HOST_DIR
+        # lines. Each is independently optional so tests can probe each
+        # preservation branch in isolation.
         lines = ["SOMETHING=other"]
         if cert is not None:
             lines.append(f"TLS_CERT={cert}")
         if key is not None:
             lines.append(f"TLS_KEY={key}")
+        if host_dir is not None:
+            lines.append(f"LETSENCRYPT_HOST_DIR={host_dir}")
         return "\n".join(lines) + "\n"
 
     def _invoke(self, install_dir, *, env_contents,
-                tls_cert_explicit="0", tls_key_explicit="0", enable_le="0"):
+                tls_cert_explicit="0", tls_key_explicit="0",
+                letsencrypt_host_dir_explicit="0", enable_le="0"):
         """Source install.sh (with trailing `main` call stripped), stub
         sudo to passthrough, set globals, call the function, and emit
         FORWARD_ARGS one-per-line on stdout.
@@ -1944,6 +1813,7 @@ eval "$src"
 INSTALL_DIR={str(install_dir)!r}
 TLS_CERT_EXPLICIT={tls_cert_explicit!r}
 TLS_KEY_EXPLICIT={tls_key_explicit!r}
+LETSENCRYPT_HOST_DIR_EXPLICIT={letsencrypt_host_dir_explicit!r}
 ENABLE_LETSENCRYPT={enable_le!r}
 FORWARD_ARGS=()
 preserve_existing_tls_paths >/dev/null 2>&1
@@ -2060,6 +1930,52 @@ fi
         assert rc == 0, err
         assert "--tls-cert" not in args
         assert "--tls-key" in args
+
+    def test_letsencrypt_host_dir_preserved_when_dir_exists(self, tmp_path):
+        # Re-run path: existing .env declares LETSENCRYPT_HOST_DIR pointing
+        # at a real directory on disk; we must forward it via
+        # --letsencrypt-host-dir so the mount source survives the .env
+        # rewrite the Python installer does.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        host_dir = install_dir / "letsencrypt-tree"
+        host_dir.mkdir()
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(cert=cert, key=key, host_dir=str(host_dir)),
+        )
+        assert rc == 0, err
+        assert "--letsencrypt-host-dir" in args
+        assert args[args.index("--letsencrypt-host-dir") + 1] == str(host_dir)
+
+    def test_letsencrypt_host_dir_not_preserved_when_dir_missing(self, tmp_path):
+        # If the dir from .env no longer exists on disk, do not forward it;
+        # docker-compose would fail to mount a non-existent path.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents=self._env(
+                cert=cert, key=key,
+                host_dir=str(install_dir / "does-not-exist"),
+            ),
+        )
+        assert rc == 0, err
+        assert "--letsencrypt-host-dir" not in args
+
+    def test_letsencrypt_host_dir_explicit_skips_preservation(self, tmp_path):
+        # When the operator passes --letsencrypt-host-dir explicitly, the
+        # CLI value wins and we do not preserve the .env value on top.
+        install_dir, cert, key = self._setup_paths(tmp_path)
+        host_dir = install_dir / "letsencrypt-tree"
+        host_dir.mkdir()
+        rc, args, err = self._invoke(
+            install_dir,
+            letsencrypt_host_dir_explicit="1",
+            env_contents=self._env(cert=cert, key=key, host_dir=str(host_dir)),
+        )
+        assert rc == 0, err
+        # Cert/key still preserved (they have their own explicit flags),
+        # but the host dir is left to whatever the CLI flag carried.
+        assert "--letsencrypt-host-dir" not in args
 
     def test_env_without_tls_lines_does_not_crash_under_pipefail(self, tmp_path):
         # Regression: install.sh runs under `set -euo pipefail`. When .env

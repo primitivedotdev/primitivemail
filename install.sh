@@ -36,6 +36,11 @@ LE_SKIP_VERIFY=0
 # --enable-letsencrypt does not silently wipe the existing TLS config.
 TLS_CERT_EXPLICIT=0
 TLS_KEY_EXPLICIT=0
+# Tracks whether the operator passed --letsencrypt-host-dir explicitly.
+# When set, their value wins over preservation logic; when unset,
+# preserve_existing_tls_paths may forward whatever .env already declares
+# (so a re-run does not silently drop the bind-mount path).
+LETSENCRYPT_HOST_DIR_EXPLICIT=0
 _ui_out() {
     if [[ "$JSON_MODE" == "1" ]]; then
         echo -e "$1" 1>&2
@@ -138,6 +143,16 @@ while [[ $# -gt 0 ]]; do
             FORWARD_ARGS+=("$1")
             shift
             ;;
+        --letsencrypt-host-dir)
+            LETSENCRYPT_HOST_DIR_EXPLICIT=1
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --letsencrypt-host-dir=*)
+            LETSENCRYPT_HOST_DIR_EXPLICIT=1
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
         --help|-h)
             echo "PrimitiveMail Installer"
             echo ""
@@ -171,8 +186,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --tls-cert PATH           Absolute path to a TLS certificate file readable"
             echo "                            inside the container (e.g. corporate CA-issued cert)."
             echo "  --tls-key PATH            Absolute path to the matching private key."
-            echo "                            Mount these into the container yourself; install.sh"
-            echo "                            does not auto-bind volumes for non-LE paths."
+            echo "                            Mount these into the container yourself, or pass"
+            echo "                            --letsencrypt-host-dir to bind a cert tree."
+            echo "  --letsencrypt-host-dir PATH"
+            echo "                            Host directory bound read-only at /etc/letsencrypt"
+            echo "                            inside the container. Set automatically by"
+            echo "                            --enable-letsencrypt; useful for BYO cert layouts."
             echo ""
             echo "Output:"
             echo "  --json                    NDJSON progress events on stdout, human output on stderr."
@@ -533,67 +552,22 @@ issue_letsencrypt_cert() {
 
 forward_letsencrypt_paths() {
     # Forward the LE cert paths to the Python installer via --tls-cert /
-    # --tls-key. The Python installer's generate_env_content writes them
-    # into .env, which docker-compose reads to populate TLS_CERT / TLS_KEY
-    # in the container. Doing it via the Python installer (instead of
-    # appending lines to .env after the fact) avoids the Python installer's
-    # write_env clobbering the LE paths during normal operation.
+    # --tls-key, and the host directory that docker-compose should bind to
+    # /etc/letsencrypt via --letsencrypt-host-dir. The Python installer's
+    # generate_env_content writes all three into .env, which docker-compose
+    # reads to populate TLS_CERT / TLS_KEY and resolve the bind-mount source
+    # via the LETSENCRYPT_HOST_DIR env-var default in the volumes block.
+    # Doing it via the Python installer (instead of appending lines to .env
+    # after the fact) avoids the Python installer's write_env clobbering
+    # these values during normal operation.
     local cert_path="/etc/letsencrypt/live/${LE_HOSTNAME}/fullchain.pem"
     local key_path="/etc/letsencrypt/live/${LE_HOSTNAME}/privkey.pem"
-    FORWARD_ARGS+=("--tls-cert" "$cert_path" "--tls-key" "$key_path")
+    FORWARD_ARGS+=(
+        "--tls-cert" "$cert_path"
+        "--tls-key" "$key_path"
+        "--letsencrypt-host-dir" "/etc/letsencrypt"
+    )
     success "Forwarding TLS_CERT=$cert_path to installer"
-}
-
-mount_letsencrypt_in_compose() {
-    # Add a read-only /etc/letsencrypt mount to the primitivemail service so
-    # the container can read the renewed cert chain. Delegates the YAML
-    # rewriting to installer/inject-compose-mount.awk so failure modes have
-    # explicit exit codes (no silent no-op when the compose file's shape
-    # has drifted from what the awk expects).
-    local compose_path="${INSTALL_DIR}/docker-compose.yml"
-    local awk_script="${INSTALL_DIR}/installer/inject-compose-mount.awk"
-
-    if [[ ! -f "$compose_path" ]]; then
-        warn "docker-compose.yml not found at $compose_path; skipping mount injection"
-        return
-    fi
-    if [[ ! -f "$awk_script" ]]; then
-        error "Mount injection helper not found at $awk_script"
-        detail "Your checkout may be incomplete. Re-clone the repo and try again."
-        exit 1
-    fi
-
-    # The awk helper expects the compose file passed twice (two-pass) so it
-    # can detect an existing mount line without emitting a duplicate.
-    local rc=0
-    awk -f "$awk_script" "$compose_path" "$compose_path" > "${compose_path}.tmp" || rc=$?
-    case "$rc" in
-        0)
-            mv "${compose_path}.tmp" "$compose_path"
-            success "Added /etc/letsencrypt:ro mount to primitivemail service"
-            ;;
-        2)
-            rm -f "${compose_path}.tmp"
-            success "docker-compose.yml already mounts /etc/letsencrypt"
-            ;;
-        3)
-            rm -f "${compose_path}.tmp"
-            error "Could not inject /etc/letsencrypt mount: primitivemail service block not found in docker-compose.yml"
-            detail "If you renamed the service or restructured the file, mount /etc/letsencrypt:/etc/letsencrypt:ro into the postfix container manually and re-run."
-            exit 1
-            ;;
-        4)
-            rm -f "${compose_path}.tmp"
-            error "Could not inject /etc/letsencrypt mount: ./maildata:/mail/incoming anchor missing inside primitivemail service block"
-            detail "The injector anchors after the maildata mount; restore the standard volumes shape or mount /etc/letsencrypt manually."
-            exit 1
-            ;;
-        *)
-            rm -f "${compose_path}.tmp"
-            error "Mount injection failed with unexpected awk exit code $rc"
-            exit 1
-            ;;
-    esac
 }
 
 install_renewal_hook() {
@@ -680,31 +654,33 @@ setup_letsencrypt() {
     install_certbot
     issue_letsencrypt_cert
     forward_letsencrypt_paths
-    mount_letsencrypt_in_compose
     install_renewal_hook
     verify_renewal
     spacer
 }
 
-# Preserve TLS_CERT/TLS_KEY across re-runs.
+# Preserve TLS_CERT / TLS_KEY / LETSENCRYPT_HOST_DIR across re-runs.
 #
 # The Python installer's write_env recreates .env from CLI args every run, so
 # an operator who set up Let's Encrypt last week and re-runs install.sh
-# (without --enable-letsencrypt and without explicit --tls-cert/--tls-key)
-# would otherwise see their cert paths silently dropped from .env, and the
-# container would fall back to the self-signed cert on the next restart.
+# (without --enable-letsencrypt and without explicit --tls-cert/--tls-key/
+# --letsencrypt-host-dir) would otherwise see those values silently dropped
+# from .env. The container would fall back to the self-signed cert on the
+# next restart, and the docker-compose LETSENCRYPT_HOST_DIR default would
+# bind /var/empty over /etc/letsencrypt.
 #
-# Behavior (cert and key are evaluated INDEPENDENTLY so passing only one of
-# the two flags does not silently drop the unflagged partner):
+# Behavior (each of cert / key / host_dir is evaluated INDEPENDENTLY so
+# passing only one of the flags does not silently drop the unflagged ones):
 #   - If --enable-letsencrypt is set, forward_letsencrypt_paths handles the
-#     forwarding and we do nothing here. LE owns both cert and key.
-#   - For each of cert / key independently:
-#       * If --tls-cert (or --tls-key) was explicit on this invocation,
+#     forwarding and we do nothing here. LE owns all three.
+#   - For each of cert / key / host_dir independently:
+#       * If the corresponding --tls-cert / --tls-key /
+#         --letsencrypt-host-dir flag was explicit on this invocation,
 #         the operator's choice wins; do not preserve that side. Explicit
 #         empty string still counts as explicit (the operator is asking to
 #         clear that value), so we do not preserve over an empty arg.
-#       * Otherwise, if the existing .env value points at a file that
-#         exists on disk, forward it via --tls-cert / --tls-key.
+#       * Otherwise, if the existing .env value points at a file/dir that
+#         exists on disk, forward it via the matching --... flag.
 #
 # Pairing correctness (matching cert + key) is NOT enforced here; it never
 # was. An operator who passes --tls-cert /new/cert without --tls-key will
@@ -726,9 +702,10 @@ preserve_existing_tls_paths() {
     # TLS_KEY lines at all, which is exactly the no-match case; without the
     # guard, the first re-install on those boxes exits before reaching the
     # Python installer.
-    local existing_cert existing_key
+    local existing_cert existing_key existing_host_dir
     existing_cert="$(grep -E '^TLS_CERT=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
     existing_key="$(grep -E '^TLS_KEY=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    existing_host_dir="$(grep -E '^LETSENCRYPT_HOST_DIR=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
 
     # Use sudo for the on-disk check because /etc/letsencrypt/live/<host>/
     # is mode 700 root:root by default; a non-root operator running
@@ -736,6 +713,7 @@ preserve_existing_tls_paths() {
     # would silently drop the LE config.
     local preserved_cert=""
     local preserved_key=""
+    local preserved_host_dir=""
 
     if [[ "$TLS_CERT_EXPLICIT" != "1" && -n "$existing_cert" ]] && sudo test -f "$existing_cert"; then
         FORWARD_ARGS+=("--tls-cert" "$existing_cert")
@@ -747,8 +725,17 @@ preserve_existing_tls_paths() {
         preserved_key="$existing_key"
     fi
 
-    if [[ -n "$preserved_cert" || -n "$preserved_key" ]]; then
-        info "Preserving existing TLS config: cert=${preserved_cert:-<unchanged>}, key=${preserved_key:-<unchanged>}"
+    # LETSENCRYPT_HOST_DIR is the bind-mount source resolved by docker-compose
+    # at start time. Preserve independently so an operator who set up LE
+    # previously does not lose the cert mount on a re-run that omits the
+    # flag. Existence check uses sudo for the same reason as cert/key above.
+    if [[ "$LETSENCRYPT_HOST_DIR_EXPLICIT" != "1" && -n "$existing_host_dir" ]] && sudo test -d "$existing_host_dir"; then
+        FORWARD_ARGS+=("--letsencrypt-host-dir" "$existing_host_dir")
+        preserved_host_dir="$existing_host_dir"
+    fi
+
+    if [[ -n "$preserved_cert" || -n "$preserved_key" || -n "$preserved_host_dir" ]]; then
+        info "Preserving existing TLS config: cert=${preserved_cert:-<unchanged>}, key=${preserved_key:-<unchanged>}, host_dir=${preserved_host_dir:-<unchanged>}"
     fi
 }
 

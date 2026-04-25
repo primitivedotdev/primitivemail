@@ -81,7 +81,9 @@ Prerequisites:
 - Inbound TCP 80 reachable (HTTP-01 challenge). The installer opens it in UFW or firewalld where active. Cloud security groups are out of scope; open them yourself.
 - The hostname in DNS must match `--hostname`.
 
-The installer issues the cert with certbot's `--standalone` plugin, mounts `/etc/letsencrypt` read-only into the container, sets `TLS_CERT` and `TLS_KEY` in `.env`, and installs a deploy hook at `/etc/letsencrypt/renewal-hooks/deploy/reload-postfix.sh` that reloads Postfix after every renewal. Renewals run automatically through certbot's systemd timer; no operator action is required.
+The installer issues the cert with certbot's `--standalone` plugin, writes `LETSENCRYPT_HOST_DIR=/etc/letsencrypt` to `.env` so `docker-compose` bind-mounts the host's cert tree read-only into the container, sets `TLS_CERT` and `TLS_KEY` in `.env`, and installs a deploy hook at `/etc/letsencrypt/renewal-hooks/deploy/reload-postfix.sh` that reloads Postfix after every renewal. Renewals run automatically through certbot's systemd timer; no operator action is required.
+
+The committed `docker-compose.yml` is never modified by the installer. The bind mount uses `${LETSENCRYPT_HOST_DIR:-/var/empty}` so an unset value mounts an empty directory (a harmless no-op), and `git pull` updates stay clean across re-installs.
 
 Add `--le-skip-verify` to skip the post-issuance `certbot renew --dry-run` (saves 10-20s on slow / CI networks).
 
@@ -93,7 +95,7 @@ curl -fsSL https://get.primitive.dev | bash -s -- \
   --tls-key  /opt/certs/privkey.pem
 ```
 
-Mount the cert files into the container yourself (the installer only auto-mounts `/etc/letsencrypt`); the same paths must be readable by the running container.
+Mount the cert files into the container yourself, or pass `--letsencrypt-host-dir <path>` so `docker-compose` bind-mounts your cert directory at `/etc/letsencrypt` read-only. The same paths must be readable by the running container.
 
 Re-running `install.sh` later without `--enable-letsencrypt` or `--tls-cert` preserves the existing TLS configuration when the file at `TLS_CERT` still exists on disk.
 

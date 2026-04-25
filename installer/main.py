@@ -38,6 +38,14 @@ def parse_args() -> argparse.Namespace:
     # default) preserves the existing self-signed-at-startup behavior.
     parser.add_argument("--tls-cert", default="", dest="tls_cert")
     parser.add_argument("--tls-key", default="", dest="tls_key")
+    # Host path that docker-compose binds to /etc/letsencrypt inside the
+    # primitivemail container. install.sh --enable-letsencrypt sets this to
+    # /etc/letsencrypt after issuing a cert; bring-your-own-cert operators
+    # can also point it at any host directory whose tree they want exposed
+    # to Postfix. Empty (the default) leaves the line out of .env, which
+    # makes docker-compose mount /var/empty — harmless and a no-op.
+    parser.add_argument("--letsencrypt-host-dir", default="",
+                        dest="letsencrypt_host_dir")
     parser.add_argument("--no-prompt", "-y", action="store_true", dest="no_prompt")
     parser.add_argument("--no-start", action="store_true", dest="no_start")
     parser.add_argument("--json", action="store_true", dest="json_output")
@@ -278,6 +286,7 @@ def configure(args: argparse.Namespace) -> dict:
         "spoof_protection": spoof_protection,
         "tls_cert": args.tls_cert,
         "tls_key": args.tls_key,
+        "letsencrypt_host_dir": args.letsencrypt_host_dir,
     }
 
 
@@ -297,6 +306,7 @@ def write_env(install_dir: str, cfg: dict) -> None:
         spoof_protection=cfg["spoof_protection"],
         tls_cert=cfg.get("tls_cert", ""),
         tls_key=cfg.get("tls_key", ""),
+        letsencrypt_host_dir=cfg.get("letsencrypt_host_dir", ""),
     )
     env_path = os.path.join(install_dir, ".env")
     with open(env_path, "w") as f:

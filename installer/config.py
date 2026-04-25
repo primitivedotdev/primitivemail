@@ -66,6 +66,7 @@ def generate_env_content(
     spoof_protection: str,
     tls_cert: str = "",
     tls_key: str = "",
+    letsencrypt_host_dir: str = "",
 ) -> str:
     """Generate .env file content. Unquoted values, one key per line.
 
@@ -75,6 +76,11 @@ def generate_env_content(
     are unchanged. When set (e.g. by install.sh --enable-letsencrypt), the
     paths are written and the milter entrypoint propagates them into the
     running Postfix config via postconf.
+
+    `letsencrypt_host_dir` is the host path that docker-compose binds to
+    /etc/letsencrypt inside the container. When empty, the key is omitted
+    and docker-compose's `${LETSENCRYPT_HOST_DIR:-/var/empty}` default
+    mounts an empty directory — harmless and equivalent to no mount.
     """
     enable = "true" if enable_ip_literal else "false"
     lines = [
@@ -96,6 +102,8 @@ def generate_env_content(
         lines.append(f"TLS_CERT={tls_cert}")
     if tls_key:
         lines.append(f"TLS_KEY={tls_key}")
+    if letsencrypt_host_dir:
+        lines.append(f"LETSENCRYPT_HOST_DIR={letsencrypt_host_dir}")
     return "\n".join(lines) + "\n"
 
 
