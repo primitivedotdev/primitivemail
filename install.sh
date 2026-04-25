@@ -346,25 +346,40 @@ check_docker() {
 # --- Firewall ------------------------------------------------------------
 
 open_firewall() {
+    # Always open 25/tcp for inbound SMTP. Also open 80/tcp when Let's
+    # Encrypt is enabled: certbot --standalone needs inbound :80 for the
+    # HTTP-01 challenge, and renewals every ~60 days hit the same port via
+    # the systemd timer. The :80 rule stays in place after issuance — it
+    # is required for renewal and operators sometimes use it for
+    # health-check endpoints. We do not tear it down on subsequent runs.
+    local ports=("25/tcp")
+    if [[ "$ENABLE_LETSENCRYPT" == "1" ]]; then
+        ports+=("80/tcp")
+    fi
+
     if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ! ufw status | grep -q "25/tcp"; then
-            info "Opening port 25 in UFW firewall..."
-            sudo ufw allow 25/tcp >/dev/null 2>&1
-            success "Port 25 opened in UFW"
-        else
-            success "Port 25 already open in UFW"
-        fi
+        for port in "${ports[@]}"; do
+            if ! ufw status | grep -q "$port"; then
+                info "Opening port $port in UFW firewall..."
+                sudo ufw allow "$port" >/dev/null 2>&1
+                success "Port $port opened in UFW"
+            else
+                success "Port $port already open in UFW"
+            fi
+        done
     fi
 
     if command -v firewall-cmd &> /dev/null && firewall-cmd --state 2>/dev/null | grep -q "running"; then
-        if ! firewall-cmd --list-ports 2>/dev/null | grep -q "25/tcp"; then
-            info "Opening port 25 in firewalld..."
-            sudo firewall-cmd --permanent --add-port=25/tcp >/dev/null 2>&1
-            sudo firewall-cmd --reload >/dev/null 2>&1
-            success "Port 25 opened in firewalld"
-        else
-            success "Port 25 already open in firewalld"
-        fi
+        for port in "${ports[@]}"; do
+            if ! firewall-cmd --list-ports 2>/dev/null | grep -q "$port"; then
+                info "Opening port $port in firewalld..."
+                sudo firewall-cmd --permanent --add-port="$port" >/dev/null 2>&1
+                sudo firewall-cmd --reload >/dev/null 2>&1
+                success "Port $port opened in firewalld"
+            else
+                success "Port $port already open in firewalld"
+            fi
+        done
     fi
 }
 
