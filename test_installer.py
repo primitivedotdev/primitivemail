@@ -2076,3 +2076,255 @@ class TestVerifyTlsReadableInContainer:
         )
         assert result is None
 
+
+# ===========================================================================
+# ensure_certbot_timer_enabled / verify_renewal_timer: schedule the renewal
+# ===========================================================================
+#
+# Background: on RPM-based distros (AL2023, RHEL, Rocky, AlmaLinux, Fedora)
+# the certbot package ships `certbot-renew.timer` but does NOT enable it on
+# install. Debian/Ubuntu's deb postinst enables `certbot.timer` for you.
+# install.sh used to assume the package manager handled it, so on RPM boxes
+# the cert issued fine but `certbot renew` was never invoked on a schedule
+# and the cert silently expired 90 days later. These tests pin the fix:
+# install.sh now calls `systemctl enable --now` on whichever timer name is
+# present, with a cron fallback warning if neither is found.
+#
+# Test harness pattern: source install.sh with the trailing `main` stripped,
+# stub `sudo` and `systemctl` as bash functions whose behavior is controlled
+# by env vars the test sets, run the function, and assert on stdout +
+# stderr.
+
+class TestEnsureCertbotTimerEnabled:
+    INSTALL_SH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "install.sh",
+    )
+
+    def _invoke(self, *, list_unit_files_returns=None, enable_now_succeeds=True):
+        """Source install.sh, stub systemctl/sudo, run the function.
+
+        list_unit_files_returns: dict mapping unit name -> bool. True means
+        `systemctl list-unit-files <unit>` will print a matching line; False
+        means it prints nothing (unit not present). Order does not matter;
+        the function iterates `certbot-renew.timer` then `certbot.timer`.
+
+        enable_now_succeeds: whether `systemctl enable --now <unit>` exits 0.
+
+        Returns (returncode, stdout, stderr).
+        """
+        import subprocess
+        if list_unit_files_returns is None:
+            list_unit_files_returns = {}
+        # Encode the unit map as a flat key=value string for the bash stub.
+        # Bash 3 (still default on macOS) lacks associative arrays, so we
+        # use a case statement.
+        cases = []
+        for unit, present in list_unit_files_returns.items():
+            if present:
+                # `systemctl list-unit-files <unit>` prints a header + a
+                # matching line that starts with the unit name. The
+                # function only checks for `^${unit}\b`, so we just emit
+                # that line.
+                cases.append(f'        {unit}) echo "{unit} enabled"; return 0;;')
+            else:
+                cases.append(f'        {unit}) return 1;;')
+        cases_block = "\n".join(cases) if cases else "        *) return 1;;"
+        enable_rc = 0 if enable_now_succeeds else 1
+        script = f"""
+set -e
+src="$(sed -e 's/^main$/: # stripped for testing/' {self.INSTALL_SH!r})"
+sudo() {{ "$@"; }}
+export -f sudo
+systemctl() {{
+    case "$1" in
+        list-unit-files)
+            shift
+            case "$1" in
+{cases_block}
+            esac
+            ;;
+        enable)
+            return {enable_rc}
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}}
+export -f systemctl
+eval "$src"
+ensure_certbot_timer_enabled
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    def test_finds_and_enables_certbot_renew_timer_rpm(self):
+        # RPM scenario: only `certbot-renew.timer` is present. The function
+        # must enable it and report success.
+        rc, out, err = self._invoke(list_unit_files_returns={
+            "certbot-renew.timer": True,
+            "certbot.timer": False,
+        })
+        assert rc == 0, err
+        combined = out + err
+        assert "certbot-renew.timer" in combined
+        assert "Enabled" in combined or "enabled" in combined
+        # Must NOT print the "could not find" warning.
+        assert "Could not find" not in combined
+
+    def test_falls_back_to_certbot_timer_deb(self):
+        # Deb scenario: `certbot-renew.timer` is absent, `certbot.timer` is
+        # present. The loop must move past the missing unit and land on
+        # the second one.
+        rc, out, err = self._invoke(list_unit_files_returns={
+            "certbot-renew.timer": False,
+            "certbot.timer": True,
+        })
+        assert rc == 0, err
+        combined = out + err
+        assert "certbot.timer" in combined
+        assert "Could not find" not in combined
+
+    def test_warns_with_cron_fallback_when_neither_timer_exists(self):
+        # Neither unit shipped (e.g. snap-only certbot install, exotic
+        # distro). The function must warn loudly and emit the cron
+        # fallback so the operator has a clear next step.
+        rc, out, err = self._invoke(list_unit_files_returns={
+            "certbot-renew.timer": False,
+            "certbot.timer": False,
+        })
+        assert rc == 0, err
+        combined = out + err
+        assert "Could not find or enable" in combined
+        # 90-day expiry warning so the operator understands the stakes.
+        assert "90 days" in combined
+        # Cron fallback line so they have something to copy/paste.
+        assert "certbot renew --quiet" in combined
+
+
+class TestVerifyRenewalTimer:
+    INSTALL_SH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "install.sh",
+    )
+
+    def _invoke(self, *, list_timers_output=""):
+        """Source install.sh, stub systemctl so list-timers returns the
+        canned output, and run verify_renewal_timer.
+
+        Returns (returncode, stdout, stderr).
+        """
+        import subprocess
+        # Escape single quotes for embedding in the bash heredoc.
+        encoded = list_timers_output.replace("'", "'\\''")
+        script = f"""
+set -e
+src="$(sed -e 's/^main$/: # stripped for testing/' {self.INSTALL_SH!r})"
+sudo() {{ "$@"; }}
+export -f sudo
+systemctl() {{
+    case "$1" in
+        list-timers)
+            printf '%s' '{encoded}'
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}}
+export -f systemctl
+eval "$src"
+verify_renewal_timer
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    def test_surfaces_next_fire_when_timer_listed(self):
+        # Real-world `systemctl list-timers` output looks like (truncated):
+        #   NEXT                        LEFT       LAST                        PASSED      UNIT                ACTIVATES
+        #   Mon 2026-04-27 03:42:00 UTC 2 days ago Sun 2026-04-26 03:42:00 UTC 23h ago     certbot-renew.timer certbot-renew.service
+        # The function awks the first column pair off the matching line.
+        canned = (
+            "NEXT                        LEFT       LAST                        PASSED      UNIT                ACTIVATES\n"
+            "Mon 2026-04-27 03:42:00 UTC 2 days ago Sun 2026-04-26 03:42:00 UTC 23h ago     certbot-renew.timer certbot-renew.service\n"
+            "\n"
+            "1 timers listed.\n"
+        )
+        rc, out, err = self._invoke(list_timers_output=canned)
+        assert rc == 0, err
+        combined = out + err
+        assert "Next fire" in combined
+        # The NEXT column is "DayName YYYY-MM-DD HH:MM:SS TZ" (4 fields);
+        # all four must surface so the operator sees the actual fire time
+        # and timezone, not just the date.
+        assert "Mon" in combined
+        assert "2026-04-27" in combined
+        assert "03:42:00" in combined
+        assert "UTC" in combined
+
+    def test_warns_when_no_timer_found(self):
+        # Empty output (no certbot timer registered) must produce a warning
+        # so the operator notices before walking away thinking they're set.
+        rc, out, err = self._invoke(list_timers_output="")
+        assert rc == 0, err
+        combined = out + err
+        assert "No certbot timer visible" in combined
+
+
+class TestSetupLetsencryptCallsTimerHelpers:
+    """Sanity check on install.sh structure: setup_letsencrypt must call
+    ensure_certbot_timer_enabled AFTER issue_letsencrypt_cert (the cert has
+    to exist before we wire renewal) and BEFORE verify_renewal (the
+    dry-run only proves the cert can renew, not that the timer is
+    scheduled). A grep-based check is fine here; the behavior of the
+    helpers themselves is covered by the classes above."""
+
+    INSTALL_SH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "install.sh",
+    )
+
+    def _function_body(self, name):
+        # Extract the body of `name() { ... }` from install.sh. Crude but
+        # sufficient: install.sh's helpers are flat (no nested braces in
+        # function bodies that would confuse a brace-counter at this
+        # granularity), so we capture from the `name() {` opening line to
+        # the line containing only `}`.
+        with open(self.INSTALL_SH) as f:
+            text = f.read()
+        import re
+        m = re.search(
+            rf"^{re.escape(name)}\(\)\s*\{{\n(.*?)\n\}}",
+            text, re.MULTILINE | re.DOTALL,
+        )
+        assert m, f"Could not locate {name}() in install.sh"
+        return m.group(1)
+
+    def test_calls_ensure_certbot_timer_enabled(self):
+        body = self._function_body("setup_letsencrypt")
+        assert "ensure_certbot_timer_enabled" in body
+
+    def test_calls_verify_renewal_timer(self):
+        body = self._function_body("setup_letsencrypt")
+        assert "verify_renewal_timer" in body
+
+    def test_timer_enable_runs_after_cert_issuance(self):
+        # The cert has to exist before enabling the timer makes sense.
+        body = self._function_body("setup_letsencrypt")
+        idx_issue = body.find("issue_letsencrypt_cert")
+        idx_timer = body.find("ensure_certbot_timer_enabled")
+        assert idx_issue >= 0 and idx_timer >= 0
+        assert idx_issue < idx_timer
+
+    def test_timer_enable_runs_before_dry_run_verify(self):
+        # ensure_certbot_timer_enabled must come before verify_renewal so
+        # the timer is live when (and if) we run the dry-run check.
+        body = self._function_body("setup_letsencrypt")
+        idx_timer = body.find("ensure_certbot_timer_enabled")
+        idx_verify = body.find("verify_renewal\n")
+        # `verify_renewal\n` matches the bare-call line; `verify_renewal_timer`
+        # is a different identifier and would not match.
+        assert idx_timer >= 0 and idx_verify >= 0
+        assert idx_timer < idx_verify

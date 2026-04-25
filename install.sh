@@ -632,6 +632,54 @@ EOF
     success "Installed renewal hook at $hook_path"
 }
 
+# Enable and start the certbot renewal systemd timer.
+#
+# Why this exists: certbot's deb postinst on Debian/Ubuntu enables
+# `certbot.timer` automatically. The RPM packages on AL2023, RHEL,
+# Rocky, AlmaLinux, and Fedora ship `certbot-renew.timer` (note the
+# different unit name) but follow the RPM convention of leaving units
+# disabled on install. Without this step, the cert issues fine, the
+# renewal deploy hook is in place, but `certbot renew` is never invoked
+# on a schedule and the cert silently expires 90 days later.
+#
+# Strategy: try both unit names, enable --now whichever one the
+# installed certbot package shipped, and warn loudly with a cron
+# fallback if neither is present.
+ensure_certbot_timer_enabled() {
+    local enabled=0
+    local unit
+    for unit in certbot-renew.timer certbot.timer; do
+        if systemctl list-unit-files "$unit" 2>/dev/null | grep -q "^${unit}\b"; then
+            if sudo systemctl enable --now "$unit" >/dev/null 2>&1; then
+                success "Enabled ${unit} for automatic cert renewal"
+                enabled=1
+                break
+            fi
+        fi
+    done
+    if [[ $enabled -eq 0 ]]; then
+        warn "Could not find or enable a certbot renewal timer."
+        warn "Automatic renewal is NOT scheduled. Your cert will expire in 90 days."
+        detail "As a fallback, add a cron entry:"
+        detail "  0 4,16 * * * $(command -v certbot || echo certbot) renew --quiet"
+    fi
+}
+
+# Surface the next scheduled renewal time so the operator can see it
+# wired up. `certbot renew --dry-run` only proves the cert can renew;
+# it says nothing about whether anything is scheduled to call renew.
+verify_renewal_timer() {
+    local next
+    next=$(systemctl list-timers certbot.timer certbot-renew.timer --no-pager 2>/dev/null \
+           | awk '/certbot/ {print $1, $2, $3, $4; exit}')
+    if [[ -n "$next" ]]; then
+        success "Renewal timer scheduled. Next fire: $next"
+    else
+        warn "No certbot timer visible in systemctl list-timers."
+        warn "Renewal may not be scheduled. Investigate before relying on it."
+    fi
+}
+
 verify_renewal() {
     if [[ "$LE_SKIP_VERIFY" == "1" ]]; then
         info "Skipping certbot renew --dry-run (--le-skip-verify)"
@@ -655,6 +703,12 @@ setup_letsencrypt() {
     issue_letsencrypt_cert
     forward_letsencrypt_paths
     install_renewal_hook
+    # Order matters: enable the timer BEFORE the dry-run verify so the
+    # timer is live by the time we check anything, and run
+    # verify_renewal_timer right after enable so its "next fire" output
+    # reflects the unit we just enabled.
+    ensure_certbot_timer_enabled
+    verify_renewal_timer
     verify_renewal
     spacer
 }

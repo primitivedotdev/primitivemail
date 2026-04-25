@@ -83,6 +83,8 @@ Prerequisites:
 
 The installer issues the cert with certbot's `--standalone` plugin, writes `LETSENCRYPT_HOST_DIR=/etc/letsencrypt` to `.env` so `docker-compose` bind-mounts the host's cert tree read-only into the container, sets `TLS_CERT` and `TLS_KEY` in `.env`, and installs a deploy hook at `/etc/letsencrypt/renewal-hooks/deploy/reload-postfix.sh` that reloads Postfix after every renewal. Renewals run automatically through certbot's systemd timer; no operator action is required.
 
+Automatic renewal is scheduled via a systemd timer (`certbot-renew.timer` on RPM-based distros, `certbot.timer` on Debian/Ubuntu), enabled by the installer.
+
 The committed `docker-compose.yml` is never modified by the installer. The bind mount uses `${LETSENCRYPT_HOST_DIR:-/var/empty}` so an unset value mounts an empty directory (a harmless no-op), and `git pull` updates stay clean across re-installs.
 
 Add `--le-skip-verify` to skip the post-issuance `certbot renew --dry-run` (saves 10-20s on slow / CI networks).
