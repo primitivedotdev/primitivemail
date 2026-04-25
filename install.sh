@@ -720,9 +720,15 @@ preserve_existing_tls_paths() {
         return
     fi
 
+    # `|| true` on the pipeline tail is load-bearing: under `set -euo
+    # pipefail`, grep's exit-1-on-no-match would propagate up and abort the
+    # script. Old installs predating this PR have a .env with no TLS_CERT /
+    # TLS_KEY lines at all, which is exactly the no-match case; without the
+    # guard, the first re-install on those boxes exits before reaching the
+    # Python installer.
     local existing_cert existing_key
-    existing_cert="$(grep -E '^TLS_CERT=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2-)"
-    existing_key="$(grep -E '^TLS_KEY=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    existing_cert="$(grep -E '^TLS_CERT=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    existing_key="$(grep -E '^TLS_KEY=' "$env_path" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
 
     # Use sudo for the on-disk check because /etc/letsencrypt/live/<host>/
     # is mode 700 root:root by default; a non-root operator running

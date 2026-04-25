@@ -2061,6 +2061,21 @@ fi
         assert "--tls-cert" not in args
         assert "--tls-key" in args
 
+    def test_env_without_tls_lines_does_not_crash_under_pipefail(self, tmp_path):
+        # Regression: install.sh runs under `set -euo pipefail`. When .env
+        # has neither TLS_CERT= nor TLS_KEY= lines (e.g. an old install
+        # predating the TLS env-var support), `grep` returns 1 on no-match
+        # and the pipeline's non-zero status would abort the script before
+        # reaching the Python installer. The fix appends `|| true` to each
+        # pipeline; this test pins it.
+        install_dir, _, _ = self._setup_paths(tmp_path)
+        rc, args, err = self._invoke(
+            install_dir,
+            env_contents="SOMETHING=other\nUNRELATED=value\n",
+        )
+        assert rc == 0, err
+        assert args == []
+
 
 # ===========================================================================
 # verify_tls_readable_in_container: post-start cert readability smoke check
