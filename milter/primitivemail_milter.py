@@ -60,8 +60,9 @@ def _get_s3_client():
     """Get or create a cached S3 client with sensible timeouts.
 
     Cached at module level — one connection pool shared across all uploads.
-    Region is read from AWS_DEFAULT_REGION on first call and locked thereafter.
-    Timeouts prevent a slow S3 upload from blocking a milter thread indefinitely.
+    Reset by reload_config() on SIGHUP so a storage_url change is picked up
+    without requiring a full milter restart. AWS_DEFAULT_REGION is read on
+    each (re)creation; restart is still required to change the region.
     """
     global _s3_client
     if _s3_client is None:
@@ -224,20 +225,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Shared HTTP client. PoolManager is thread-safe and amortises socket setup
-# across requests. The pool is cleared on SIGHUP (see reload_config) so that
-# webhook_url / storage_url changes don't leave stale connections holding
-# DNS pinning to the old endpoint.
+# Shared HTTP client used by both the webhook and (non-S3) storage uploads.
+# PoolManager is thread-safe and amortises socket setup across requests.
+# The pool — and the cached boto3 S3 client — are dropped on SIGHUP (see
+# _reset_outbound_http_clients) so a webhook_url or storage_url change does
+# not leave idle connections pinned to the old endpoint.
 #
-# retries: a single transparent retry on connection-level errors only. This
-# is the urllib3-specific failure mode where the server has closed our
-# keep-aliveconnection between calls — without a retry we'd surface a spurious
-# network error on the first request to use the stale connection. The retry
-# does NOT apply to read errors or non-2xx responses (status_forcelist=()),
-# preserving the existing single-attempt semantics for application-level
-# failures: the milter still decides REJECT vs TEMPFAIL on each response.
+# maxsize=50: enough to keep most concurrent webhook calls on warm
+# connections under expected production concurrency. block=False means
+# bursts beyond the pool fall back to transient connections (full TLS
+# handshake) rather than blocking — chosen because SMTP timeouts are worse
+# than redundant connections for the milter's role.
+#
+# retries: one transparent retry, connect-only. Stale-keep-alive failures
+# (server closed our pooled socket between calls) surface as a connect
+# error on reuse; without a retry we'd see a spurious network failure
+# where urllib.request would have transparently re-resolved DNS for a
+# fresh socket. read=False / status_forcelist=() keep application-level
+# semantics unchanged: the milter remains responsible for translating
+# non-2xx into REJECT vs TEMPFAIL on a single attempt.
 _HTTP = urllib3.PoolManager(
-    maxsize=10,
+    maxsize=50,
     block=False,
     retries=urllib3.util.Retry(
         total=1,
@@ -251,6 +259,18 @@ _HTTP = urllib3.PoolManager(
         raise_on_status=False,
     ),
 )
+
+
+def _reset_outbound_http_clients():
+    """Drop cached outbound HTTP/S3 state.
+
+    Called from reload_config() on SIGHUP so a webhook_url / storage_url
+    change can't leave us with idle pooled connections holding DNS pinning
+    to an old endpoint, or a boto3 client wired to a stale config.
+    """
+    global _s3_client
+    _HTTP.clear()
+    _s3_client = None
 
 # Deferred tracing log (after basicConfig so the message is visible)
 if TRACING_ENABLED:
@@ -309,6 +329,7 @@ class ReloadableConfig:
     def __init__(self, *, webhook_url=None, webhook_secret=None,
                  webhook_extra_headers=None, storage_url=None,
                  storage_key=None, storage_auth_style='s3',
+                 storage_upload_threshold=3_000_000,
                  allowed_sender_domains=None, allowed_senders=None,
                  allow_bounces=True, allowed_recipients=None,
                  spoof_protection='off'):
@@ -318,6 +339,7 @@ class ReloadableConfig:
         self.storage_url = storage_url
         self.storage_key = storage_key
         self.storage_auth_style = storage_auth_style
+        self.storage_upload_threshold = storage_upload_threshold
         self.allowed_sender_domains = allowed_sender_domains or set()
         self.allowed_senders = allowed_senders or set()
         self.allow_bounces = allow_bounces
@@ -424,6 +446,9 @@ def _build_reloadable_config(file_data: dict) -> ReloadableConfig:
         storage_url=_cfg(file_data, 'storage_url', 'STORAGE_URL'),
         storage_key=_cfg(file_data, 'storage_key', 'STORAGE_KEY'),
         storage_auth_style=_cfg(file_data, 'storage_auth_style', 'STORAGE_AUTH_STYLE', 's3'),
+        storage_upload_threshold=int(
+            _cfg(file_data, 'storage_upload_threshold',
+                 'STORAGE_UPLOAD_THRESHOLD', '3000000')),
         allowed_sender_domains=_parse_comma_set(
             _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')),
         allowed_senders=_parse_comma_set(
@@ -451,7 +476,6 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     global _rcfg
     global MESSAGE_ID_DOMAIN, STANDALONE_MODE, MAIL_DIR
     global SPAMHAUS_DNSBL_DOMAIN
-    global STORAGE_UPLOAD_THRESHOLD
 
     new_cfg = _build_reloadable_config(file_data)
 
@@ -482,8 +506,6 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     # --- Non-reloadable values (startup only) ---
     MESSAGE_ID_DOMAIN = _cfg(file_data, 'mydomain', 'MYDOMAIN', 'primitivemail')
     MAIL_DIR = _cfg(file_data, 'mail_dir', 'MAIL_DIR', '/mail/incoming')
-    STORAGE_UPLOAD_THRESHOLD = int(_cfg(file_data, 'storage_upload_threshold',
-                                        'STORAGE_UPLOAD_THRESHOLD', '3000000'))
 
     STANDALONE_MODE = not _rcfg.webhook_url
 
@@ -534,10 +556,10 @@ def reload_config(signum=None, frame=None):
                        "aborting reload to preserve current state")
         return
     _apply_config(file_data, reloadable_only=True)
-    # Drop pooled HTTP connections so a webhook_url change doesn't leave
-    # idle connections holding DNS pinning to the old endpoint. Cheap —
-    # the pool refills naturally on the next request.
-    _HTTP.clear()
+    # Drop pooled HTTP connections + cached boto3 client so any webhook_url
+    # or storage_url change is fully picked up. Cheap — both refill
+    # naturally on next use.
+    _reset_outbound_http_clients()
     cfg = _rcfg
     logger.info(f"Config reloaded (webhook_url={cfg.webhook_url}, "
                 f"sender_filter={cfg.sender_filtering_enabled}, "
@@ -1132,7 +1154,7 @@ class PrimitiveMailMilter(Milter.Base):
             return Milter.REJECT
 
         # Determine path
-        if size > STORAGE_UPLOAD_THRESHOLD:
+        if size > self._cfg.storage_upload_threshold:
             self._path_label = 'storage_first'
 
         # Record email size
@@ -1255,7 +1277,7 @@ class PrimitiveMailMilter(Milter.Base):
 
         # Webhook mode: upload large emails to storage ONCE (same bytes for all recipients)
         storage_result = None
-        if size > STORAGE_UPLOAD_THRESHOLD and cfg.storage_url:
+        if size > cfg.storage_upload_threshold and cfg.storage_url:
             storage_result = self.upload_to_storage(raw_email_bytes)
             if not storage_result['success']:
                 self.log_error(f"Storage upload failed: {storage_result.get('error', 'unknown')}")
@@ -1274,7 +1296,7 @@ class PrimitiveMailMilter(Milter.Base):
         if len(valid_recipients) > 5:
             self.log(f"Warning: {len(valid_recipients)} recipients - webhook calls will be sequential")
 
-        use_inline = size > STORAGE_UPLOAD_THRESHOLD and not cfg.storage_url
+        use_inline = size > cfg.storage_upload_threshold and not cfg.storage_url
         if use_inline:
             self.log(f"Large email ({size} bytes) but no STORAGE_URL - sending inline")
 
@@ -1282,7 +1304,7 @@ class PrimitiveMailMilter(Milter.Base):
             domain = rcpt.split('@')[1].lower()
             self.log(f"  Webhook for: {rcpt} (domain: {domain})")
 
-            if size > STORAGE_UPLOAD_THRESHOLD and not use_inline:
+            if size > cfg.storage_upload_threshold and not use_inline:
                 result = self._call_webhook_for_recipient(
                     rcpt, domain, None, size, storage_result)
             else:
