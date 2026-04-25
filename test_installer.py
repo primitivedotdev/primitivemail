@@ -2273,6 +2273,108 @@ verify_renewal_timer
         combined = out + err
         assert "No certbot timer visible" in combined
 
+    def test_no_sigpipe_with_long_systemctl_output(self, tmp_path):
+        # Regression for the SIGPIPE bug that broke every
+        # `install.sh --enable-letsencrypt` run after PR #56 landed.
+        #
+        # Cause: `systemctl list-timers ... | awk '/certbot/ {...; exit}'`
+        # closes the pipe as soon as awk hits the first match. systemctl
+        # then takes SIGPIPE on its next write and exits with 141. With
+        # `set -euo pipefail` (top of install.sh), pipefail propagates
+        # the 141 and `set -e` aborts the entire installer mid-run,
+        # after the timer is enabled but before the Python installer
+        # writes .env or starts the container.
+        #
+        # The earlier _invoke harness uses a bash-function stub that
+        # `printf`s a small buffer and exits, so the writer is already
+        # gone by the time awk closes the pipe -- SIGPIPE is not
+        # triggered and the bug hides. This test instead drops a real
+        # systemctl shell script on PATH that streams more output than
+        # the pipe buffer can hold (>64KiB on Linux/macOS). If awk exits
+        # early, the writer takes SIGPIPE on a later write, pipefail
+        # propagates, and the function's command substitution returns
+        # non-zero. The test asserts the function still exits 0 under
+        # `set -euo pipefail`.
+        import subprocess
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        systemctl_stub = bin_dir / "systemctl"
+        # Emit one matching certbot row, then a large volume of trailing
+        # data that exceeds typical pipe-buffer capacity so any reader
+        # that closes the pipe early forces SIGPIPE on the writer.
+        systemctl_stub.write_text(
+            "#!/bin/bash\n"
+            "echo 'NEXT LEFT LAST PASSED UNIT ACTIVATES'\n"
+            "echo 'Mon 2026-04-27 03:42:00 UTC 2 days ago Sun 2026-04-26"
+            " 03:42:00 UTC 23h ago certbot-renew.timer"
+            " certbot-renew.service'\n"
+            # ~200 KiB of filler well past any 16/64 KiB pipe buffer.
+            "for i in $(seq 1 4000); do\n"
+            "    printf 'filler line %d %s\\n' \"$i\""
+            " 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n"
+            "done\n",
+        )
+        systemctl_stub.chmod(0o755)
+
+        script = f"""
+set -euo pipefail
+export PATH={str(bin_dir)!r}:$PATH
+src="$(sed -e 's/^main$/: # stripped for testing/' {self.INSTALL_SH!r})"
+sudo() {{ "$@"; }}
+export -f sudo
+eval "$src"
+verify_renewal_timer
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            f"verify_renewal_timer failed under set -euo pipefail with "
+            f"long systemctl output (rc={result.returncode}). This is "
+            f"the SIGPIPE regression: awk must not close the pipe "
+            f"before systemctl finishes writing.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        combined = result.stdout + result.stderr
+        # Sanity: the matching line was still extracted.
+        assert "Next fire" in combined
+        assert "2026-04-27" in combined
+
+    def test_awk_does_not_use_exit_in_verify_renewal_timer(self):
+        # Belt-and-suspenders static check. The pipeline in
+        # verify_renewal_timer must not contain `awk '... exit'`,
+        # because `awk exit` after the first match closes the pipe and
+        # gives systemctl SIGPIPE under `set -euo pipefail`. Even if a
+        # future refactor changes the test harness in a way that hides
+        # the runtime SIGPIPE behavior, this assertion will still fire
+        # if someone reintroduces `exit` into the awk action.
+        with open(self.INSTALL_SH) as f:
+            text = f.read()
+        # Find the body of verify_renewal_timer.
+        start = text.index("verify_renewal_timer() {")
+        # The next top-level `}` line ends the function.
+        end = text.index("\n}\n", start)
+        body = text[start:end]
+        # Strip shell comment lines so the assertion checks executable
+        # code only -- the function body legitimately documents this
+        # bug in comments and we should not trip on the word "exit"
+        # appearing there.
+        non_comment_lines = [
+            line for line in body.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        code = "\n".join(non_comment_lines)
+        assert "awk" in code, (
+            "test is stale: verify_renewal_timer no longer pipes to awk"
+        )
+        assert "exit" not in code, (
+            "verify_renewal_timer must not use `awk '... exit'`: it "
+            "closes the pipe before systemctl finishes writing and "
+            "trips SIGPIPE under `set -euo pipefail`. Use a flag "
+            "(e.g. `&& !found {...; found=1}`) instead."
+        )
+
 
 class TestSetupLetsencryptCallsTimerHelpers:
     """Sanity check on install.sh structure: setup_letsencrypt must call
