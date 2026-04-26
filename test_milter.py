@@ -276,6 +276,58 @@ class TestSingleRecipient:
         assert any('error_type=timeout' in r.message for r in caplog.records), \
             f"expected error_type=timeout, got: {[r.message for r in caplog.records]}"
 
+    def test_body_read_failure_still_records_http_metrics(self, milter):
+        """A read failure on response.data must not skip TTFB / body-read / requests metrics.
+
+        With preload_content=False, _HTTP.request returns once headers are in
+        and the body is read on .data access. If that read raises (mid-body
+        timeout, RST), metrics outside a finally block would silently be
+        dropped — exactly the tail those histograms exist to measure.
+        """
+        from urllib3.exceptions import ProtocolError as _ProtocolError
+
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        class _MidBodyFailure:
+            status = 200
+            @property
+            def data(self):
+                raise _ProtocolError('connection reset mid-body')
+            def release_conn(self):
+                pass
+
+        # Locate the webhook-path's HTTP-stage record_metrics block by the
+        # source line of its body-read sibling, so we can later check whether
+        # the corresponding lambda actually fired. eom() invokes several
+        # unrelated record_metrics calls — counting alone wouldn't isolate
+        # the regression we care about (skipping metrics on body-read failure).
+        webhook_fn_start = None
+        webhook_body_read_line = None
+        for i, line in enumerate(open(pm.__file__), start=1):
+            if 'def _call_webhook_for_recipient' in line:
+                webhook_fn_start = i
+            if (webhook_fn_start
+                    and 'HTTP_BODY_READ_DURATION.labels(host=host_label' in line):
+                webhook_body_read_line = i
+                break
+        assert webhook_body_read_line, "could not locate webhook HTTP_BODY_READ_DURATION call site"
+
+        recorded_lines = []
+        with patch.object(pm, 'record_metrics',
+                          side_effect=lambda fn: recorded_lines.append(fn.__code__.co_firstlineno)), \
+             patch_http(return_value=_MidBodyFailure()):
+            milter.eom()
+
+        # The lambda's first line is the line containing `lambda:`, two lines
+        # before the body-read site. Allow a 5-line window for refactors.
+        hit = any(abs(ln - webhook_body_read_line) <= 5 for ln in recorded_lines)
+        assert hit, (
+            f"HTTP-stage metrics never recorded — finally block skipped on "
+            f"body-read failure. Expected a record_metrics lambda near line "
+            f"{webhook_body_read_line}; saw lambdas at lines: {recorded_lines}")
+
 
 # ===========================================================================
 # Core: Multiple recipients
@@ -2032,6 +2084,45 @@ class TestApplyConfig:
 
             pm._apply_config({}, reloadable_only=False)
             assert pm._rcfg.allow_bounces is True  # default
+        finally:
+            self._restore_state(saved)
+
+    def test_storage_upload_threshold_zero_preserved(self):
+        """0 means 'always upload to storage' — pre-PR config that must keep working."""
+        saved = self._save_state()
+        try:
+            pm._apply_config({
+                "webhook_url": "https://t.example.com/h",
+                "webhook_secret": "s",
+                "storage_upload_threshold": "0",
+            }, reloadable_only=False)
+            assert pm._rcfg.storage_upload_threshold == 0
+        finally:
+            self._restore_state(saved)
+
+    def test_storage_upload_threshold_negative_falls_back(self):
+        """Negative values are nonsense — fall back to default rather than crashing SIGHUP."""
+        saved = self._save_state()
+        try:
+            pm._apply_config({
+                "webhook_url": "https://t.example.com/h",
+                "webhook_secret": "s",
+                "storage_upload_threshold": "-1",
+            }, reloadable_only=False)
+            assert pm._rcfg.storage_upload_threshold == 3_000_000
+        finally:
+            self._restore_state(saved)
+
+    def test_storage_upload_threshold_garbage_falls_back(self):
+        """Non-integer must not crash _build_reloadable_config (SIGHUP-safe)."""
+        saved = self._save_state()
+        try:
+            pm._apply_config({
+                "webhook_url": "https://t.example.com/h",
+                "webhook_secret": "s",
+                "storage_upload_threshold": "not-a-number",
+            }, reloadable_only=False)
+            assert pm._rcfg.storage_upload_threshold == 3_000_000
         finally:
             self._restore_state(saved)
 

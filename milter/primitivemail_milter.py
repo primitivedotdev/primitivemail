@@ -608,7 +608,8 @@ def _build_reloadable_config(file_data: dict) -> ReloadableConfig:
             _cfg(file_data, 'storage_upload_threshold',
                  'STORAGE_UPLOAD_THRESHOLD', '3000000'),
             default=3_000_000,
-            name='storage_upload_threshold'),
+            name='storage_upload_threshold',
+            minimum=0),  # 0 means "always upload to storage", preserved from pre-PR behaviour
         allowed_sender_domains=_parse_comma_set(
             _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')),
         allowed_senders=_parse_comma_set(
@@ -1697,16 +1698,19 @@ class PrimitiveMailMilter(Milter.Base):
             preload_content=False,
         )
         t_headers = time.monotonic()
+        # See note on the matching block in _call_webhook_for_recipient:
+        # metrics record in the finally so a mid-body failure still observes
+        # the partial timing instead of silently dropping the sample.
         try:
             _ = response.data  # forces body read into memory
         finally:
             t_done = time.monotonic()
             response.release_conn()
-        record_metrics(lambda: (
-            HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
-            HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
-            HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
-        ))
+            record_metrics(lambda: (
+                HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
+                HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
+                HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
+            ))
         duration = time.time() - start
         if response.status in (200, 201):
             record_metrics(lambda: (
@@ -1802,16 +1806,20 @@ class PrimitiveMailMilter(Milter.Base):
                 preload_content=False,
             )
             t_headers = time.monotonic()
+            # Metrics live in the finally so a mid-body read failure
+            # (e.g. read timeout, RST) still records what we observed —
+            # otherwise the body-read histogram silently undercounts the
+            # exact tail it exists to measure.
             try:
                 response_body = response.data.decode('utf-8')
             finally:
                 t_done = time.monotonic()
                 response.release_conn()
-            record_metrics(lambda: (
-                HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
-                HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
-                HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
-            ))
+                record_metrics(lambda: (
+                    HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
+                    HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
+                    HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
+                ))
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
 
