@@ -27,8 +27,9 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Dict, Any
-import urllib.request
-import urllib.error
+import urllib.parse
+import urllib3
+import urllib3.connection
 
 import Milter
 from Milter.utils import parse_addr
@@ -61,8 +62,9 @@ def _get_s3_client():
     """Get or create a cached S3 client with sensible timeouts.
 
     Cached at module level — one connection pool shared across all uploads.
-    Region is read from AWS_DEFAULT_REGION on first call and locked thereafter.
-    Timeouts prevent a slow S3 upload from blocking a milter thread indefinitely.
+    Reset by reload_config() on SIGHUP so a storage_url change is picked up
+    without requiring a full milter restart. AWS_DEFAULT_REGION is read on
+    each (re)creation; restart is still required to change the region.
     """
     global _s3_client
     if _s3_client is None:
@@ -138,6 +140,48 @@ try:
         'Webhook call time',
         ['status', 'path'],
         buckets=DURATION_BUCKETS,
+    )
+    # Per-stage breakdown of the outbound webhook call. Together with
+    # WEBHOOK_DURATION (the total), these answer "where did the time go?"
+    # under load — surfacing connect-side cost (handshakes the client paid)
+    # vs server-side cost (TTFB once the request is in-flight) vs body
+    # transfer. The host label distinguishes webhook from storage uploads
+    # so we don't conflate two different remotes.
+    HTTP_CONNECT_DURATION = Histogram(
+        'milter_outbound_connect_seconds',
+        'TCP+TLS handshake time on outbound HTTP (only recorded for fresh '
+        'connections; reused pooled connections are excluded by definition)',
+        ['host', 'scheme'],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+    )
+    HTTP_TTFB_DURATION = Histogram(
+        'milter_outbound_ttfb_seconds',
+        'Time from request start to first response byte. Includes connect '
+        'time on cold calls; near-zero (sub-ms) request transit + remote '
+        'processing on warm calls. Compare to remote-reported processing '
+        'time to localise transit vs queueing.',
+        ['host', 'scheme'],
+        buckets=DURATION_BUCKETS,
+    )
+    HTTP_BODY_READ_DURATION = Histogram(
+        'milter_outbound_body_read_seconds',
+        'Time spent reading the response body after headers arrived. '
+        'Typically sub-ms for small JSON responses; growth here points '
+        'at egress-side network problems.',
+        ['host', 'scheme'],
+        buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+    )
+    HTTP_CONNECTIONS_NEW = Counter(
+        'milter_outbound_new_connections_total',
+        'Count of fresh TCP+TLS connections opened (i.e. pool misses). '
+        'Compare against milter_outbound_requests_total to derive pool '
+        'reuse rate.',
+        ['host', 'scheme'],
+    )
+    HTTP_REQUESTS_TOTAL = Counter(
+        'milter_outbound_requests_total',
+        'Count of outbound HTTP requests issued, regardless of pool reuse.',
+        ['host', 'scheme'],
     )
     EMAIL_SIZE = Histogram(
         'milter_email_size_bytes',
@@ -225,6 +269,167 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Outbound HTTP timing instrumentation
+# ----------------------------------------------------------------------------
+# We split the previously-opaque "webhook latency" measurement into three
+# stages so we can answer "where did the time go?" under concurrency:
+#
+#   connect — DNS + TCP + TLS handshake (only recorded for fresh sockets;
+#             reused pooled connections skip this entirely)
+#   ttfb    — request start → first response byte (request transit + remote
+#             processing; on cold calls this also subsumes connect)
+#   body    — response body read (typically sub-ms for small JSON responses)
+#
+# This is the original motivation for moving off urllib.request: we can
+# subclass urllib3's connection class to time connect() in place, while
+# the ttfb/body split is taken at each call site via preload_content=False.
+class _TimingHTTPSConnection(urllib3.connection.HTTPSConnection):
+    """HTTPS connection that records its handshake duration on connect()."""
+
+    def connect(self):
+        t0 = time.monotonic()
+        super().connect()
+        elapsed = time.monotonic() - t0
+        host = self.host
+        record_metrics(lambda: (
+            HTTP_CONNECT_DURATION.labels(host=host, scheme='https').observe(elapsed),
+            HTTP_CONNECTIONS_NEW.labels(host=host, scheme='https').inc(),
+        ))
+
+
+class _TimingHTTPConnection(urllib3.connection.HTTPConnection):
+    """HTTP connection that records its TCP-only connect duration."""
+
+    def connect(self):
+        t0 = time.monotonic()
+        super().connect()
+        elapsed = time.monotonic() - t0
+        host = self.host
+        record_metrics(lambda: (
+            HTTP_CONNECT_DURATION.labels(host=host, scheme='http').observe(elapsed),
+            HTTP_CONNECTIONS_NEW.labels(host=host, scheme='http').inc(),
+        ))
+
+
+class _TimingHTTPSConnectionPool(urllib3.HTTPSConnectionPool):
+    ConnectionCls = _TimingHTTPSConnection
+
+
+class _TimingHTTPConnectionPool(urllib3.HTTPConnectionPool):
+    ConnectionCls = _TimingHTTPConnection
+
+
+# Shared HTTP client used by both the webhook and (non-S3) storage uploads.
+# PoolManager is thread-safe and amortises socket setup across requests.
+# The pool — and the cached boto3 S3 client — are dropped on SIGHUP (see
+# _reset_outbound_http_clients) so a webhook_url or storage_url change does
+# not leave idle connections pinned to the old endpoint.
+#
+# Sizing: outbound_http_pool_maxsize (config file) /
+# OUTBOUND_HTTP_POOL_MAXSIZE (env var) cap the number of warm connections
+# kept per remote host (default 50). Pick a value at or above your typical
+# concurrent outbound-HTTP fan-out so most calls hit a warm connection;
+# bursts past the cap fall back to transient connections (full TLS
+# handshake) rather than blocking, because for a mail server an SMTP
+# timeout is worse than a redundant TCP connection. Resolved once at
+# startup; restart the milter to pick up a change.
+#
+# retries: one transparent retry, connect-only. Stale-keep-alive failures
+# (server closed our pooled socket between calls) surface as a connect
+# error on reuse; without a retry we'd see a spurious network failure
+# where urllib.request would have transparently re-resolved DNS for a
+# fresh socket. read=False / status_forcelist=() keep application-level
+# semantics unchanged: the milter remains responsible for translating
+# non-2xx into REJECT vs TEMPFAIL on a single attempt.
+def _coerce_positive_int(value, *, default: int, name: str, minimum: int = 1) -> int:
+    """Validate an int input (string or int) with a safe fallback.
+
+    Returns ``default`` on non-integer input or values below ``minimum``,
+    logging a warning. Used in the SIGHUP reload path so a malformed value
+    in the config file cannot terminate the milter via an uncaught
+    ValueError in the signal handler.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"{name}={value!r} is not an integer; using default {default}")
+        return default
+    if n < minimum:
+        logger.warning(
+            f"{name}={value!r} must be >= {minimum}; using default {default}")
+        return default
+    return n
+
+
+def _coerce_pool_maxsize(value, source: str = '') -> int:
+    """Validate a pool-maxsize input (string or int) with a safe fallback to 50."""
+    return _coerce_positive_int(
+        value, default=50,
+        name=f"outbound_http_pool_maxsize (from {source or 'config'})")
+
+
+def _build_http_pool(maxsize: int) -> urllib3.PoolManager:
+    pool = urllib3.PoolManager(
+        maxsize=maxsize,
+        block=False,
+        retries=urllib3.util.Retry(
+            total=1,
+            connect=1,
+            read=False,
+            redirect=False,
+            status=False,
+            other=0,
+            status_forcelist=(),
+            backoff_factor=0,
+            raise_on_status=False,
+        ),
+    )
+    # Substitute timing-aware pool classes so connect() is observed every time
+    # urllib3 opens a fresh socket. Reused connections never re-enter connect(),
+    # which is exactly what we want — the histogram represents pool-miss cost.
+    pool.pool_classes_by_scheme = {
+        'http': _TimingHTTPConnectionPool,
+        'https': _TimingHTTPSConnectionPool,
+    }
+    return pool
+
+
+# Initialised at startup by _apply_config(reloadable_only=False) once the
+# config file has been read. Pool size is non-reloadable (changing it would
+# require recreating every pool entry); SIGHUP only refreshes the contents
+# via _reset_outbound_http_clients(), not the cap itself.
+_HTTP: urllib3.PoolManager = _build_http_pool(50)
+
+
+def _outbound_host_label(url: str) -> tuple:
+    """Extract (host, scheme) for outbound-HTTP metric labels.
+
+    Returns ('unknown', 'unknown') on parse failure so a malformed URL
+    never crashes the metric path. Port is stripped from the host so the
+    label cardinality stays bounded by distinct webhook/storage targets,
+    not by accidentally varying ports.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or 'unknown'
+        scheme = parsed.scheme or 'unknown'
+        return host, scheme
+    except Exception:
+        return 'unknown', 'unknown'
+
+
+def _reset_outbound_http_clients():
+    """Drop cached outbound HTTP/S3 state.
+
+    Called from reload_config() on SIGHUP so a webhook_url / storage_url
+    change can't leave us with idle pooled connections holding DNS pinning
+    to an old endpoint, or a boto3 client wired to a stale config.
+    """
+    global _s3_client
+    _HTTP.clear()
+    _s3_client = None
+
 # Deferred tracing log (after basicConfig so the message is visible)
 if TRACING_ENABLED:
     logger.info("Datadog APM tracing enabled")
@@ -282,6 +487,7 @@ class ReloadableConfig:
     def __init__(self, *, webhook_url=None, webhook_secret=None,
                  webhook_extra_headers=None, storage_url=None,
                  storage_key=None, storage_auth_style='s3',
+                 storage_upload_threshold=3_000_000,
                  allowed_sender_domains=None, allowed_senders=None,
                  allow_bounces=True, allowed_recipients=None,
                  spoof_protection='off'):
@@ -291,6 +497,7 @@ class ReloadableConfig:
         self.storage_url = storage_url
         self.storage_key = storage_key
         self.storage_auth_style = storage_auth_style
+        self.storage_upload_threshold = storage_upload_threshold
         self.allowed_sender_domains = allowed_sender_domains or set()
         self.allowed_senders = allowed_senders or set()
         self.allow_bounces = allow_bounces
@@ -397,6 +604,12 @@ def _build_reloadable_config(file_data: dict) -> ReloadableConfig:
         storage_url=_cfg(file_data, 'storage_url', 'STORAGE_URL'),
         storage_key=_cfg(file_data, 'storage_key', 'STORAGE_KEY'),
         storage_auth_style=_cfg(file_data, 'storage_auth_style', 'STORAGE_AUTH_STYLE', 's3'),
+        storage_upload_threshold=_coerce_positive_int(
+            _cfg(file_data, 'storage_upload_threshold',
+                 'STORAGE_UPLOAD_THRESHOLD', '3000000'),
+            default=3_000_000,
+            name='storage_upload_threshold',
+            minimum=0),  # 0 means "always upload to storage", preserved from pre-PR behaviour
         allowed_sender_domains=_parse_comma_set(
             _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')),
         allowed_senders=_parse_comma_set(
@@ -424,7 +637,6 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     global _rcfg
     global MESSAGE_ID_DOMAIN, STANDALONE_MODE, MAIL_DIR
     global SPAMHAUS_DNSBL_DOMAIN
-    global STORAGE_UPLOAD_THRESHOLD
 
     new_cfg = _build_reloadable_config(file_data)
 
@@ -455,10 +667,21 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     # --- Non-reloadable values (startup only) ---
     MESSAGE_ID_DOMAIN = _cfg(file_data, 'mydomain', 'MYDOMAIN', 'primitivemail')
     MAIL_DIR = _cfg(file_data, 'mail_dir', 'MAIL_DIR', '/mail/incoming')
-    STORAGE_UPLOAD_THRESHOLD = int(_cfg(file_data, 'storage_upload_threshold',
-                                        'STORAGE_UPLOAD_THRESHOLD', '3000000'))
 
     STANDALONE_MODE = not _rcfg.webhook_url
+
+    # Outbound HTTP pool size — non-reloadable because changing it would
+    # require recreating every pool entry. Resolves config file → env var
+    # → default, matching every other startup-only value.
+    global _HTTP
+    pool_maxsize_raw = _cfg(file_data, 'outbound_http_pool_maxsize',
+                            'OUTBOUND_HTTP_POOL_MAXSIZE', 50)
+    source = ('config file' if 'outbound_http_pool_maxsize' in file_data
+              else ('env var' if 'OUTBOUND_HTTP_POOL_MAXSIZE' in os.environ
+                    else 'default'))
+    pool_maxsize = _coerce_pool_maxsize(pool_maxsize_raw, source)
+    _HTTP = _build_http_pool(pool_maxsize)
+    logger.info(f"Outbound HTTP pool maxsize: {pool_maxsize} (from {source})")
 
     # Spamhaus DNSBL
     SPAMHAUS_DNSBL_DOMAIN = str(_cfg(file_data, 'spamhaus_dnsbl_domain',
@@ -507,6 +730,10 @@ def reload_config(signum=None, frame=None):
                        "aborting reload to preserve current state")
         return
     _apply_config(file_data, reloadable_only=True)
+    # Drop pooled HTTP connections + cached boto3 client so any webhook_url
+    # or storage_url change is fully picked up. Cheap — both refill
+    # naturally on next use.
+    _reset_outbound_http_clients()
     cfg = _rcfg
     logger.info(f"Config reloaded (webhook_url={cfg.webhook_url}, "
                 f"sender_filter={cfg.sender_filtering_enabled}, "
@@ -1101,7 +1328,7 @@ class PrimitiveMailMilter(Milter.Base):
             return Milter.REJECT
 
         # Determine path
-        if size > STORAGE_UPLOAD_THRESHOLD:
+        if size > self._cfg.storage_upload_threshold:
             self._path_label = 'storage_first'
 
         # Record email size
@@ -1224,7 +1451,7 @@ class PrimitiveMailMilter(Milter.Base):
 
         # Webhook mode: upload large emails to storage ONCE (same bytes for all recipients)
         storage_result = None
-        if size > STORAGE_UPLOAD_THRESHOLD and cfg.storage_url:
+        if size > cfg.storage_upload_threshold and cfg.storage_url:
             storage_result = self.upload_to_storage(raw_email_bytes)
             if not storage_result['success']:
                 self.log_error(f"Storage upload failed: {storage_result.get('error', 'unknown')}")
@@ -1243,7 +1470,7 @@ class PrimitiveMailMilter(Milter.Base):
         if len(valid_recipients) > 5:
             self.log(f"Warning: {len(valid_recipients)} recipients - webhook calls will be sequential")
 
-        use_inline = size > STORAGE_UPLOAD_THRESHOLD and not cfg.storage_url
+        use_inline = size > cfg.storage_upload_threshold and not cfg.storage_url
         if use_inline:
             self.log(f"Large email ({size} bytes) but no STORAGE_URL - sending inline")
 
@@ -1251,7 +1478,7 @@ class PrimitiveMailMilter(Milter.Base):
             domain = rcpt.split('@')[1].lower()
             self.log(f"  Webhook for: {rcpt} (domain: {domain})")
 
-            if size > STORAGE_UPLOAD_THRESHOLD and not use_inline:
+            if size > cfg.storage_upload_threshold and not use_inline:
                 result = self._call_webhook_for_recipient(
                     rcpt, domain, None, size, storage_result)
             else:
@@ -1458,38 +1685,56 @@ class PrimitiveMailMilter(Milter.Base):
         else:
             headers['Authorization'] = f'Bearer {cfg.storage_key}'
 
-        req = urllib.request.Request(
+        host_label, scheme_label = _outbound_host_label(url)
+        # preload_content=False so headers and body are observed separately:
+        # the request() call returns once headers are in, .data triggers the body read.
+        t_send = time.monotonic()
+        response = _HTTP.request(
+            'POST',
             url,
-            data=raw_bytes,
+            body=raw_bytes,
             headers=headers,
-            method='POST'
+            timeout=urllib3.Timeout(connect=15.0, read=15.0),
+            preload_content=False,
         )
-
-        with urllib.request.urlopen(req, timeout=15) as response:
-            duration = time.time() - start
-            if response.status in (200, 201):
-                record_metrics(lambda: (
-                    STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
-                    STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
-                ))
-                if storage_span:
-                    storage_span.set_tag('storage.status', 'success')
-                return {
-                    'success': True,
-                    'upload_id': upload_id,
-                    'storage_key': storage_key,
-                    'sha256': sha256,
-                }
-            else:
-                record_metrics(lambda: (
-                    STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
-                    STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
-                    ERRORS_TOTAL.labels(stage='storage_upload').inc(),
-                ))
-                if storage_span:
-                    storage_span.set_tag('error', True)
-                    storage_span.set_tag('http.status_code', response.status)
-                return {'success': False, 'error': f'HTTP {response.status}'}
+        t_headers = time.monotonic()
+        # See note on the matching block in _call_webhook_for_recipient:
+        # metrics record in the finally so a mid-body failure still observes
+        # the partial timing instead of silently dropping the sample.
+        try:
+            _ = response.data  # forces body read into memory
+        finally:
+            t_done = time.monotonic()
+            response.release_conn()
+            record_metrics(lambda: (
+                HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
+                HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
+                HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
+            ))
+        duration = time.time() - start
+        if response.status in (200, 201):
+            record_metrics(lambda: (
+                STORAGE_UPLOAD_DURATION.labels(status='success').observe(duration),
+                STORAGE_UPLOADS_TOTAL.labels(status='success').inc(),
+            ))
+            if storage_span:
+                storage_span.set_tag('storage.status', 'success')
+            return {
+                'success': True,
+                'upload_id': upload_id,
+                'storage_key': storage_key,
+                'sha256': sha256,
+            }
+        else:
+            record_metrics(lambda: (
+                STORAGE_UPLOAD_DURATION.labels(status='error').observe(duration),
+                STORAGE_UPLOADS_TOTAL.labels(status='error').inc(),
+                ERRORS_TOTAL.labels(stage='storage_upload').inc(),
+            ))
+            if storage_span:
+                storage_span.set_tag('error', True)
+                storage_span.set_tag('http.status_code', response.status)
+            return {'success': False, 'error': f'HTTP {response.status}'}
 
     def _call_webhook_for_recipient(self, recipient: str, domain: str,
                                      raw_bytes: Optional[bytes], size: int,
@@ -1545,18 +1790,45 @@ class PrimitiveMailMilter(Milter.Base):
             if TRACING_ENABLED and webhook_span and HTTPPropagator:
                 HTTPPropagator.inject(webhook_span.context, webhook_headers)
 
-            req = urllib.request.Request(
+            host_label, scheme_label = _outbound_host_label(cfg.webhook_url)
+            # preload_content=False so we observe TTFB (time-to-first-byte —
+            # the metric that exposes the gap between local dispatch and
+            # remote function entry under load) separately from the body
+            # read. The connect-time histogram lives one level deeper, on
+            # the timing-aware HTTPSConnection subclass.
+            t_send = time.monotonic()
+            response = _HTTP.request(
+                'POST',
                 cfg.webhook_url,
-                data=json.dumps(payload).encode('utf-8'),
+                body=json.dumps(payload).encode('utf-8'),
                 headers=webhook_headers,
-                method='POST'
+                timeout=urllib3.Timeout(connect=float(timeout), read=float(timeout)),
+                preload_content=False,
             )
+            t_headers = time.monotonic()
+            # Metrics live in the finally so a mid-body read failure
+            # (e.g. read timeout, RST) still records what we observed —
+            # otherwise the body-read histogram silently undercounts the
+            # exact tail it exists to measure.
+            try:
+                # errors='replace' so a non-UTF-8 error body (rare, but seen
+                # from misconfigured upstreams) still flows through
+                # _interpret_webhook_response and the HTTP-status fallback
+                # rather than landing on WEBHOOK_UNEXPECTED_ERROR. Matches
+                # the urllib.error.HTTPError branch's previous tolerance.
+                response_body = response.data.decode('utf-8', errors='replace')
+            finally:
+                t_done = time.monotonic()
+                response.release_conn()
+                record_metrics(lambda: (
+                    HTTP_TTFB_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_headers - t_send),
+                    HTTP_BODY_READ_DURATION.labels(host=host_label, scheme=scheme_label).observe(t_done - t_headers),
+                    HTTP_REQUESTS_TOTAL.labels(host=host_label, scheme=scheme_label).inc(),
+                ))
+            latency_ms = (time.time() - start_time) * 1000
+            webhook_path = 'storage_first' if storage_result else 'inline'
 
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                latency_ms = (time.time() - start_time) * 1000
-                response_body = response.read().decode('utf-8')
-                webhook_path = 'storage_first' if storage_result else 'inline'
-
+            if 200 <= response.status < 300:
                 result = _interpret_webhook_response(response.status, response_body)
                 self.log(
                     f"Webhook responded: {result.get('status', 'N/A')} "
@@ -1568,33 +1840,24 @@ class PrimitiveMailMilter(Milter.Base):
                 ))
                 return result
 
-        except urllib.error.HTTPError as e:
-            latency_ms = (time.time() - start_time) * 1000
-            webhook_path = 'storage_first' if storage_result else 'inline'
-            error_body = ''
-            try:
-                error_body = e.read().decode('utf-8') if e.fp else ''
-            except Exception:
-                error_body = '<unreadable>'
+            # Non-2xx: interpret body, mirror the previous HTTPError branch.
+            result = _interpret_webhook_response(response.status, response_body)
 
-            result = _interpret_webhook_response(e.code, error_body)
-
-            # Log based on the interpreted result, not the HTTP status
             if result.get('success') and result.get('status') == 'accepted':
                 self.log(
                     f"Webhook responded: accepted "
-                    f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
+                    f"(HTTP {response.status}, latency: {latency_ms:.0f}ms)"
                 )
             elif result.get('success'):
                 logger.warning(
                     f"[{self.id}] Webhook responded: {result.get('status')} "
-                    f"(HTTP {e.code}, latency: {latency_ms:.0f}ms)"
+                    f"(HTTP {response.status}, latency: {latency_ms:.0f}ms)"
                 )
             else:
                 self.log_error(
                     f"WEBHOOK_HTTP_ERROR recipient={recipient} "
-                    f"http_status={e.code} latency_ms={latency_ms:.0f} "
-                    f"body={error_body[:500]}"
+                    f"http_status={response.status} latency_ms={latency_ms:.0f} "
+                    f"body={response_body[:500]}"
                 )
 
             metrics_status = 'success' if result.get('success') else 'error'
@@ -1606,12 +1869,23 @@ class PrimitiveMailMilter(Milter.Base):
                 record_metrics(lambda: ERRORS_TOTAL.labels(stage='webhook').inc())
             return result
 
-        except urllib.error.URLError as e:
+        except (
+            urllib3.exceptions.ConnectTimeoutError,
+            urllib3.exceptions.ReadTimeoutError,
+            urllib3.exceptions.NewConnectionError,
+            urllib3.exceptions.ProtocolError,
+            urllib3.exceptions.SSLError,
+            urllib3.exceptions.HTTPError,
+        ) as e:
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
-            reason = str(e.reason)
-            # Classify the network error for easier searching
-            if 'timed out' in reason.lower() or 'timeout' in reason.lower():
+            reason = str(e)
+            # MaxRetryError wraps the underlying cause (e.g. ConnectTimeoutError
+            # after our one retry); peel it off so a timeout that exhausted the
+            # retry budget is still classified as a timeout, matching the
+            # urllib.request baseline this PR replaced.
+            cause = e.reason if isinstance(e, urllib3.exceptions.MaxRetryError) else e
+            if isinstance(cause, (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError)):
                 error_type = 'timeout'
             elif 'refused' in reason.lower():
                 error_type = 'connection_refused'
