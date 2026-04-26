@@ -341,21 +341,32 @@ class _TimingHTTPConnectionPool(urllib3.HTTPConnectionPool):
 # fresh socket. read=False / status_forcelist=() keep application-level
 # semantics unchanged: the milter remains responsible for translating
 # non-2xx into REJECT vs TEMPFAIL on a single attempt.
-def _coerce_pool_maxsize(value, source: str = '') -> int:
-    """Validate a pool-maxsize input (string or int) with a safe fallback to 50."""
+def _coerce_positive_int(value, *, default: int, name: str, minimum: int = 1) -> int:
+    """Validate an int input (string or int) with a safe fallback.
+
+    Returns ``default`` on non-integer input or values below ``minimum``,
+    logging a warning. Used in the SIGHUP reload path so a malformed value
+    in the config file cannot terminate the milter via an uncaught
+    ValueError in the signal handler.
+    """
     try:
         n = int(value)
     except (TypeError, ValueError):
         logger.warning(
-            f"outbound_http_pool_maxsize={value!r} from {source or 'config'} is "
-            f"not an integer; using default 50")
-        return 50
-    if n < 1:
+            f"{name}={value!r} is not an integer; using default {default}")
+        return default
+    if n < minimum:
         logger.warning(
-            f"outbound_http_pool_maxsize={value!r} from {source or 'config'} must "
-            f"be >= 1; using default 50")
-        return 50
+            f"{name}={value!r} must be >= {minimum}; using default {default}")
+        return default
     return n
+
+
+def _coerce_pool_maxsize(value, source: str = '') -> int:
+    """Validate a pool-maxsize input (string or int) with a safe fallback to 50."""
+    return _coerce_positive_int(
+        value, default=50,
+        name=f"outbound_http_pool_maxsize (from {source or 'config'})")
 
 
 def _build_http_pool(maxsize: int) -> urllib3.PoolManager:
@@ -593,9 +604,11 @@ def _build_reloadable_config(file_data: dict) -> ReloadableConfig:
         storage_url=_cfg(file_data, 'storage_url', 'STORAGE_URL'),
         storage_key=_cfg(file_data, 'storage_key', 'STORAGE_KEY'),
         storage_auth_style=_cfg(file_data, 'storage_auth_style', 'STORAGE_AUTH_STYLE', 's3'),
-        storage_upload_threshold=int(
+        storage_upload_threshold=_coerce_positive_int(
             _cfg(file_data, 'storage_upload_threshold',
-                 'STORAGE_UPLOAD_THRESHOLD', '3000000')),
+                 'STORAGE_UPLOAD_THRESHOLD', '3000000'),
+            default=3_000_000,
+            name='storage_upload_threshold'),
         allowed_sender_domains=_parse_comma_set(
             _cfg(file_data, 'allowed_sender_domains', 'ALLOWED_SENDER_DOMAINS', '')),
         allowed_senders=_parse_comma_set(
