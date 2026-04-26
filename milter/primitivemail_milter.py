@@ -1811,7 +1811,12 @@ class PrimitiveMailMilter(Milter.Base):
             # otherwise the body-read histogram silently undercounts the
             # exact tail it exists to measure.
             try:
-                response_body = response.data.decode('utf-8')
+                # errors='replace' so a non-UTF-8 error body (rare, but seen
+                # from misconfigured upstreams) still flows through
+                # _interpret_webhook_response and the HTTP-status fallback
+                # rather than landing on WEBHOOK_UNEXPECTED_ERROR. Matches
+                # the urllib.error.HTTPError branch's previous tolerance.
+                response_body = response.data.decode('utf-8', errors='replace')
             finally:
                 t_done = time.monotonic()
                 response.release_conn()

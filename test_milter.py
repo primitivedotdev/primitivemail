@@ -715,6 +715,38 @@ class TestWebhookHTTPStatusFallback:
 
         assert result == mock_milter.TEMPFAIL
 
+    def test_non_utf8_body_routes_through_status_fallback(self, milter, caplog):
+        """A non-UTF-8 error body must not derail into WEBHOOK_UNEXPECTED_ERROR.
+
+        urllib.error.HTTPError previously absorbed the bad-decode case;
+        urllib3's unified path has no such guard, so decode() must be
+        permissive enough to keep flowing through _interpret_webhook_response.
+        Outcome stays TEMPFAIL either way; we assert on the structured log
+        signature (WEBHOOK_HTTP_ERROR vs WEBHOOK_UNEXPECTED_ERROR) so a
+        regression here surfaces as a metrics/log shape change, not a silent
+        status-code drift.
+        """
+        import logging
+
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        # Latin-1 byte that's invalid UTF-8 — common when an upstream
+        # returns text/html with the wrong charset.
+        bad_body = b'\xff<html>error</html>'
+        with caplog.at_level(logging.ERROR, logger='primitivemail_milter'):
+            with patch_http(return_value=MockResponse(500, bad_body)):
+                result = milter.eom()
+
+        assert result == mock_milter.TEMPFAIL
+        # Must travel through the HTTP-status-fallback path, not the
+        # catchall — i.e. the same log signature a UTF-8 5xx body would emit.
+        assert any('WEBHOOK_HTTP_ERROR' in r.message for r in caplog.records), \
+            f"expected WEBHOOK_HTTP_ERROR log, got: {[r.message for r in caplog.records]}"
+        assert not any('WEBHOOK_UNEXPECTED_ERROR' in r.message for r in caplog.records), \
+            "non-UTF-8 body should not trip the catchall handler"
+
     def test_http_4xx_with_json_status_uses_json(self, milter):
         """HTTP 422 with JSON {"status": "accepted"} → JSON wins → ACCEPT"""
         milter.envfrom('<sender@example.com>')
