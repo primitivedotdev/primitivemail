@@ -325,11 +325,14 @@ class _TimingHTTPConnectionPool(urllib3.HTTPConnectionPool):
 # _reset_outbound_http_clients) so a webhook_url or storage_url change does
 # not leave idle connections pinned to the old endpoint.
 #
-# maxsize=50: enough to keep most concurrent webhook calls on warm
-# connections under expected production concurrency. block=False means
-# bursts beyond the pool fall back to transient connections (full TLS
-# handshake) rather than blocking — chosen because SMTP timeouts are worse
-# than redundant connections for the milter's role.
+# Sizing: outbound_http_pool_maxsize (config file) /
+# OUTBOUND_HTTP_POOL_MAXSIZE (env var) cap the number of warm connections
+# kept per remote host (default 50). Pick a value at or above your typical
+# concurrent outbound-HTTP fan-out so most calls hit a warm connection;
+# bursts past the cap fall back to transient connections (full TLS
+# handshake) rather than blocking, because for a mail server an SMTP
+# timeout is worse than a redundant TCP connection. Resolved once at
+# startup; restart the milter to pick up a change.
 #
 # retries: one transparent retry, connect-only. Stale-keep-alive failures
 # (server closed our pooled socket between calls) surface as a connect
@@ -338,28 +341,54 @@ class _TimingHTTPConnectionPool(urllib3.HTTPConnectionPool):
 # fresh socket. read=False / status_forcelist=() keep application-level
 # semantics unchanged: the milter remains responsible for translating
 # non-2xx into REJECT vs TEMPFAIL on a single attempt.
-_HTTP = urllib3.PoolManager(
-    maxsize=50,
-    block=False,
-    retries=urllib3.util.Retry(
-        total=1,
-        connect=1,
-        read=False,
-        redirect=False,
-        status=False,
-        other=0,
-        status_forcelist=(),
-        backoff_factor=0,
-        raise_on_status=False,
-    ),
-)
-# Substitute timing-aware pool classes so connect() is observed every time
-# urllib3 opens a fresh socket. Reused connections never re-enter connect(),
-# which is exactly what we want — the histogram represents pool-miss cost.
-_HTTP.pool_classes_by_scheme = {
-    'http': _TimingHTTPConnectionPool,
-    'https': _TimingHTTPSConnectionPool,
-}
+def _coerce_pool_maxsize(value, source: str = '') -> int:
+    """Validate a pool-maxsize input (string or int) with a safe fallback to 50."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"outbound_http_pool_maxsize={value!r} from {source or 'config'} is "
+            f"not an integer; using default 50")
+        return 50
+    if n < 1:
+        logger.warning(
+            f"outbound_http_pool_maxsize={value!r} from {source or 'config'} must "
+            f"be >= 1; using default 50")
+        return 50
+    return n
+
+
+def _build_http_pool(maxsize: int) -> urllib3.PoolManager:
+    pool = urllib3.PoolManager(
+        maxsize=maxsize,
+        block=False,
+        retries=urllib3.util.Retry(
+            total=1,
+            connect=1,
+            read=False,
+            redirect=False,
+            status=False,
+            other=0,
+            status_forcelist=(),
+            backoff_factor=0,
+            raise_on_status=False,
+        ),
+    )
+    # Substitute timing-aware pool classes so connect() is observed every time
+    # urllib3 opens a fresh socket. Reused connections never re-enter connect(),
+    # which is exactly what we want — the histogram represents pool-miss cost.
+    pool.pool_classes_by_scheme = {
+        'http': _TimingHTTPConnectionPool,
+        'https': _TimingHTTPSConnectionPool,
+    }
+    return pool
+
+
+# Initialised at startup by _apply_config(reloadable_only=False) once the
+# config file has been read. Pool size is non-reloadable (changing it would
+# require recreating every pool entry); SIGHUP only refreshes the contents
+# via _reset_outbound_http_clients(), not the cap itself.
+_HTTP: urllib3.PoolManager = _build_http_pool(50)
 
 
 def _outbound_host_label(url: str) -> tuple:
@@ -626,6 +655,19 @@ def _apply_config(file_data: dict, reloadable_only: bool = False):
     MAIL_DIR = _cfg(file_data, 'mail_dir', 'MAIL_DIR', '/mail/incoming')
 
     STANDALONE_MODE = not _rcfg.webhook_url
+
+    # Outbound HTTP pool size — non-reloadable because changing it would
+    # require recreating every pool entry. Resolves config file → env var
+    # → default, matching every other startup-only value.
+    global _HTTP
+    pool_maxsize_raw = _cfg(file_data, 'outbound_http_pool_maxsize',
+                            'OUTBOUND_HTTP_POOL_MAXSIZE', 50)
+    source = ('config file' if 'outbound_http_pool_maxsize' in file_data
+              else ('env var' if 'OUTBOUND_HTTP_POOL_MAXSIZE' in os.environ
+                    else 'default'))
+    pool_maxsize = _coerce_pool_maxsize(pool_maxsize_raw, source)
+    _HTTP = _build_http_pool(pool_maxsize)
+    logger.info(f"Outbound HTTP pool maxsize: {pool_maxsize} (from {source})")
 
     # Spamhaus DNSBL
     SPAMHAUS_DNSBL_DOMAIN = str(_cfg(file_data, 'spamhaus_dnsbl_domain',
