@@ -11,8 +11,7 @@ import json
 import os
 import sys
 from unittest.mock import patch, MagicMock, PropertyMock
-from urllib.error import HTTPError, URLError
-from io import BytesIO
+from urllib3.exceptions import ProtocolError
 
 
 # Mock Milter module before importing our code
@@ -50,18 +49,19 @@ import primitivemail_milter as pm
 
 
 class MockResponse:
-    """Mock urllib response object"""
+    """Mock shaped like a urllib3.HTTPResponse with preload_content=False."""
     def __init__(self, status_code, body):
         self.status = status_code
-        self.body = body
+        if isinstance(body, bytes):
+            self._body = body
+        else:
+            self._body = body.encode('utf-8')
 
-    def read(self):
-        return self.body.encode('utf-8')
+    @property
+    def data(self):
+        return self._body
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
+    def release_conn(self):
         pass
 
 
@@ -69,6 +69,37 @@ def make_webhook_response(status='accepted', reason='', detail=''):
     return MockResponse(200, json.dumps({
         'status': status, 'reason': reason, 'detail': detail
     }))
+
+
+class _FakeReq:
+    """urllib.Request-shaped facade so existing capture(request, timeout=...) callbacks still work."""
+    def __init__(self, method, url, body, headers):
+        self.full_url = url
+        self.data = body
+        self.headers = headers or {}
+        self.method = method
+
+
+def _adapt_capture(fn):
+    """Adapt an old-style (request, timeout=None) capture to urllib3 PoolManager.request signature."""
+    def wrapper(method, url, body=None, headers=None, timeout=None,
+                preload_content=True, **kw):
+        return fn(_FakeReq(method, url, body, headers), timeout=timeout)
+    return wrapper
+
+
+def patch_http(side_effect=None, return_value=None):
+    """Patch the milter's outbound HTTP client (pm._HTTP.request).
+
+    Accepts old-style capture callables of shape (request, timeout=None) and
+    auto-adapts them; `request.full_url` and `request.data` work as before.
+    Pass exception classes/instances via side_effect to simulate network errors.
+    """
+    if callable(side_effect) and not isinstance(side_effect, type):
+        return patch.object(pm._HTTP, 'request', side_effect=_adapt_capture(side_effect))
+    if side_effect is not None:
+        return patch.object(pm._HTTP, 'request', side_effect=side_effect)
+    return patch.object(pm._HTTP, 'request', return_value=return_value)
 
 
 @pytest.fixture
@@ -147,7 +178,7 @@ class TestSingleRecipient:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        with patch('urllib.request.urlopen', return_value=make_webhook_response('accepted')):
+        with patch_http(return_value=make_webhook_response('accepted')):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -163,7 +194,7 @@ class TestSingleRecipient:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         assert len(captured) == 1
@@ -176,7 +207,7 @@ class TestSingleRecipient:
         add_simple_message(milter)
 
         resp = make_webhook_response('reject_permanent', reason='domain_not_found')
-        with patch('urllib.request.urlopen', return_value=resp):
+        with patch_http(return_value=resp):
             result = milter.eom()
 
         assert result == mock_milter.REJECT
@@ -190,7 +221,7 @@ class TestSingleRecipient:
         resp = make_webhook_response('reject_permanent',
                                       reason='protocol_violation',
                                       detail='reserved_tld')
-        with patch('urllib.request.urlopen', return_value=resp):
+        with patch_http(return_value=resp):
             result = milter.eom()
 
         assert result == mock_milter.REJECT
@@ -202,7 +233,7 @@ class TestSingleRecipient:
         add_simple_message(milter)
 
         resp = make_webhook_response('reject_permanent', reason='spamhaus_drop_listed')
-        with patch('urllib.request.urlopen', return_value=resp):
+        with patch_http(return_value=resp):
             result = milter.eom()
 
         assert result == mock_milter.REJECT
@@ -213,7 +244,7 @@ class TestSingleRecipient:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        with patch('urllib.request.urlopen', side_effect=URLError("Connection refused")):
+        with patch_http(side_effect=ProtocolError("Connection refused")):
             result = milter.eom()
 
         assert result == mock_milter.TEMPFAIL
@@ -232,7 +263,7 @@ class TestMultipleRecipients:
         milter.envrcpt('<bob@b.com>')
         add_simple_message(milter)
 
-        with patch('urllib.request.urlopen', return_value=make_webhook_response('accepted')):
+        with patch_http(return_value=make_webhook_response('accepted')):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -249,7 +280,7 @@ class TestMultipleRecipients:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         assert len(captured) == 2
@@ -270,7 +301,7 @@ class TestMultipleRecipients:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         assert captured[0]['eml_base64'] == captured[1]['eml_base64']
@@ -293,7 +324,7 @@ class TestMultipleRecipients:
             else:
                 return make_webhook_response('reject_permanent', reason='domain_not_found')
 
-        with patch('urllib.request.urlopen', side_effect=mock_urlopen):
+        with patch_http(side_effect=mock_urlopen):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -312,9 +343,9 @@ class TestMultipleRecipients:
             if call_count[0] == 1:
                 return make_webhook_response('accepted')
             else:
-                raise URLError("Connection refused")
+                raise ProtocolError("Connection refused")
 
-        with patch('urllib.request.urlopen', side_effect=mock_urlopen):
+        with patch_http(side_effect=mock_urlopen):
             result = milter.eom()
 
         assert result == mock_milter.TEMPFAIL
@@ -325,7 +356,7 @@ class TestMultipleRecipients:
         milter.envrcpt('<bob@b.com>')
         add_simple_message(milter)
 
-        with patch('urllib.request.urlopen', side_effect=URLError("Connection refused")):
+        with patch_http(side_effect=ProtocolError("Connection refused")):
             result = milter.eom()
 
         assert result == mock_milter.TEMPFAIL
@@ -384,7 +415,7 @@ class TestSpamhausDNSBL:
         add_simple_message(milter)
 
         resp = make_webhook_response('reject_permanent', reason='domain_not_found')
-        with patch('urllib.request.urlopen', return_value=resp):
+        with patch_http(return_value=resp):
             result = milter.eom()
 
         assert result == mock_milter.REJECT
@@ -397,7 +428,7 @@ class TestSpamhausDNSBL:
         add_simple_message(milter)
 
         resp = make_webhook_response('reject_permanent', reason='sender_blocked')
-        with patch('urllib.request.urlopen', return_value=resp):
+        with patch_http(return_value=resp):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -415,10 +446,10 @@ class TestSpamhausDNSBL:
         def mock_urlopen(request, timeout=None):
             call_count[0] += 1
             if call_count[0] == 1:
-                raise URLError("Connection refused")  # alice fails
+                raise ProtocolError("Connection refused")  # alice fails
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=mock_urlopen):
+        with patch_http(side_effect=mock_urlopen):
             milter.eom()
 
         assert call_count[0] == 3, "All 3 webhooks should be called even after first fails"
@@ -431,7 +462,7 @@ class TestSpamhausDNSBL:
         add_simple_message(milter)
 
         resp = make_webhook_response('reject_permanent', reason='domain_not_found')
-        with patch('urllib.request.urlopen', return_value=resp):
+        with patch_http(return_value=resp):
             milter.eom()
 
         milter.setreply.assert_called_with("550", "5.1.1", "No valid recipients")
@@ -455,7 +486,7 @@ class TestDeduplication:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         assert len(captured) == 1
@@ -472,7 +503,7 @@ class TestDeduplication:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         assert len(captured) == 1
@@ -524,7 +555,7 @@ class TestEdgeCases:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         assert len(captured) == 1
@@ -567,7 +598,7 @@ class TestWebhookHTTPStatusFallback:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        with patch('urllib.request.urlopen', return_value=MockResponse(200, '')):
+        with patch_http(return_value=MockResponse(200, '')):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -578,7 +609,7 @@ class TestWebhookHTTPStatusFallback:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        with patch('urllib.request.urlopen', return_value=MockResponse(200, 'OK')):
+        with patch_http(return_value=MockResponse(200, 'OK')):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -589,15 +620,7 @@ class TestWebhookHTTPStatusFallback:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        mock_error = HTTPError(
-            url="https://test.example.com/webhook",
-            code=422,
-            msg="Unprocessable",
-            hdrs={},
-            fp=BytesIO(b'')
-        )
-
-        with patch('urllib.request.urlopen', side_effect=mock_error):
+        with patch_http(return_value=MockResponse(422, '')):
             result = milter.eom()
 
         assert result == mock_milter.TEMPFAIL
@@ -608,15 +631,7 @@ class TestWebhookHTTPStatusFallback:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        mock_error = HTTPError(
-            url="https://test.example.com/webhook",
-            code=500,
-            msg="Server Error",
-            hdrs={},
-            fp=BytesIO(b'')
-        )
-
-        with patch('urllib.request.urlopen', side_effect=mock_error):
+        with patch_http(return_value=MockResponse(500, '')):
             result = milter.eom()
 
         assert result == mock_milter.TEMPFAIL
@@ -627,15 +642,8 @@ class TestWebhookHTTPStatusFallback:
         milter.envrcpt('<user@example.com>')
         add_simple_message(milter)
 
-        mock_error = HTTPError(
-            url="https://test.example.com/webhook",
-            code=422,
-            msg="Unprocessable",
-            hdrs={},
-            fp=BytesIO(json.dumps({"status": "accepted"}).encode())
-        )
-
-        with patch('urllib.request.urlopen', side_effect=mock_error):
+        body = json.dumps({"status": "accepted"})
+        with patch_http(return_value=MockResponse(422, body)):
             result = milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -651,7 +659,7 @@ class TestWebhookHTTPStatusFallback:
             "reason": "domain_not_found"
         }))
 
-        with patch('urllib.request.urlopen', return_value=response):
+        with patch_http(return_value=response):
             result = milter.eom()
 
         assert result == mock_milter.REJECT
@@ -668,7 +676,7 @@ class TestStandaloneMode:
         standalone_milter.envrcpt('<user@example.com>')
         add_simple_message(standalone_milter)
 
-        with patch('urllib.request.urlopen') as mock_url:
+        with patch_http() as mock_url:
             result = standalone_milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -680,7 +688,7 @@ class TestStandaloneMode:
         standalone_milter.envrcpt('<bob@b.com>')
         add_simple_message(standalone_milter)
 
-        with patch('urllib.request.urlopen') as mock_url:
+        with patch_http() as mock_url:
             result = standalone_milter.eom()
 
         assert result == mock_milter.ACCEPT
@@ -695,10 +703,10 @@ class TestStorageUpload:
 
     def test_storage_uploaded_once_for_multiple_recipients(self, milter):
         """Large email: upload once, reference same storage_key in all webhooks"""
-        original_threshold = pm.STORAGE_UPLOAD_THRESHOLD
+        original_threshold = pm._rcfg.storage_upload_threshold
         original_storage_url = pm._rcfg.storage_url
         original_auth_style = pm._rcfg.storage_auth_style
-        pm.STORAGE_UPLOAD_THRESHOLD = 10  # tiny threshold
+        pm._rcfg.storage_upload_threshold = 10  # tiny threshold
         pm._rcfg.storage_url = 'https://storage.example.com/bucket'
         pm._rcfg.storage_auth_style = 'supabase'  # use HTTP path so urllib mock works
 
@@ -719,10 +727,10 @@ class TestStorageUpload:
                 webhook_calls.append(json.loads(request.data.decode('utf-8')))
                 return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=mock_urlopen):
+        with patch_http(side_effect=mock_urlopen):
             result = milter.eom()
 
-        pm.STORAGE_UPLOAD_THRESHOLD = original_threshold
+        pm._rcfg.storage_upload_threshold = original_threshold
         pm._rcfg.storage_url = original_storage_url
         pm._rcfg.storage_auth_style = original_auth_style
 
@@ -733,10 +741,10 @@ class TestStorageUpload:
         assert webhook_calls[0]['storage_key'] == webhook_calls[1]['storage_key']
 
     def test_storage_failure_tempfails_before_any_webhook(self, milter):
-        original_threshold = pm.STORAGE_UPLOAD_THRESHOLD
+        original_threshold = pm._rcfg.storage_upload_threshold
         original_storage_url = pm._rcfg.storage_url
         original_auth_style = pm._rcfg.storage_auth_style
-        pm.STORAGE_UPLOAD_THRESHOLD = 10
+        pm._rcfg.storage_upload_threshold = 10
         pm._rcfg.storage_url = 'https://storage.example.com/bucket'
         pm._rcfg.storage_auth_style = 'supabase'  # use HTTP path so urllib mock works
 
@@ -750,14 +758,14 @@ class TestStorageUpload:
         def mock_urlopen(request, timeout=None):
             url = request.full_url
             if 'storage.example.com' in url:
-                raise URLError("Storage down")
+                raise ProtocolError("Storage down")
             webhook_called[0] = True
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=mock_urlopen):
+        with patch_http(side_effect=mock_urlopen):
             result = milter.eom()
 
-        pm.STORAGE_UPLOAD_THRESHOLD = original_threshold
+        pm._rcfg.storage_upload_threshold = original_threshold
         pm._rcfg.storage_url = original_storage_url
         pm._rcfg.storage_auth_style = original_auth_style
 
@@ -786,7 +794,7 @@ class TestMessageIdGeneration:
             captured.append(json.loads(request.data.decode('utf-8')))
             return make_webhook_response('accepted')
 
-        with patch('urllib.request.urlopen', side_effect=capture):
+        with patch_http(side_effect=capture):
             milter.eom()
 
         # Both calls should have the same generated message_id
@@ -1908,7 +1916,6 @@ class TestApplyConfig:
             'STANDALONE_MODE': pm.STANDALONE_MODE,
             'MAIL_DIR': pm.MAIL_DIR,
             'SPAMHAUS_DNSBL_DOMAIN': pm.SPAMHAUS_DNSBL_DOMAIN,
-            'STORAGE_UPLOAD_THRESHOLD': pm.STORAGE_UPLOAD_THRESHOLD,
         }
 
     def _restore_state(self, saved):
@@ -1917,7 +1924,6 @@ class TestApplyConfig:
         pm.STANDALONE_MODE = saved['STANDALONE_MODE']
         pm.MAIL_DIR = saved['MAIL_DIR']
         pm.SPAMHAUS_DNSBL_DOMAIN = saved['SPAMHAUS_DNSBL_DOMAIN']
-        pm.STORAGE_UPLOAD_THRESHOLD = saved['STORAGE_UPLOAD_THRESHOLD']
 
     def test_apply_from_file_data(self):
         saved = self._save_state()
@@ -2013,7 +2019,6 @@ class TestSighupReload:
             'STANDALONE_MODE': pm.STANDALONE_MODE,
             'MAIL_DIR': pm.MAIL_DIR,
             'SPAMHAUS_DNSBL_DOMAIN': pm.SPAMHAUS_DNSBL_DOMAIN,
-            'STORAGE_UPLOAD_THRESHOLD': pm.STORAGE_UPLOAD_THRESHOLD,
         }
 
     def _restore_state(self, saved):
@@ -2022,7 +2027,6 @@ class TestSighupReload:
         pm.STANDALONE_MODE = saved['STANDALONE_MODE']
         pm.MAIL_DIR = saved['MAIL_DIR']
         pm.SPAMHAUS_DNSBL_DOMAIN = saved['SPAMHAUS_DNSBL_DOMAIN']
-        pm.STORAGE_UPLOAD_THRESHOLD = saved['STORAGE_UPLOAD_THRESHOLD']
 
     def test_reload_updates_webhook_url(self, tmp_path):
         saved = self._save_state()
@@ -2300,7 +2304,7 @@ class TestEndToEndConfigFile:
                 captured_urls.append(request.full_url)
                 return make_webhook_response('accepted')
 
-            with patch('urllib.request.urlopen', side_effect=capture_request):
+            with patch_http(side_effect=capture_request):
                 result = m.eom()
 
             assert result == mock_milter.ACCEPT
