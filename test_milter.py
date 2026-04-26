@@ -249,6 +249,33 @@ class TestSingleRecipient:
 
         assert result == mock_milter.TEMPFAIL
 
+    def test_max_retry_wrapping_timeout_classified_as_timeout(self, milter, caplog):
+        """MaxRetryError wrapping ConnectTimeoutError must still log error_type=timeout.
+
+        urllib3 raises MaxRetryError(reason=ConnectTimeoutError) when our single
+        configured retry also times out; classification must unwrap reason so the
+        structured log field matches the urllib.request baseline.
+        """
+        import logging
+        from urllib3.exceptions import ConnectTimeoutError, MaxRetryError
+
+        milter.envfrom('<sender@example.com>')
+        milter.envrcpt('<user@example.com>')
+        add_simple_message(milter)
+
+        wrapped = MaxRetryError(
+            pool=MagicMock(),
+            url='/webhook',
+            reason=ConnectTimeoutError('timed out'),
+        )
+        with caplog.at_level(logging.ERROR, logger='primitivemail_milter'):
+            with patch_http(side_effect=wrapped):
+                result = milter.eom()
+
+        assert result == mock_milter.TEMPFAIL
+        assert any('error_type=timeout' in r.message for r in caplog.records), \
+            f"expected error_type=timeout, got: {[r.message for r in caplog.records]}"
+
 
 # ===========================================================================
 # Core: Multiple recipients

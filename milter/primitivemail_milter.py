@@ -1867,7 +1867,12 @@ class PrimitiveMailMilter(Milter.Base):
             latency_ms = (time.time() - start_time) * 1000
             webhook_path = 'storage_first' if storage_result else 'inline'
             reason = str(e)
-            if isinstance(e, (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError)):
+            # MaxRetryError wraps the underlying cause (e.g. ConnectTimeoutError
+            # after our one retry); peel it off so a timeout that exhausted the
+            # retry budget is still classified as a timeout, matching the
+            # urllib.request baseline this PR replaced.
+            cause = e.reason if isinstance(e, urllib3.exceptions.MaxRetryError) else e
+            if isinstance(cause, (urllib3.exceptions.ConnectTimeoutError, urllib3.exceptions.ReadTimeoutError)):
                 error_type = 'timeout'
             elif 'refused' in reason.lower():
                 error_type = 'connection_refused'
